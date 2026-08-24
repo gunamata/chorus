@@ -1,0 +1,32 @@
+# chorus agent registry (chorus-spec.md §10).
+#
+# Each entry's `spawn` is a full command line: the executable followed by
+# its arguments. `transport` must be "acp" (the only one chorus implements
+# today — see §10's note on non-ACP agents needing a translating adapter).
+# `cost_tier` and `notes` are surfaced to every OTHER connected agent via
+# the `delegate` tool's description and the seeded first-turn briefing
+# (internal/delegate, chorus-spec.md §11) — concrete signal for an agent
+# deciding whether and to whom to delegate a sub-task. Both are free text,
+# edit them to match your own setup.
+#
+# gemini is kept configured even though it's currently blocked by a
+# Google-side free-tier restriction on this machine (see chorus-spec.md
+# §0) — try it on a machine where that isn't the case.
+agents:
+  - name: claude
+    spawn: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+    cost_tier: metered
+    notes: "metered/paid usage; this project's default route for fix/implement/refactor/debug-style work (see policy.yaml routing rules)"
+    transport: acp
+
+  - name: gemini
+    spawn: ["gemini", "--acp"]
+    cost_tier: seat
+    notes: "seat/subscription usage; this project's default route for summarize/explain/review/analyze-style work (see policy.yaml routing rules)"
+    transport: acp
+
+  - name: opencode
+    spawn: ["opencode", "acp"]
+    cost_tier: free
+    notes: "free by default (opencode's own hosted free tier, zero configured credentials); this project's default catch-all agent for unmatched prompts"
+    transport: acp

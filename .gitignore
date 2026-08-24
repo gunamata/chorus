@@ -1,0 +1,9 @@
+# Build output
+chorus.exe
+chorus
+
+# Per-project, per-machine agent session state (chorus-spec.md's session
+# persistence feature) — a session ID is a pointer into that agent's own
+# conversation history tied to a specific account/machine, not something
+# to share or commit.
+.chorus/
