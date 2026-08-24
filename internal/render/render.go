@@ -601,8 +601,17 @@ func (r *Renderer) formatPlan(agent string, entries []acp.PlanEntry) string {
 
 // FormatPermissionPrompt renders a permission request's title and
 // whatever option set it actually carries (§15: never a hardcoded menu).
-func (r *Renderer) FormatPermissionPrompt(agent string, req acp.RequestPermissionRequest) string {
-	r.clearInPlaceState()
+// FormatPermissionPrompt renders a permission request as a menu, with
+// cursor marking the arrow-key-selected option (0-based). Pure — call
+// repeatedly as the cursor moves; internal/tui's Model tracks the block
+// this landed in and re-renders it in place on each arrow keypress. It
+// does NOT call ClearInPlaceState itself (unlike before arrow-key
+// selection existed) — a menu can stay pending for a while with other
+// agents' unrelated output streaming in around it, so clearing
+// in-place state (which affects THEIR spinners/streams) must happen
+// exactly once, when the prompt first arrives, not on every re-render;
+// callers do that explicitly via ClearInPlaceState.
+func (r *Renderer) FormatPermissionPrompt(agent string, req acp.RequestPermissionRequest, cursor int) string {
 	title := "(no title)"
 	if req.ToolCall.Title != nil {
 		title = StripANSI(*req.ToolCall.Title)
@@ -610,10 +619,30 @@ func (r *Renderer) FormatPermissionPrompt(agent string, req acp.RequestPermissio
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n%s %sPERMISSION%s: %s wants to: %s\n", agentTag(agent), colYellow+colBold, colReset, agent, title)
 	for i, o := range req.Options {
-		fmt.Fprintf(&b, "  %d) %s %s(%s)%s\n", i+1, StripANSI(o.Name), colDim, o.Kind, colReset)
+		fmt.Fprint(&b, FormatMenuLine(i, cursor, fmt.Sprintf("%s %s(%s)%s", StripANSI(o.Name), colDim, o.Kind, colReset)))
 	}
-	fmt.Fprint(&b, "> ")
+	fmt.Fprint(&b, colDim+"↑/↓ + enter, or type a number/name/\"cancel\""+colReset+"\n")
 	return b.String()
+}
+
+// ClearInPlaceState resets in-progress spinner/stream tracking — exported
+// for internal/tui's Model to call exactly once when a NEW interactive
+// menu (permission or routeAsk) first appears, since FormatPermissionPrompt
+// itself no longer does this on every re-render (see its doc comment).
+func (r *Renderer) ClearInPlaceState() {
+	r.clearInPlaceState()
+}
+
+// FormatMenuLine renders one arrow-key-selectable menu option: a
+// highlighted "❯ N) ..." for the cursor row, "  N) ..." otherwise.
+// Exported so internal/tui's routeAsk menu (formatRouteAskPrompt) uses
+// the identical visual convention as a permission prompt's menu, rather
+// than a second, subtly-different implementation.
+func FormatMenuLine(i, cursor int, rest string) string {
+	if i == cursor {
+		return fmt.Sprintf("%s%s❯ %d) %s%s\n", colBold, colGreen, i+1, rest, colReset)
+	}
+	return fmt.Sprintf("  %d) %s\n", i+1, rest)
 }
 
 // --- diff rendering -------------------------------------------------

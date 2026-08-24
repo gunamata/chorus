@@ -345,7 +345,11 @@ func formatDelegateLog(le delegate.LogEntry) string {
 // formatRouteAskPrompt renders the question shown while a pendingRoute is
 // awaiting an answer — appended as a block, not printed, so it stays
 // visible in the scrollable document once answered.
-func formatRouteAskPrompt(ask *pendingRoute, workers map[string]*AgentWorker) string {
+// formatRouteAskPrompt renders the routeAsk agent-choice menu, with
+// cursor marking the arrow-key-selected option (0-based) — the same
+// visual convention as a permission prompt's menu (render.FormatMenuLine),
+// so the two interactive menus in chorus look and behave consistently.
+func formatRouteAskPrompt(ask *pendingRoute, workers map[string]*AgentWorker, cursor int) string {
 	names := ask.candidates
 	question := "no routing rule matched — which agent should handle this?"
 	if names == nil {
@@ -356,7 +360,7 @@ func formatRouteAskPrompt(ask *pendingRoute, workers map[string]*AgentWorker) st
 	var b strings.Builder
 	fmt.Fprintf(&b, "\n%s\n", question)
 	for i, n := range names {
-		fmt.Fprintf(&b, "  %d) %s\n", i+1, n)
+		fmt.Fprint(&b, render.FormatMenuLine(i, cursor, n))
 	}
 	return b.String()
 }

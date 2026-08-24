@@ -13,6 +13,7 @@ package tui
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"time"
 
@@ -121,6 +122,24 @@ type Model struct {
 	pendingPerm  *bus.PermissionRequest
 	pendingRoute *pendingRoute
 
+	// permCursor/routeCursor are the arrow-key-selected index (0-based)
+	// into the currently pending menu's options, independently tracked
+	// per menu type — not one shared field — specifically so the
+	// permission-interrupts-routeAsk nuance (mode.go's doc comment)
+	// doesn't leave a resumed routeAsk showing a cursor position left
+	// over from an unrelated permission menu the user was navigating in
+	// between. permMenuIndex/routeMenuIndex are each menu's position in
+	// m.blocks, so an arrow keypress can update that exact block in
+	// place (bypassing mergeBlock's "only the immediately preceding
+	// block" rule — correct for short-lived tool-call/stream blocks,
+	// wrong here: a menu can stay pending while OTHER agents' unrelated
+	// output keeps getting appended after it). -1 means no menu of that
+	// type is currently tracked.
+	permCursor     int
+	permMenuIndex  int
+	routeCursor    int
+	routeMenuIndex int
+
 	width, height int
 	ready         bool // true once the first WindowSizeMsg has sized viewport/input
 
@@ -146,20 +165,22 @@ func New(cfg Config) Model {
 	vp := viewport.New(0, 0)
 
 	return Model{
-		ctx:           cfg.Ctx,
-		renderer:      cfg.Renderer,
-		coll:          cfg.Collectors,
-		workers:       cfg.Workers,
-		routing:       cfg.Routing,
-		agentSpecs:    cfg.AgentSpecs,
-		conns:         cfg.Conns,
-		commands:      make(map[string][]acp.AvailableCommand),
-		outputCh:      cfg.OutputCh,
-		permCh:        cfg.PermCh,
-		errCh:         cfg.ErrCh,
-		delegateLogCh: cfg.DelegateLogCh,
-		viewport:      vp,
-		input:         ti,
+		ctx:            cfg.Ctx,
+		renderer:       cfg.Renderer,
+		coll:           cfg.Collectors,
+		workers:        cfg.Workers,
+		routing:        cfg.Routing,
+		agentSpecs:     cfg.AgentSpecs,
+		conns:          cfg.Conns,
+		commands:       make(map[string][]acp.AvailableCommand),
+		outputCh:       cfg.OutputCh,
+		permCh:         cfg.PermCh,
+		errCh:          cfg.ErrCh,
+		delegateLogCh:  cfg.DelegateLogCh,
+		viewport:       vp,
+		input:          ti,
+		permMenuIndex:  -1,
+		routeMenuIndex: -1,
 	}
 }
 
@@ -261,7 +282,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// answerPermission's success path below.
 		p := msg.req
 		m.pendingPerm = &p
-		m.appendLine(m.renderer.FormatPermissionPrompt(p.Agent, p.Req))
+		m.permCursor = 0
+		m.renderer.ClearInPlaceState()
+		m.blocks = append(m.blocks, block{text: m.renderer.FormatPermissionPrompt(p.Agent, p.Req, m.permCursor)})
+		m.permMenuIndex = len(m.blocks) - 1
 		m.syncViewport()
 		return m, nil
 
@@ -317,9 +341,9 @@ func (m Model) View() string {
 	var status string
 	switch m.mode() {
 	case modePermission:
-		status = statusStyle.Render("awaiting permission answer (number, name, or \"cancel\")")
+		status = statusStyle.Render("awaiting permission answer (↑/↓ + enter, number, name, or \"cancel\")")
 	case modeRouteAsk:
-		status = statusStyle.Render("awaiting agent choice (number or name)")
+		status = statusStyle.Render("awaiting agent choice (↑/↓ + enter, number, or name)")
 	}
 	if status != "" {
 		status += "\n"
@@ -430,6 +454,22 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Arrow-key menu navigation, only while a permission or routeAsk
+	// menu is actually up — otherwise up/down fall through to the input
+	// box as normal (textinput has no history feature bound to them, so
+	// this doesn't take anything away from ordinary typing). Typing a
+	// number/name still works exactly as before regardless of whether
+	// the user has also been arrowing around — see handlePermissionAnswer/
+	// handleRouteAnswer's empty-line-means-arrow-selection fallback.
+	if mode := m.mode(); mode != modeNormal {
+		switch msg.Type {
+		case tea.KeyUp:
+			return m.moveMenuCursor(mode, -1), nil
+		case tea.KeyDown:
+			return m.moveMenuCursor(mode, 1), nil
+		}
+	}
+
 	if msg.Type != tea.KeyEnter {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
@@ -449,21 +489,36 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 }
 
+// handlePermissionAnswer resolves an Enter press while a permission is
+// pending. An empty line means the user navigated with arrow keys rather
+// than typing — in that case the arrow-selected option (permCursor) is
+// used directly, equivalent to typing its 1-based index; typed text (a
+// number, name, or kind, or "cancel") always takes priority when present,
+// exactly as before arrow-key selection existed.
 func (m Model) handlePermissionAnswer(line string) (tea.Model, tea.Cmd) {
+	if line == "" {
+		line = strconv.Itoa(m.permCursor + 1)
+	}
 	if !answerPermission(m.pendingPerm, line) {
 		m.appendLine("invalid choice, try again\n")
 		m.syncViewport()
 		return m, nil
 	}
 	m.pendingPerm = nil
+	m.permMenuIndex = -1
 	m.syncViewport()
 	return m, waitForPermission(m.permCh)
 }
 
+// handleRouteAnswer is handlePermissionAnswer's routeAsk counterpart —
+// same empty-line-means-arrow-selection fallback.
 func (m Model) handleRouteAnswer(line string) (tea.Model, tea.Cmd) {
 	names := m.pendingRoute.candidates
 	if names == nil {
 		names = agentNames(m.workers)
+	}
+	if line == "" {
+		line = strconv.Itoa(m.routeCursor + 1)
 	}
 	agent, ok := matchName(line, names)
 	if !ok {
@@ -475,6 +530,7 @@ func (m Model) handleRouteAnswer(line string) (tea.Model, tea.Cmd) {
 		m.appendLine(msg + "\n")
 	}
 	m.pendingRoute = nil
+	m.routeMenuIndex = -1
 	m.syncViewport()
 	return m, nil
 }
@@ -510,7 +566,9 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 	}
 	if ask != nil {
 		m.pendingRoute = ask
-		m.appendLine(formatRouteAskPrompt(ask, m.workers))
+		m.routeCursor = 0
+		m.blocks = append(m.blocks, block{text: formatRouteAskPrompt(ask, m.workers, m.routeCursor)})
+		m.routeMenuIndex = len(m.blocks) - 1
 	}
 	m.syncViewport()
 	return m, nil
@@ -528,6 +586,62 @@ func (m *Model) mergeBlock(key, text string) {
 		return
 	}
 	m.blocks = append(m.blocks, block{key: key, text: text})
+}
+
+// moveMenuCursor advances the current menu's arrow-key cursor by delta
+// (wrapping at either end) and re-renders that exact block in place via
+// permMenuIndex/routeMenuIndex — not mergeBlock, since a long-pending
+// menu can easily no longer be the last block by the time an arrow key
+// arrives (another agent's unrelated output may have streamed in around
+// it in the meantime).
+func (m Model) moveMenuCursor(mode inputMode, delta int) Model {
+	switch mode {
+	case modePermission:
+		n := len(m.pendingPerm.Req.Options)
+		if n == 0 {
+			return m
+		}
+		m.permCursor = wrapIndex(m.permCursor+delta, n)
+		m.setBlockAt(m.permMenuIndex, m.renderer.FormatPermissionPrompt(m.pendingPerm.Agent, m.pendingPerm.Req, m.permCursor))
+	case modeRouteAsk:
+		names := m.pendingRoute.candidates
+		if names == nil {
+			names = agentNames(m.workers)
+		}
+		n := len(names)
+		if n == 0 {
+			return m
+		}
+		m.routeCursor = wrapIndex(m.routeCursor+delta, n)
+		m.setBlockAt(m.routeMenuIndex, formatRouteAskPrompt(m.pendingRoute, m.workers, m.routeCursor))
+	default:
+		return m
+	}
+	m.syncViewport()
+	return m
+}
+
+// wrapIndex adds delta to i and wraps into [0, n) — so pressing down at
+// the last option moves to the first, and vice versa, rather than
+// getting stuck at either end.
+func wrapIndex(i, n int) int {
+	if n == 0 {
+		return 0
+	}
+	i %= n
+	if i < 0 {
+		i += n
+	}
+	return i
+}
+
+// setBlockAt overwrites the block at idx directly, if it's still a valid
+// index — see moveMenuCursor's doc comment for why this bypasses
+// mergeBlock.
+func (m *Model) setBlockAt(idx int, text string) {
+	if idx >= 0 && idx < len(m.blocks) {
+		m.blocks[idx].text = text
+	}
 }
 
 // appendLine appends a one-shot (never merged) block — the equivalent of

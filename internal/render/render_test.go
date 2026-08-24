@@ -119,11 +119,40 @@ func TestFormatPermissionPrompt_ShowsWhateverOptionsAreOffered(t *testing.T) {
 			{OptionId: "1", Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
 			{OptionId: "2", Name: "Allow Once", Kind: acp.PermissionOptionKindAllowOnce},
 		},
-	})
+	}, 0)
 	for _, want := range []string{"Write auth.py", "Deny", "Allow Once", "reject_once", "allow_once"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("prompt missing %q; got %q", want, out)
 		}
+	}
+}
+
+func TestFormatPermissionPrompt_CursorMarksSelectedOption(t *testing.T) {
+	r := newTestRenderer()
+	req := acp.RequestPermissionRequest{
+		Options: []acp.PermissionOption{
+			{OptionId: "1", Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+			{OptionId: "2", Name: "Allow Once", Kind: acp.PermissionOptionKindAllowOnce},
+		},
+	}
+	at0 := r.FormatPermissionPrompt("claude", req, 0)
+	at1 := r.FormatPermissionPrompt("claude", req, 1)
+	if !strings.Contains(at0, "❯") {
+		t.Errorf("cursor at 0 = %q, want a cursor marker present", at0)
+	}
+	if at0 == at1 {
+		t.Fatal("FormatPermissionPrompt() at cursor 0 and cursor 1 produced identical text — the cursor must visibly move")
+	}
+}
+
+func TestFormatMenuLine_MarksOnlyTheCursorRow(t *testing.T) {
+	other := FormatMenuLine(0, 1, "not selected")
+	selected := FormatMenuLine(1, 1, "selected")
+	if strings.Contains(other, "❯") {
+		t.Errorf("FormatMenuLine(0, cursor=1, ...) = %q, want no cursor marker on a non-selected row", other)
+	}
+	if !strings.Contains(selected, "❯") {
+		t.Errorf("FormatMenuLine(1, cursor=1, ...) = %q, want a cursor marker on the selected row", selected)
 	}
 }
 

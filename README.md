@@ -105,13 +105,20 @@ PERMISSION: claude wants to: Edit auth.py
 - All started agents run concurrently — output from any of them can
   appear at any time, including mid-turn, interleaved in the same
   scrolling pane.
-- **Scroll the output pane** with `PgUp`/`PgDn`, `Home`/`End`, or the
-  mouse wheel — it auto-follows new output while you're at the bottom,
-  and stays put (doesn't get yanked back down) if you've scrolled up to
-  read something while agents keep streaming.
+- **Scroll the output pane** with `PgUp`/`PgDn`/`Home`/`End` (also
+  `ctrl+u`/`ctrl+d` for half-page steps) — it auto-follows new output
+  while you're at the bottom, and stays put (doesn't get yanked back
+  down) if you've scrolled up to read something while agents keep
+  streaming. Mouse wheel scrolling is deliberately not enabled — it
+  requires capturing all mouse input, which breaks your terminal's
+  native click-drag text selection/copy, and that matters more for a
+  coding tool.
 - Permission prompts render whatever option set the agent actually
-  sent (never a fixed menu). Answer with the option's number, or its
-  name/kind (case-insensitive), or `cancel`.
+  sent (never a fixed menu). Answer with **arrow keys (↑/↓) + Enter**,
+  or by typing the option's number, its name/kind (case-insensitive), or
+  `cancel` — both work interchangeably, even in the same prompt. The
+  routeAsk agent-choice menu (ambiguous auto-routing, or an ambiguous
+  slash command) works the same way.
 - `quit` / `exit` / `ctrl+c` cleanly end every session, kill the
   subprocesses, and restore your terminal (leaves the alt-screen,
   cursor visible).

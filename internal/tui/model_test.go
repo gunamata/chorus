@@ -299,3 +299,153 @@ func strPtrTUI(s string) *string { return &s }
 type errFixture string
 
 func (e errFixture) Error() string { return string(e) }
+
+// --- arrow-key menu navigation ------------------------------------------
+
+func TestModel_ArrowKeysSelectPermissionOption(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	resp := make(chan acp.RequestPermissionResponse, 1)
+	updated, _ := m.Update(permissionMsg{bus.PermissionRequest{
+		Agent: "claude",
+		Req: acp.RequestPermissionRequest{
+			Options: []acp.PermissionOption{
+				{OptionId: "deny", Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+				{OptionId: "allow", Name: "Allow Once", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		},
+		Resp: resp,
+	}})
+	m = updated.(Model)
+	if m.permCursor != 0 {
+		t.Fatalf("permCursor = %d, want 0 initially", m.permCursor)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.permCursor != 1 {
+		t.Fatalf("permCursor = %d after one Down, want 1", m.permCursor)
+	}
+	if !strings.Contains(m.viewport.View(), "❯") {
+		t.Fatal("viewport doesn't show a cursor marker after moving it")
+	}
+
+	// Enter with no typed text confirms the arrow-selected option (index 1
+	// -> "allow"), not option 0.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	select {
+	case out := <-resp:
+		if out.Outcome.Selected == nil || out.Outcome.Selected.OptionId != "allow" {
+			t.Fatalf("outcome = %+v, want the arrow-selected \"allow\" option", out.Outcome)
+		}
+	default:
+		t.Fatal("no permission answer was sent")
+	}
+}
+
+func TestModel_ArrowCursorWrapsAtBoundaries(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(permissionMsg{bus.PermissionRequest{
+		Agent: "claude",
+		Req: acp.RequestPermissionRequest{
+			Options: []acp.PermissionOption{
+				{OptionId: "a", Name: "A", Kind: acp.PermissionOptionKindRejectOnce},
+				{OptionId: "b", Name: "B", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		},
+		Resp: make(chan acp.RequestPermissionResponse, 1),
+	}})
+	m = updated.(Model)
+
+	// Up from index 0 should wrap to the last option (index 1), not go
+	// negative or get stuck.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyUp})
+	m = updated.(Model)
+	if m.permCursor != 1 {
+		t.Fatalf("permCursor = %d after Up from 0, want 1 (wrapped)", m.permCursor)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.permCursor != 0 {
+		t.Fatalf("permCursor = %d after Down from 1, want 0 (wrapped)", m.permCursor)
+	}
+}
+
+func TestModel_ArrowKeyUpdatesMenuInPlaceDespiteInterleavedOutput(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(permissionMsg{bus.PermissionRequest{
+		Agent: "claude",
+		Req: acp.RequestPermissionRequest{
+			Options: []acp.PermissionOption{
+				{OptionId: "a", Name: "A", Kind: acp.PermissionOptionKindRejectOnce},
+				{OptionId: "b", Name: "B", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		},
+		Resp: make(chan acp.RequestPermissionResponse, 1),
+	}})
+	m = updated.(Model)
+	menuBlocksBefore := len(m.blocks)
+
+	// A completely unrelated agent's output streams in while the
+	// permission is still pending — this used to be exactly the scenario
+	// that would break mergeBlock's "only the last block" rule, since the
+	// menu is no longer last afterward.
+	updated, _ = m.Update(outputMsg{u: bus.Update{
+		Agent: "opencode",
+		Notification: acp.SessionNotification{
+			SessionId: "s2",
+			Update: acp.SessionUpdate{
+				AgentMessageChunk: &acp.SessionUpdateAgentMessageChunk{Content: acp.TextBlock("unrelated update")},
+			},
+		},
+	}})
+	m = updated.(Model)
+	if len(m.blocks) != menuBlocksBefore+1 {
+		t.Fatalf("len(blocks) = %d, want exactly one new block appended for the unrelated output", len(m.blocks))
+	}
+
+	// Now move the cursor — it must update the ORIGINAL menu block (still
+	// tracked by permMenuIndex), not spam a duplicate menu at the end.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if len(m.blocks) != menuBlocksBefore+1 {
+		t.Fatalf("len(blocks) = %d after an arrow keypress, want unchanged (%d) — the menu must update in place, not append a new block", len(m.blocks), menuBlocksBefore+1)
+	}
+	if !strings.Contains(m.blocks[m.permMenuIndex].text, "❯") {
+		t.Fatal("the tracked menu block wasn't updated with the new cursor position")
+	}
+}
+
+func TestModel_ArrowKeysSelectRouteAskCandidate(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{AskWhenAmbiguous: true})
+
+	m, _ = enterWithInput(m, "some ambiguous prompt")
+	if m.pendingRoute == nil {
+		t.Fatal("pendingRoute = nil, want a pending route")
+	}
+
+	names := agentNames(workers) // sorted: [claude, opencode]
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.routeCursor != 1 {
+		t.Fatalf("routeCursor = %d, want 1", m.routeCursor)
+	}
+
+	m, _ = enterWithInput(m, "")
+	select {
+	case blocks := <-workers[names[1]].in:
+		if len(blocks) != 1 || blocks[0].Text == nil {
+			t.Fatalf("queued blocks = %+v, unexpected shape", blocks)
+		}
+	default:
+		t.Fatalf("%s never received the queued prompt after arrow-selecting it", names[1])
+	}
+}
