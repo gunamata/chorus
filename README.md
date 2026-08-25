@@ -86,6 +86,7 @@ Claude Code / Gemini CLI / opencode / Codex — not a plain scroll-by
 REPL. The interaction itself is unchanged, just the display:
 
 ```
+[claude] fix the login bug in auth.py
 [claude] Reading auth.py...
 [claude] ● Read auth.py (completed)
 
@@ -95,24 +96,46 @@ PERMISSION: claude wants to: Edit auth.py
   3) Always Allow (allow_always)
 [claude] Fixed the null check on line 42.
 ──────────────────────────────────────────────
-> _
+❯ _
 ```
+
+That first line — `[claude] fix the login bug in auth.py` — is chorus echoing your own submitted prompt back into the scrollback, tagged by which agent it went to, on a solid highlighted background (matching Claude Code's own convention for setting your input apart from the reply — not visible in this plain-text example, but real in the actual TUI). ACP has no way to do this for you on a live turn (ask returns the reply, not an echo of what was asked), so chorus does it explicitly — without it, a long session would give you replies with no record of which question each one answers.
 
 - Type a prompt with no prefix and chorus **auto-routes** it (see
   [Routing](#routing-policyyaml) below). `<agent>: <text>` always
   overrides the router and sends straight to that agent's persistent
   session (`claude`, `gemini`, or `opencode`).
+- `!<command>` runs a shell command directly — no agent involved at all
+  (see [Native commands](#native-commands-)).
 - All started agents run concurrently — output from any of them can
   appear at any time, including mid-turn, interleaved in the same
   scrolling pane.
-- **Scroll the output pane** with `PgUp`/`PgDn`/`Home`/`End` (also
-  `ctrl+u`/`ctrl+d` for half-page steps) — it auto-follows new output
+- **Scroll the output pane** with `PgUp`/`PgDn`, `ctrl+u`/`ctrl+d`
+  (half-page steps), or the mouse wheel — it auto-follows new output
   while you're at the bottom, and stays put (doesn't get yanked back
   down) if you've scrolled up to read something while agents keep
-  streaming. Mouse wheel scrolling is deliberately not enabled — it
-  requires capturing all mouse input, which breaks your terminal's
-  native click-drag text selection/copy, and that matters more for a
-  coding tool.
+  streaming (except a permission/routeAsk menu, which always forces the
+  view back down to itself — it needs an answer before anything else can
+  proceed, so it isn't allowed to scroll out of sight). Mouse wheel
+  support means chorus captures plain click-drag too — to select/copy
+  text natively, hold your terminal's override modifier while dragging
+  (**Shift+drag** on Windows Terminal; check your terminal's docs if
+  that doesn't work for yours, since not every terminal supports the
+  same override).
+- **The input box is multi-line** and wraps long text instead of
+  scrolling sideways forever. Press **ctrl+j** for a new line within the
+  same prompt (Enter always submits). `Home`/`End` (and, for the same
+  job, `ctrl+a`/`ctrl+e` — macOS Terminal/iTerm's own readline-style
+  bindings) jump to the start/end of the current line. `↑`/`↓` move the
+  cursor between lines like any multi-line editor — and once the cursor
+  is already on the topmost or bottommost line, they instead walk
+  through **prompt history** (everything you've submitted this session,
+  most recent first), the same way a shell's `↑` does.
+- Once a prompt finishes, chorus prints `[agent] finished in <duration>`
+  (`45s`, `2m14s`, `1h05m`) — and while one or more agents are still
+  working, a spinner + elapsed-time line for each of them stays visible
+  just above the input box the whole time, so a long-running turn with
+  no output yet doesn't look identical to nothing happening.
 - Permission prompts render whatever option set the agent actually
   sent (never a fixed menu). Answer with **arrow keys (↑/↓) + Enter**,
   or by typing the option's number, its name/kind (case-insensitive), or
@@ -135,6 +158,11 @@ PERMISSION: claude wants to: Edit auth.py
 - `capabilities` shows what each connected agent actually advertised at
   initialize (session resume support, image-prompt support) — useful
   when verifying a newly-added or previously-untested agent.
+- `stats` shows each agent's direct tool calls vs. `delegate` calls sent
+  and received so far this run — real numbers to tune
+  `delegation.prefer`/`nudge_threshold` against (see
+  [Cross-agent delegation](#cross-agent-delegation) below) instead of
+  guesswork.
 
 Agent replies and thoughts are rendered as styled markdown (bold,
 headers, code blocks — via [glamour](https://github.com/charmbracelet/glamour)),
@@ -206,6 +234,45 @@ If an agent sends an image back, it's saved under `.chorus/images/`
 and the path is printed — a terminal can't display the bytes inline,
 but a path you can open beats a bare `[image]` placeholder.
 
+## Native commands (`!`)
+
+```
+❯ !go test ./...
+[!] go test ./...
+ok  	chorus	(cached)
+ok  	chorus/internal/render	0.23s
+...
+[!] done in 1.8s
+```
+
+`!<command>` runs a shell command directly on this machine — `cmd /C`
+on Windows, `sh -c` elsewhere — completely bypassing every connected
+agent, metered or free. It's for exactly the class of work chorus's
+agents themselves keep running as plain tool calls: `go build`,
+`go vet`, `go test`, `gofmt -l`, a lint pass, checking whether a file
+exists. That work is deterministic and needs no reasoning — spending
+an LLM turn on it (even a free-tier one) is worse than free, since it
+adds latency and a chance the "summary" of the result doesn't match
+what actually happened. `!` gives you (or an agent you ask to use it,
+via its own shell tool) a way to get the exact same real output a
+terminal would show, without going through anyone's model.
+
+A couple of things worth knowing:
+
+- It never asks for permission — you typed the exact command
+  yourself, so there's nothing for chorus to gate the way it gates an
+  *agent's* tool calls (`policy.yaml`'s `execute` kind). This is the
+  same trust boundary as running the command in a plain terminal next
+  to chorus; `!` doesn't grant any access chorus didn't already have.
+- Output is captured (stdout+stderr combined), capped at 200KB, and
+  the command can't read from stdin (it's disconnected — bubbletea
+  owns the real terminal input while chorus is running), so anything
+  that waits on input will just run until a 5-minute timeout instead
+  of hanging forever.
+- It runs asynchronously, same as an agent prompt — you can keep
+  interacting with agents (or run another `!` command) while a long
+  one is still going.
+
 ## Agent registry (`agents.yaml`)
 
 Which agents chorus spawns, and how, lives in data, not code:
@@ -239,6 +306,20 @@ seeded first-turn briefing, so an agent has concrete signal for
 deciding whether and to whom to delegate a sub-task (see
 [Cross-agent delegation](#cross-agent-delegation)).
 
+**Neither `agents.yaml` nor `policy.yaml` is actually required** —
+chorus embeds its own copy of both (this repo's own reference config,
+baked in at build time) and falls back to them for whichever file isn't
+present in the directory you run it from, so `chorus` works out of the
+box with zero setup. A local file always takes precedence over the
+embedded default, checked independently for each — **except** that a
+local `agents.yaml` requires a local `policy.yaml` too; chorus refuses
+to start rather than silently pair your custom agent set with the
+built-in default policy, since `policy.yaml`'s `auto_allow`/routing/
+delegation settings are keyed to specific agent names and a mismatch
+could quietly under- or over-permission agents it was never written
+for. (A local `policy.yaml` with no local `agents.yaml` is fine — it
+just applies to the embedded default agent set.)
+
 **`agents.yaml` is trusted, executable configuration, not passive
 data** — `spawn` is a literal command line chorus runs unconditionally
 at startup. Never point chorus at an `agents.yaml` (or `policy.yaml`)
@@ -271,6 +352,16 @@ First matching rule wins; an unmatched prompt falls back to `default`.
 Set `ask_when_ambiguous: true` to have chorus ask which agent should
 handle an unmatched prompt instead of guessing via `default`.
 
+**If a matched rule's agent isn't currently connected** (blocked,
+crashed, or just never configured to start this run), chorus falls
+back to `default` automatically — rather than failing outright — as
+long as `default` itself is connected. You'll see
+`(matched gemini, but it's not connected — falling back to default: opencode)`
+instead of a bare "no route" error. This only applies to auto-routing:
+an explicit `<agent>: text` override or a slash command still fails
+outright if that agent isn't connected — you asked for it specifically,
+so chorus never silently substitutes a different one.
+
 ## Permission policy (`policy.yaml`)
 
 The same file also holds the §5 allow-list, keyed on ACP's
@@ -297,8 +388,11 @@ of kind — needed for chorus's own `delegate` tool below, since an
 external MCP tool's kind is generically `other` to every agent, so
 kind-based matching can't single it out.
 
-Anything not listed under either falls through and asks. Missing
-`policy.yaml` is not an error — everything just asks.
+Anything not listed under either falls through and asks. A missing
+local `policy.yaml` isn't an error — chorus falls back to its embedded
+default policy (shown above) unless you also have a local `agents.yaml`
+with no matching local `policy.yaml`, which is rejected outright rather
+than guessed at (see [Agent registry](#agent-registry-agentsyaml)).
 
 **This allow-list is enforced, not advisory**: `edit`/`execute` (and
 everything else not explicitly listed) require your approval even for
@@ -333,7 +427,12 @@ something that's possible:**
 
 - The `delegate` tool's description lists every other connected
   agent's `cost_tier` and `notes` (from `agents.yaml`) so the calling
-  model has concrete signal to weigh, not just bare agent names.
+  model has concrete signal to weigh, not just bare agent names. It
+  also explicitly frames delegation as more than analysis/summarize
+  work: a well-specified implementation step (you've already decided
+  *what* to change) is just as delegable as "explain this" once you
+  hand over the exact file, change, and reasoning — the seeded
+  briefing below carries the same framing.
 - It also frames a delegate reply explicitly as **an unverified
   draft** — the calling agent stays responsible for checking it, which
   is what makes it safe to encourage proactive delegation in the first
@@ -356,10 +455,34 @@ something that's possible:**
   (On by default — delegation is meant to be something an agent
   reaches for on its own, not something you have to ask for every
   time.)
-- **Known limitation**: if a session already existed before a 2nd
-  agent became available (e.g. you ran chorus with just Claude, then
-  later added opencode to `agents.yaml`), that pre-existing session
-  never gets the briefing — restart with `--fresh` to pick it up.
+- If a session already existed before a 2nd agent became available
+  (e.g. you ran chorus with just Claude, then later added opencode to
+  `agents.yaml`), chorus tracks per-agent "has this session ever been
+  briefed" independently of session resume/history, so that pre-existing
+  session picks up the briefing automatically on its next run — no
+  `--fresh` needed. (This used to require `--fresh`; fixed once it
+  turned out to be a likely real cause of unreliable delegation, not
+  just a theoretical gap — see chorus-spec.md §0.)
+- **Delegation nudge**: ACP gives no way to redirect a tool call
+  mid-permission-check (its response carries only allow/deny, no free
+  text), so instead chorus counts how many direct tool calls a
+  `metered` agent (`agents.yaml`'s `cost_tier`) makes in a row of a
+  kind you've flagged as delegable, and once that streak crosses a
+  threshold — while a non-metered agent is connected and currently
+  idle — prepends a one-time suggestion to the metered agent's *next*
+  turn naming the idle agent. The streak resets the moment the agent
+  actually calls `delegate`. Off by default in the code (empty `prefer`
+  list) — but **this project's own `policy.yaml` enables it**, since the
+  briefing alone (a one-time message at session start) turned out not to
+  be enough to make delegation reliable on a long session:
+  ```yaml
+  delegation:
+    prefer: [execute, edit]   # ACP ToolKinds worth nudging about
+    nudge_threshold: 2        # direct calls in a row before nudging (code default: 3)
+  ```
+  Type `stats` in the REPL to see real per-agent direct-vs-delegated
+  counts and confirm this is actually shifting behavior, not just
+  present in config.
 
 This works by chorus re-invoking itself as a small local MCP server
 (`chorus __mcp_delegate`) that each agent's own `mcpServers` config

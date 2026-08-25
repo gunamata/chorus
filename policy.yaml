@@ -56,11 +56,30 @@ routing:
     - match: [summarize, explain, list, scan, review, analyze]
       agent: gemini
 
-# chorus-spec.md §11: delegation briefing — a one-time priming message
-# sent to each agent's session on its first-ever turn, once 2+ agents are
-# connected, explaining the agent roster (agents.yaml's cost_tier/notes)
-# and encouraging proactive use of the delegate tool. On by default —
-# delegation should be a live option the agent reaches for on its own,
-# not something the user has to ask for every time. Uncomment to disable:
+# chorus-spec.md §11 / CLAUDE.md's delegation-maximization plan:
+# - briefing: a one-time priming message sent to each agent's session on
+#   its first-ever turn, once 2+ agents are connected, explaining the
+#   agent roster (agents.yaml's cost_tier/notes) and encouraging
+#   proactive use of the delegate tool. On by default — delegation should
+#   be a live option the agent reaches for on its own, not something the
+#   user has to ask for every time. Uncomment to disable:
 # delegation:
 #   briefing: false
+#
+# - prefer / nudge_threshold (item 2 of the plan): when a metered agent
+#   (agents.yaml's cost_tier: metered) makes `nudge_threshold` direct tool
+#   calls in a row (default 3) whose Kind is listed in `prefer`, AND a
+#   non-metered agent is currently connected and idle, chorus prepends a
+#   one-time reminder to that agent's next queued prompt suggesting it
+#   delegate similar work instead. The counter resets every time the
+#   agent actually calls `delegate`. Enabled below (was off by default,
+#   empty prefer list, until live use showed the briefing alone — a
+#   one-time message at session start — isn't enough on its own: it
+#   fades from relevance as a long session goes on, and doesn't push back
+#   in the moment an agent is actually about to do mechanical work
+#   directly instead of delegating it). threshold: 2 rather than the
+#   default 3 — reacts after just two direct calls in a row, since the
+#   goal here is agents reaching for `delegate` reliably, not eventually.
+delegation:
+  prefer: [execute, edit]
+  nudge_threshold: 2

@@ -13,6 +13,22 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// mcpServerName is the MCP server name chorus registers its delegate tool
+// under. ToolTitlePrefix is exported so callers that need to recognize a
+// delegate call from an ACP ToolCall's Title — without duplicating the
+// string a second time — can do so directly: policy.yaml's own
+// auto_allow_tools convention (internal/policy's AutoAllowTool) matches
+// this same prefix by user config, but internal/tui's stats tally needs
+// it independent of whatever a project's policy.yaml happens to auto-
+// allow, so it imports this constant instead of hardcoding the string.
+const mcpServerName = "chorus-delegate"
+
+// ToolTitlePrefix is the tool-call title prefix an agent shows when
+// invoking chorus's own delegate tool — MCP's own "mcp__<server>__<tool>"
+// naming convention (observed live, see chorus-spec.md §0), not something
+// chorus constructs itself.
+const ToolTitlePrefix = "mcp__" + mcpServerName + "__"
+
 // RunMCPServer runs chorus in delegate-mcp mode: an MCP stdio server
 // exposing one tool, `delegate`, that calls back into the main chorus
 // process's Hub over loopback HTTP. This is what each agent's
@@ -36,7 +52,7 @@ func RunMCPServer(ctx context.Context) error {
 		roster = nil
 	}
 
-	server := mcp.NewServer(&mcp.Implementation{Name: "chorus-delegate"}, nil)
+	server := mcp.NewServer(&mcp.Implementation{Name: mcpServerName}, nil)
 
 	type args struct {
 		Agent string `json:"agent" jsonschema:"which chorus agent to delegate to (e.g. claude, gemini, opencode) — not yourself"`
@@ -72,7 +88,10 @@ func buildToolDescription(roster []RosterEntry) string {
 	b.WriteString("Delegate a sub-task to another chorus agent and get back its text reply. ")
 	b.WriteString("Runs in a fresh, isolated sub-session for the target agent, not its main conversation — ")
 	b.WriteString("give it full context in the task text since it starts with none. One hop only: this tool ")
-	b.WriteString("is not available from within a delegated sub-session, so the target agent cannot delegate further.")
+	b.WriteString("is not available from within a delegated sub-session, so the target agent cannot delegate further. ")
+	b.WriteString("Not just for analysis (summarize/explain/review) — a well-specified implementation step is just ")
+	b.WriteString("as delegable once you've already decided what needs to change: give the exact file, the exact ")
+	b.WriteString("change, and why, and a cheaper agent can make it without needing the reasoning that got you there.")
 
 	if len(roster) > 0 {
 		b.WriteString("\n\nAgents available to delegate to:\n")

@@ -4,20 +4,22 @@
 // in main.go. See the implementation plan (chorus-spec.md/CLAUDE.md, and
 // the design doc this was built from) for the full architecture rationale.
 //
-// Model owns the channel bridging (outputCh/permCh/errCh/delegateLogCh),
-// the permission/routeAsk state machine, and the viewport/textinput
-// wiring. internal/render's Renderer stays the pure "how do I format one
-// bus.Update" layer — Model is the new "how do I lay that out on screen
-// and drive it from bubbletea's event loop" layer.
+// Model owns the channel bridging (outputCh/permCh/errCh/doneCh/
+// delegateLogCh), the permission/routeAsk state machine, and the
+// viewport/textarea wiring. internal/render's Renderer stays the pure "how
+// do I format one bus.Update" layer — Model is the new "how do I lay that
+// out on screen and drive it from bubbletea's event loop" layer.
 package tui
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/bubbles/key"
+	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -52,6 +54,31 @@ const (
 	modeRouteAsk
 	modePermission
 )
+
+// agentStats tallies one agent's direct-vs-delegated tool activity —
+// CLAUDE.md's delegation-maximization plan item 4, added so
+// policy.yaml's delegation.prefer/nudge_threshold can eventually be
+// tuned against real numbers instead of guesswork (see
+// policy.defaultNudgeThreshold's own doc comment, which names this
+// command directly). Built entirely from data already flowing through
+// Model — ToolCall notifications on outputCh, delegate.LogEntry on
+// delegateLogCh — so no new plumbing from internal/acpclient or
+// internal/delegate was needed to add it.
+type agentStats struct {
+	direct       map[string]int // agent -> non-delegate ToolCall count
+	delegateSent map[string]int // source agent -> delegate calls made
+	delegateRecv map[string]int // target agent -> delegate calls received
+	delegateFail map[string]int // source agent -> delegate calls that errored
+}
+
+func newAgentStats() agentStats {
+	return agentStats{
+		direct:       make(map[string]int),
+		delegateSent: make(map[string]int),
+		delegateRecv: make(map[string]int),
+		delegateFail: make(map[string]int),
+	}
+}
 
 func (m Model) mode() inputMode {
 	if m.pendingPerm != nil {
@@ -93,6 +120,7 @@ type Config struct {
 	OutputCh      chan bus.Update
 	PermCh        chan bus.PermissionRequest
 	ErrCh         chan ErrMsg
+	DoneCh        chan PromptDoneMsg
 	DelegateLogCh chan delegate.LogEntry
 }
 
@@ -108,14 +136,35 @@ type Model struct {
 	agentSpecs []session.Spec
 	conns      map[string]*session.Connection
 	commands   map[string][]acp.AvailableCommand
+	stats      agentStats
 
 	outputCh      chan bus.Update
 	permCh        chan bus.PermissionRequest
 	errCh         chan ErrMsg
+	doneCh        chan PromptDoneMsg
 	delegateLogCh chan delegate.LogEntry
 
 	viewport viewport.Model
-	input    textinput.Model
+	input    textarea.Model
+
+	// promptHistory records every non-empty line submitted via
+	// handleNormalLine (agent prompts, native "!" commands, meta commands
+	// like "stats") in submission order, so Up at the top of the (now
+	// multi-line) input box can recall it — see historyUp/historyDown.
+	// historyIndex is -1 when not currently navigating history (the input
+	// holds the user's own in-progress draft); historyDraft holds that
+	// draft while navigating, so paging back down past the newest history
+	// entry restores it instead of leaving the input blank.
+	promptHistory []string
+	historyIndex  int
+	historyDraft  string
+
+	// uiTick counts spinnerTickMsg deliveries unconditionally (unlike
+	// renderer.spinnerFrame, which only advances while an in-place
+	// document block is actively animating) — used purely to animate the
+	// persistent "<agent> working (...)" status line in View(), which has
+	// no document block of its own to attach a frame counter to.
+	uiTick int
 
 	blocks []block
 
@@ -146,22 +195,63 @@ type Model struct {
 	quitting bool
 }
 
+// inputHeight is the textarea's fixed visible height in rows. Not
+// dynamically grown with content — bubbles/textarea is itself backed by an
+// internal scrollable viewport (see its SetHeight doc comment), so a long
+// or many-line prompt simply scrolls within this fixed box exactly like a
+// small editor window, the same way the old single-line textinput never
+// needed to grow either.
+const inputHeight = 3
+
+// inputKeyMap is textarea.DefaultKeyMap with InsertNewline rebound to
+// ctrl+j only (dropping "enter"/"ctrl+m") — Enter must submit the prompt,
+// handled directly in handleKey before any KeyMsg reaches the textarea, so
+// insert-newline needs its own dedicated key instead. Everything else
+// (Home/End -> line start/end, ctrl+a/ctrl+e as the same, which happens to
+// already be exactly what macOS Terminal/iTerm's readline-style bindings
+// expect) is DefaultKeyMap unchanged.
+var inputKeyMap = func() textarea.KeyMap {
+	km := textarea.DefaultKeyMap
+	km.InsertNewline = key.NewBinding(key.WithKeys("ctrl+j"), key.WithHelp("ctrl+j", "insert newline"))
+	return km
+}()
+
 // New constructs the initial Model. Call tea.NewProgram(New(cfg), ...) —
 // see main.go.
 func New(cfg Config) Model {
-	ti := textinput.New()
-	ti.Placeholder = `"<agent>: text", a bare prompt to auto-route, or "/name ..." — try "commands"`
-	ti.Focus()
-	ti.CharLimit = 0
+	ta := textarea.New()
+	// Prompt was never set before textinput's own default ("" — no visual
+	// marker at all for "this is where you type," unlike Claude Code/
+	// Gemini CLI's own input lines). "❯ " matches the same cursor glyph the
+	// arrow-key menu selection already uses (render.FormatMenuLine), so the
+	// one glyph reads consistently as "here" throughout chorus's UI. A
+	// continuation line (the 2nd+ line of a multi-line prompt) gets a
+	// blank prompt of the same width instead of repeating "❯ ", so a
+	// multi-line prompt doesn't read as several separate ones.
+	ta.Prompt = "❯ "
+	promptWidth := lipgloss.Width(ta.Prompt)
+	ta.SetPromptFunc(promptWidth, func(line int) string {
+		if line == 0 {
+			return ta.Prompt
+		}
+		return strings.Repeat(" ", promptWidth)
+	})
+	promptStyle := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	ta.FocusedStyle.Prompt = promptStyle
+	ta.BlurredStyle.Prompt = promptStyle
+	ta.ShowLineNumbers = false
+	ta.Placeholder = `<agent>: text, a bare prompt to auto-route, /name ..., or !cmd to run directly — try "commands" (ctrl+j for a new line)`
+	ta.KeyMap = inputKeyMap
+	ta.CharLimit = 0
+	ta.SetHeight(inputHeight)
+	ta.Focus()
 
-	// MouseWheelEnabled defaults true on viewport.Model, but no tea.MouseMsg
-	// ever arrives to act on it unless main.go's tea.NewProgram opts into
-	// tea.WithMouseCellMotion() — deliberately not enabled (see main.go):
-	// mouse capture stops the terminal from treating click-drag as native
-	// text selection. PgUp/PgDn/Home/End (handleKey, below) cover scrolling
-	// instead. The tea.MouseMsg case in Update() is inert dead code until/
-	// unless that trade-off is revisited, kept rather than removed so
-	// re-enabling mouse support later is a one-line change in main.go.
+	// MouseWheelEnabled defaults true on viewport.Model — see main.go's
+	// tea.WithMouseCellMotion() for why mouse events reach Update()'s
+	// tea.MouseMsg case at all, and the tradeoff (native text selection
+	// needs a terminal-level modifier-key override, e.g. Shift+drag on
+	// Windows Terminal, once mouse capture is active) that decision
+	// carries.
 	vp := viewport.New(0, 0)
 
 	return Model{
@@ -173,12 +263,15 @@ func New(cfg Config) Model {
 		agentSpecs:     cfg.AgentSpecs,
 		conns:          cfg.Conns,
 		commands:       make(map[string][]acp.AvailableCommand),
+		stats:          newAgentStats(),
 		outputCh:       cfg.OutputCh,
 		permCh:         cfg.PermCh,
 		errCh:          cfg.ErrCh,
+		doneCh:         cfg.DoneCh,
 		delegateLogCh:  cfg.DelegateLogCh,
 		viewport:       vp,
-		input:          ti,
+		input:          ta,
+		historyIndex:   -1,
 		permMenuIndex:  -1,
 		routeMenuIndex: -1,
 	}
@@ -190,6 +283,7 @@ type outputMsg struct{ u bus.Update }
 type outputClosedMsg struct{}
 type permissionMsg struct{ req bus.PermissionRequest }
 type errChMsg struct{ e ErrMsg }
+type promptDoneMsg struct{ e PromptDoneMsg }
 type delegateLogMsg struct{ e delegate.LogEntry }
 type spinnerTickMsg struct{}
 type ctxDoneMsg struct{}
@@ -227,6 +321,16 @@ func waitForErr(ch chan ErrMsg) tea.Cmd {
 	}
 }
 
+func waitForPromptDone(ch chan PromptDoneMsg) tea.Cmd {
+	return func() tea.Msg {
+		e, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return promptDoneMsg{e}
+	}
+}
+
 func waitForDelegateLog(ch chan delegate.LogEntry) tea.Cmd {
 	return func() tea.Msg {
 		e, ok := <-ch
@@ -255,10 +359,11 @@ func (m Model) Init() tea.Cmd {
 		waitForOutput(m.outputCh),
 		waitForPermission(m.permCh),
 		waitForErr(m.errCh),
+		waitForPromptDone(m.doneCh),
 		waitForDelegateLog(m.delegateLogCh),
 		waitForCtxDone(m.ctx),
 		spinnerTick(),
-		textinput.Blink,
+		textarea.Blink,
 	)
 }
 
@@ -294,15 +399,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.syncViewport()
 		return m, waitForErr(m.errCh)
 
+	case promptDoneMsg:
+		// Only on success — a failed turn already gets its own error line
+		// via errChMsg above; appending a second "finished in Xs" line for
+		// the same event would just be noise on top of it. On success this
+		// is the only place a completed turn is ever announced at all.
+		if msg.e.Err == nil {
+			m.appendLine(fmt.Sprintf("[%s] finished in %s\n", msg.e.Agent, formatDuration(msg.e.Duration)))
+			m.syncViewport()
+		}
+		return m, waitForPromptDone(m.doneCh)
+
 	case delegateLogMsg:
+		m.stats.delegateSent[msg.e.Source]++
+		m.stats.delegateRecv[msg.e.Target]++
+		if msg.e.Err != nil {
+			m.stats.delegateFail[msg.e.Source]++
+		}
 		m.appendLine(formatDelegateLog(msg.e))
 		m.syncViewport()
 		return m, waitForDelegateLog(m.delegateLogCh)
 
+	case nativeCmdResultMsg:
+		m.appendLine(render.FormatNativeCommandResult(msg.cmdline, msg.output, msg.err, msg.duration))
+		m.syncViewport()
+		return m, nil
+
 	case spinnerTickMsg:
-		// Only while nothing else owns the input — matches the original
-		// ticker case's "never disturb an active permission/routeAsk
-		// prompt" gating.
+		// uiTick animates the persistent "<agent> working (...)" status
+		// line (View(), via render.SpinnerFrame) — advanced unconditionally,
+		// unlike the in-document spinner below, since a background agent
+		// can still be busy while a permission/routeAsk menu (or nothing at
+		// all) currently owns the input.
+		m.uiTick++
+		// The in-document spinner (in-progress tool call / thinking
+		// indicator) only animates while nothing else owns the input —
+		// matches the original ticker case's "never disturb an active
+		// permission/routeAsk prompt" gating.
 		if m.mode() == modeNormal {
 			if key, text, ok := m.renderer.FormatSpinnerTick(); ok {
 				m.mergeBlock(key, text)
@@ -338,17 +471,49 @@ func (m Model) View() string {
 	if !m.ready {
 		return "starting up...\n"
 	}
-	var status string
+	// Two status lines, always both present (blank when inapplicable) —
+	// see handleResize's "must match View() line-for-line" discipline.
+	// Line 1 is the mode-related prompt (permission/routeAsk); line 2 is
+	// the persistent busy-agents indicator, independent of mode, since a
+	// background agent's turn can still be running while the user is
+	// answering a totally different agent's permission prompt.
+	var modeStatus string
 	switch m.mode() {
 	case modePermission:
-		status = statusStyle.Render("awaiting permission answer (↑/↓ + enter, number, name, or \"cancel\")")
+		modeStatus = "awaiting permission answer (↑/↓ + enter, number, name, or \"cancel\")"
 	case modeRouteAsk:
-		status = statusStyle.Render("awaiting agent choice (↑/↓ + enter, number, or name)")
+		modeStatus = "awaiting agent choice (↑/↓ + enter, number, or name)"
 	}
-	if status != "" {
-		status += "\n"
-	}
+	status := statusStyle.Render(modeStatus) + "\n" + statusStyle.Render(m.formatBusyStatus()) + "\n"
 	return m.viewport.View() + "\n" + status + inputBoxStyle.Width(m.width).Render(m.input.View())
+}
+
+// formatBusyStatus renders one line listing every currently-busy agent with
+// an animated spinner and elapsed time — e.g. "⠙ claude (12s)  ·  ⠙ opencode
+// (3s)" — or "" if none are busy. Found live: with no such indicator, a
+// long-running turn with no streamed output yet (an agent silently
+// "thinking" before its first token) looked identical to nothing happening
+// at all. Walks agentSpecs in registry order, the same determinism
+// convention formatCapabilities/formatStats use, so this doesn't reorder
+// from frame to frame as map iteration would.
+func (m Model) formatBusyStatus() string {
+	frame := render.SpinnerFrame(m.uiTick)
+	var parts []string
+	for _, spec := range m.agentSpecs {
+		w, ok := m.workers[spec.Name]
+		if !ok {
+			continue
+		}
+		start, busy := w.StartedAt()
+		if !busy {
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%c %s (%s)", frame, spec.Name, formatDuration(time.Since(start))))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return strings.Join(parts, "  ·  ")
 }
 
 var (
@@ -383,6 +548,18 @@ func (m Model) handleOutput(u bus.Update) (tea.Model, tea.Cmd) {
 		m.commands[u.Agent] = acu.AvailableCommands
 	}
 
+	// Tally direct mechanical work for the `stats` command (see agentStats'
+	// doc comment) — ToolCall (not ToolCallUpdate) fires exactly once per
+	// tool call, when it's first announced, so this can't double-count a
+	// call across its later status updates. Excludes the delegate tool
+	// itself: that's already counted precisely via delegateLogMsg below
+	// (source/target, not just "claude made an other-kind call").
+	if tc := u.Notification.Update.ToolCall; tc != nil {
+		if !strings.HasPrefix(strings.ToLower(tc.Title), strings.ToLower(delegate.ToolTitlePrefix)) {
+			m.stats.direct[u.Agent]++
+		}
+	}
+
 	if key, text, ok := m.renderer.FormatUpdate(u); ok {
 		m.mergeBlock(key, text)
 		m.syncViewport()
@@ -396,21 +573,25 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) Model {
 	m.ready = true
 
 	// Must match View()'s exact layout line-for-line: viewport, then a
-	// literal "\n" separator, then the (always reserved, even when blank
-	// this frame) status line, then inputBoxStyle's rendered output —
-	// which is itself 2 lines (its top border, then the input content),
-	// not 1. Under-reserving here would make the input box (or its
+	// literal "\n" separator, then two always-reserved (even when blank
+	// this frame) status lines, then inputBoxStyle's rendered output —
+	// which is itself 1 (top border) + inputHeight (textarea content)
+	// lines. Under-reserving here would make the input box (or its
 	// border) get clipped off the bottom by the terminal itself.
 	separatorHeight := 1
-	statusHeight := 1
-	inputBoxHeight := 2 // border line + content line
+	statusHeight := 2
+	inputBoxHeight := 1 + inputHeight // border line + textarea content lines
 	vpHeight := m.height - separatorHeight - statusHeight - inputBoxHeight
 	if vpHeight < 1 {
 		vpHeight = 1
 	}
 	m.viewport.Width = m.width
 	m.viewport.Height = vpHeight
-	m.input.Width = m.width - 2 // leave room for the cursor near the edge
+	// textarea.Model.SetWidth accounts for its own Prompt width internally
+	// (unlike textinput, which needed the prompt's width subtracted by
+	// hand here) — see SetWidth's doc comment. The "-2" margin matches
+	// what this line always reserved before the textinput->textarea swap.
+	m.input.SetWidth(m.width - 2)
 
 	m.renderer.SetWidth(m.width)
 	m.syncViewport()
@@ -435,32 +616,34 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// (bound in its DefaultKeyMap — ctrl+u/ctrl+d are half-page, kept as
 	// a deliberate second, redundant path alongside pgup/pgdown: plain
 	// control bytes like ctrl+u don't depend on a terminal correctly
-	// translating a "special key" escape sequence the way pgup/pgdown/
-	// home/end do, which is suspected — not yet confirmed, no way to
-	// test it from this environment — as the cause of pgup/pgdown not
-	// scrolling at all on at least one real Windows console
-	// (chorus-spec.md §0). home/end have no default viewport binding, so
-	// they're wired directly to GotoTop/GotoBottom instead.
+	// translating a "special key" escape sequence the way pgup/pgdown
+	// do, which is suspected — not yet confirmed, no way to test it from
+	// this environment — as the cause of pgup/pgdown not scrolling at all
+	// on at least one real Windows console (chorus-spec.md §0).
+	//
+	// home/end used to jump the viewport to top/bottom here, back when the
+	// input was a single-line textinput with nowhere for a cursor to
+	// usefully land. Now that it's a multi-line textarea, home/end are
+	// needed for their far more standard job — start/end of the current
+	// input line — so they're deliberately NOT intercepted here anymore;
+	// they fall through below to the textarea, whose DefaultKeyMap already
+	// binds home/end (and, for the same job, ctrl+a/ctrl+e — the readline-
+	// style bindings macOS Terminal/iTerm's own line editing uses, so
+	// nothing extra was needed to satisfy "appropriate keys on macOS").
+	// Jumping the viewport to top/bottom is still reachable via pgup/pgdown.
 	switch msg.String() {
 	case "pgup", "pgdown", "ctrl+u", "ctrl+d":
 		var cmd tea.Cmd
 		m.viewport, cmd = m.viewport.Update(msg)
 		return m, cmd
-	case "home":
-		m.viewport.GotoTop()
-		return m, nil
-	case "end":
-		m.viewport.GotoBottom()
-		return m, nil
 	}
 
 	// Arrow-key menu navigation, only while a permission or routeAsk
-	// menu is actually up — otherwise up/down fall through to the input
-	// box as normal (textinput has no history feature bound to them, so
-	// this doesn't take anything away from ordinary typing). Typing a
-	// number/name still works exactly as before regardless of whether
-	// the user has also been arrowing around — see handlePermissionAnswer/
-	// handleRouteAnswer's empty-line-means-arrow-selection fallback.
+	// menu is actually up — otherwise up/down fall through to input-box
+	// handling below. Typing a number/name still works exactly as before
+	// regardless of whether the user has also been arrowing around — see
+	// handlePermissionAnswer/handleRouteAnswer's empty-line-means-arrow-
+	// selection fallback.
 	if mode := m.mode(); mode != modeNormal {
 		switch msg.Type {
 		case tea.KeyUp:
@@ -468,6 +651,21 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case tea.KeyDown:
 			return m.moveMenuCursor(mode, 1), nil
 		}
+	}
+
+	// Up/Down move the cursor within a multi-line prompt exactly like any
+	// other multi-line editor (forwarded to the textarea below, unchanged)
+	// — UNLESS the cursor is already at the very top/bottom display row of
+	// the input, in which case there's nowhere further for it to go, and
+	// the key instead recalls prompt history. "Top/bottom row" (not just
+	// "first/last logical line") matters for a long single-line prompt
+	// that's soft-wrapped across several rows — see atInputTop/
+	// atInputBottom's own comments.
+	if msg.Type == tea.KeyUp && m.atInputTop() {
+		return m.historyUp(), nil
+	}
+	if msg.Type == tea.KeyDown && m.atInputBottom() {
+		return m.historyDown(), nil
 	}
 
 	if msg.Type != tea.KeyEnter {
@@ -487,6 +685,73 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	default:
 		return m.handleNormalLine(line)
 	}
+}
+
+// atInputTop reports whether the input's cursor is on the topmost display
+// row of the (possibly soft-wrapped) textarea content — i.e. there's
+// nowhere for Up to move the cursor to, so it should recall history
+// instead. Checking Line()==0 alone isn't enough: a single long line that
+// wraps across several display rows keeps Line()==0 (a logical, not
+// display, line index) until the cursor reaches the very top of that wrap,
+// so RowOffset==0 is also required.
+func (m Model) atInputTop() bool {
+	return m.input.Line() == 0 && m.input.LineInfo().RowOffset == 0
+}
+
+// atInputBottom is atInputTop's mirror for Down — see its comment.
+func (m Model) atInputBottom() bool {
+	li := m.input.LineInfo()
+	return m.input.Line() == m.input.LineCount()-1 && li.RowOffset == li.Height-1
+}
+
+// historyUp recalls the previous entry in promptHistory, saving the
+// current (possibly partially-typed) input as historyDraft the first time
+// it's called so paging back down past the newest entry restores it
+// instead of leaving the input blank — the same convention a shell's
+// readline history uses.
+func (m Model) historyUp() Model {
+	if len(m.promptHistory) == 0 {
+		return m
+	}
+	switch {
+	case m.historyIndex == -1:
+		m.historyDraft = m.input.Value()
+		m.historyIndex = len(m.promptHistory) - 1
+	case m.historyIndex > 0:
+		m.historyIndex--
+	default:
+		return m // already at the oldest entry
+	}
+	m.input.SetValue(m.promptHistory[m.historyIndex])
+	return m
+}
+
+// historyDown is historyUp's mirror for Down — see its comment.
+func (m Model) historyDown() Model {
+	if m.historyIndex == -1 {
+		return m // not currently navigating history
+	}
+	if m.historyIndex < len(m.promptHistory)-1 {
+		m.historyIndex++
+		m.input.SetValue(m.promptHistory[m.historyIndex])
+		return m
+	}
+	m.historyIndex = -1
+	m.input.SetValue(m.historyDraft)
+	m.historyDraft = ""
+	return m
+}
+
+// recordHistory appends a just-submitted line to promptHistory (skipping
+// an exact repeat of the immediately preceding entry, so holding Up doesn't
+// require paging through a run of duplicates to get past them) and resets
+// history navigation state, exactly like a shell submitting a new command.
+func (m *Model) recordHistory(line string) {
+	if n := len(m.promptHistory); n == 0 || m.promptHistory[n-1] != line {
+		m.promptHistory = append(m.promptHistory, line)
+	}
+	m.historyIndex = -1
+	m.historyDraft = ""
 }
 
 // handlePermissionAnswer resolves an Enter press while a permission is
@@ -528,6 +793,8 @@ func (m Model) handleRouteAnswer(line string) (tea.Model, tea.Cmd) {
 	}
 	if msg := queuePrompt(agent, m.pendingRoute.text, m.workers); msg != "" {
 		m.appendLine(msg + "\n")
+	} else {
+		m.appendLine(m.renderer.FormatUserPrompt(agent, m.pendingRoute.text))
 	}
 	m.pendingRoute = nil
 	m.routeMenuIndex = -1
@@ -539,9 +806,13 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 	if line == "" {
 		return m, nil
 	}
+	m.recordHistory(line)
 	if line == "quit" || line == "exit" {
 		m.quitting = true
 		return m, tea.Quit
+	}
+	if strings.HasPrefix(line, "!") {
+		return m.handleNativeCommand(line)
 	}
 	if line == "thoughts" {
 		m.renderer.ShowThoughts = !m.renderer.ShowThoughts
@@ -559,10 +830,22 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 		m.syncViewport()
 		return m, nil
 	}
+	if line == "stats" {
+		m.appendLine(formatStats(m.agentSpecs, m.stats))
+		m.syncViewport()
+		return m, nil
+	}
 
-	msg, ask := dispatch(line, m.workers, m.routing, m.commands)
+	agent, sentText, msg, ask := dispatch(line, m.workers, m.routing, m.commands)
 	if msg != "" {
 		m.appendLine(msg + "\n")
+	}
+	if agent != "" {
+		// Echo what was actually asked — ACP never sends this back on a
+		// live turn (only on session/load history replay), so without
+		// this the only thing that ever appeared was the reply, with no
+		// way to tell which reply answered which question. Found live.
+		m.appendLine(m.renderer.FormatUserPrompt(agent, sentText))
 	}
 	if ask != nil {
 		m.pendingRoute = ask
@@ -572,6 +855,26 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 	}
 	m.syncViewport()
 	return m, nil
+}
+
+// handleNativeCommand handles a "!<cmdline>" input line — chorus's native,
+// agent-free command execution (see runNativeCommand's doc comment for the
+// full rationale). Echoes the command immediately (same "echo what was
+// actually sent" convention handleNormalLine's dispatch path uses for
+// agent prompts) and kicks off async execution via a tea.Cmd — never run
+// synchronously here, since Update() must stay free to keep servicing
+// outputCh/permCh for every agent while the command runs, exactly the
+// discipline AgentWorker exists for on the agent-prompt side.
+func (m Model) handleNativeCommand(line string) (tea.Model, tea.Cmd) {
+	cmdline := strings.TrimSpace(strings.TrimPrefix(line, "!"))
+	if cmdline == "" {
+		m.appendLine("usage: !<shell command>  (runs directly on this machine, no agent involved)\n")
+		m.syncViewport()
+		return m, nil
+	}
+	m.appendLine(m.renderer.FormatNativeCommandEcho(cmdline))
+	m.syncViewport()
+	return m, runNativeCommand(m.ctx, cmdline)
 }
 
 // mergeBlock implements the document's merge rule: a mergeable block
@@ -658,10 +961,26 @@ func (m *Model) appendLine(text string) {
 // only if it was true beforehand. Getting this order right matters —
 // reversed, the view yanks back to bottom while a user is scrolling
 // through history during active streaming.
+//
+// Exception: while a permission or routeAsk menu is pending (m.mode() !=
+// modeNormal), GotoBottom fires unconditionally instead of only when
+// atBottom was already true. Found live: a user who had scrolled up even
+// slightly when a menu appeared (or who scrolled away while it was
+// already showing) would have it render partially or entirely off-screen
+// — arrow-key cursor movement doesn't scroll the viewport (down/up are
+// captured for menu selection instead, see handleKey), so nothing short
+// of pgup/pgdn/home/end could bring it back into view, and the user has
+// no way to answer a question they can't see. A pending menu blocks all
+// forward progress until it's answered, so unlike ordinary streamed
+// output it must always win over the user's scroll position — every
+// syncViewport call while one is pending (menu creation, cursor move,
+// an "invalid choice" reprompt, or even unrelated output from another
+// agent streaming in around it) re-pins the view to the bottom until the
+// menu is resolved.
 func (m *Model) syncViewport() {
 	atBottom := m.viewport.AtBottom()
 	m.viewport.SetContent(m.renderDocument())
-	if atBottom {
+	if atBottom || m.mode() != modeNormal {
 		m.viewport.GotoBottom()
 	}
 }

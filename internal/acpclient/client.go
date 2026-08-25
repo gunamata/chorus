@@ -22,6 +22,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,25 +36,60 @@ import (
 
 // Client implements acp.Client for one agent's connection.
 type Client struct {
-	Agent    string
-	OutputCh chan<- bus.Update
-	PermCh   chan<- bus.PermissionRequest
-	Policy   policy.Policy
+	Agent      string
+	OutputCh   chan<- bus.Update
+	PermCh     chan<- bus.PermissionRequest
+	Policy     policy.Policy
+	Delegation policy.Delegation
+	// CostTiers maps every registered agent's name (including Agent
+	// itself) to its agents.yaml cost_tier — needed to tell whether Agent
+	// is the metered one and whether any OTHER connected agent is cheap
+	// enough to nudge toward. Populated once at construction (the full
+	// registry is known before any agent connects — see main.go), unlike
+	// idler/nudgeFn below, which can only be wired up once tui.AgentWorker
+	// instances exist (main.go's phase 3, after every Connection).
+	CostTiers map[string]string
 
-	mu        sync.Mutex
-	terminals map[string]*terminal
+	mu          sync.Mutex
+	terminals   map[string]*terminal
+	nudgeCounts map[string]int
+	idler       func(agent string) bool
+	nudgeFn     func(agent, text string)
 }
 
 var _ acp.Client = (*Client)(nil)
 
-func New(agent string, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy) *Client {
+func New(agent string, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, delegation policy.Delegation, costTiers map[string]string) *Client {
 	return &Client{
-		Agent:     agent,
-		OutputCh:  outputCh,
-		PermCh:    permCh,
-		Policy:    pol,
-		terminals: make(map[string]*terminal),
+		Agent:       agent,
+		OutputCh:    outputCh,
+		PermCh:      permCh,
+		Policy:      pol,
+		Delegation:  delegation,
+		CostTiers:   costTiers,
+		terminals:   make(map[string]*terminal),
+		nudgeCounts: make(map[string]int),
 	}
+}
+
+// SetIdler wires up the callback trackDelegationPreference uses to ask
+// whether another agent is currently free to take a delegated sub-task.
+// Called post-construction (session.Connection.SetIdleChecker) once
+// tui.AgentWorker instances exist — Client itself is constructed earlier,
+// in Connect, before any worker does.
+func (c *Client) SetIdler(fn func(agent string) bool) {
+	c.mu.Lock()
+	c.idler = fn
+	c.mu.Unlock()
+}
+
+// SetNudgeFunc wires up the callback trackDelegationPreference invokes
+// once a delegation nudge is actually due. Same post-construction timing
+// as SetIdler.
+func (c *Client) SetNudgeFunc(fn func(agent, text string)) {
+	c.mu.Lock()
+	c.nudgeFn = fn
+	c.mu.Unlock()
 }
 
 // SessionUpdate forwards the notification to the shared output channel.
@@ -77,6 +113,7 @@ func (c *Client) RequestPermission(ctx context.Context, params acp.RequestPermis
 	if params.ToolCall.Title != nil {
 		title = *params.ToolCall.Title
 	}
+	c.trackDelegationPreference(kind, title)
 	if c.Policy.AutoAllow(c.Agent, kind) || c.Policy.AutoAllowTool(c.Agent, title) {
 		if resp, ok := firstAllowOption(params.Options); ok {
 			return resp, nil
@@ -108,6 +145,122 @@ func firstAllowOption(options []acp.PermissionOption) (acp.RequestPermissionResp
 	return acp.RequestPermissionResponse{}, false
 }
 
+// trackDelegationPreference is CLAUDE.md's delegation-maximization plan
+// item 2: since ACP's RequestPermissionResponse carries only an
+// Outcome (Selected{OptionId} or Cancelled) — no free-text field — there
+// is no protocol-level way to "redirect" a tool call toward delegating
+// instead. The only channel that can ever put a suggestion in front of an
+// agent is a normal prompt turn, so this counts direct Prefer-kind tool
+// calls since the acting agent's last `delegate` call and, once
+// Delegation.Threshold() is reached, fires nudgeFn with suggestion text
+// for the caller to queue as that agent's next turn (see
+// session.Connection.SetNudgeFunc / main.go's wiring). This runs on every
+// RequestPermission/checkPermission call regardless of allow/deny — an
+// agent that keeps asking-and-being-approved for mechanical work directly
+// is exactly the pattern worth nudging, not just auto-allowed calls.
+func (c *Client) trackDelegationPreference(kind, title string) {
+	if len(c.Delegation.Prefer) == 0 {
+		return
+	}
+	if c.Policy.AutoAllowTool(c.Agent, title) {
+		// This IS a delegate call (auto_allow_tools is, by this project's
+		// own convention, scoped to exactly that tool) — the agent just
+		// did the preferred thing, so the streak resets.
+		c.mu.Lock()
+		delete(c.nudgeCounts, c.Agent)
+		c.mu.Unlock()
+		return
+	}
+	if c.CostTiers[c.Agent] != "metered" || !c.Delegation.PreferKind(kind) {
+		return
+	}
+
+	// Count every direct Prefer-kind call since the last delegate call
+	// first, regardless of whether a cheaper agent happens to be idle
+	// right now — idleCheaperAgents is only consulted once the streak is
+	// ready to fire. Checking it before incrementing (as this used to)
+	// meant a run of direct calls made while every non-metered agent was
+	// busy didn't count at all, undercounting the streak this function's
+	// own doc comment claims to track.
+	c.mu.Lock()
+	c.nudgeCounts[c.Agent]++
+	ready := c.nudgeCounts[c.Agent] >= c.Delegation.Threshold()
+	c.mu.Unlock()
+	if !ready {
+		return
+	}
+
+	idleCheaper := c.idleCheaperAgents()
+	if len(idleCheaper) == 0 {
+		// Threshold reached but nothing to suggest yet — leave the counter
+		// at/above threshold so this fires the moment a cheaper agent goes
+		// idle, instead of resetting and losing the streak.
+		return
+	}
+
+	c.mu.Lock()
+	delete(c.nudgeCounts, c.Agent)
+	fn := c.nudgeFn
+	c.mu.Unlock()
+
+	if fn != nil {
+		fn(c.Agent, buildNudgeText(kind, idleCheaper))
+	}
+}
+
+// idleCheaperAgents returns every OTHER registered agent whose cost_tier
+// isn't "metered" and whose worker is currently idle, in CostTiers'
+// (map, so unordered) iteration order sorted for determinism. Returns nil
+// if idler was never wired up (SetIdler not yet called — a narrow startup
+// window, see main.go) rather than treating "unknown" as "idle."
+func (c *Client) idleCheaperAgents() []string {
+	c.mu.Lock()
+	idler := c.idler
+	c.mu.Unlock()
+	if idler == nil {
+		return nil
+	}
+	var out []string
+	for name, tier := range c.CostTiers {
+		if name == c.Agent || tier == "metered" {
+			continue
+		}
+		if idler(name) {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// buildNudgeText builds the suggestion queued as the metered agent's next
+// turn once trackDelegationPreference's threshold is hit. Opens with the
+// same explicit self-identification buildBriefingText (main.go) uses —
+// found live (chorus-spec.md §0) to be necessary for at least one agent
+// (opencode) to not spend a turn suspecting a plain instruction message
+// is a prompt-injection attempt.
+func buildNudgeText(kind string, idleCheaper []string) string {
+	return fmt.Sprintf(
+		"This is an automated note from chorus itself, not from the user — no response needed, nothing to "+
+			"acknowledge. You've made several %q-kind tool calls directly in a row. %s currently idle and "+
+			"reachable through your `delegate` tool — consider delegating similar mechanical sub-tasks to "+
+			"one of them going forward, when the work doesn't depend on context only you have.",
+		kind, idleAgentsClause(idleCheaper))
+}
+
+// idleAgentsClause renders idleCheaper as a short clause, singular or
+// plural, e.g. "opencode is" or "gemini and opencode are".
+func idleAgentsClause(idleCheaper []string) string {
+	switch len(idleCheaper) {
+	case 0:
+		return "another connected agent is"
+	case 1:
+		return idleCheaper[0] + " is"
+	default:
+		return strings.Join(idleCheaper[:len(idleCheaper)-1], ", ") + " and " + idleCheaper[len(idleCheaper)-1] + " are"
+	}
+}
+
 // checkPermission is the client-owned counterpart to RequestPermission:
 // used for RPCs the agent invokes directly (ReadTextFile, WriteTextFile,
 // CreateTerminal) that carry no permission request of their own. It checks
@@ -116,6 +269,7 @@ func firstAllowOption(options []acp.PermissionOption) (acp.RequestPermissionResp
 // exact same permCh -> main-loop-prompt -> resp flow RequestPermission
 // uses, so it reuses the existing UI without any changes there.
 func (c *Client) checkPermission(ctx context.Context, kind acp.ToolKind, title string, sessionID acp.SessionId) (bool, error) {
+	c.trackDelegationPreference(string(kind), title)
 	if c.Policy.AutoAllow(c.Agent, string(kind)) {
 		return true, nil
 	}

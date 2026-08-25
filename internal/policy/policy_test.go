@@ -74,6 +74,57 @@ claude:
 	}
 }
 
+func TestLoad_ParsesDelegationPreferAndThreshold(t *testing.T) {
+	path := writeTempPolicy(t, `
+delegation:
+  prefer: [execute, edit]
+  nudge_threshold: 5
+`)
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Delegation.PreferKind("execute") || !cfg.Delegation.PreferKind("edit") {
+		t.Fatalf("Delegation.Prefer = %v, want it to include execute and edit", cfg.Delegation.Prefer)
+	}
+	if cfg.Delegation.PreferKind("read") {
+		t.Fatal("PreferKind(\"read\") = true, want false — read wasn't listed")
+	}
+	if got := cfg.Delegation.Threshold(); got != 5 {
+		t.Fatalf("Threshold() = %d, want 5", got)
+	}
+}
+
+func TestDelegation_Threshold_DefaultsWhenUnsetOrNonPositive(t *testing.T) {
+	cases := []struct {
+		name string
+		d    Delegation
+	}{
+		{"unset", Delegation{}},
+		{"zero", Delegation{NudgeThreshold: intPtr(0)}},
+		{"negative", Delegation{NudgeThreshold: intPtr(-1)}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := c.d.Threshold(); got != defaultNudgeThreshold {
+				t.Fatalf("Threshold() = %d, want default %d", got, defaultNudgeThreshold)
+			}
+		})
+	}
+}
+
+func TestDelegation_PreferKind_EmptyPreferMatchesNothing(t *testing.T) {
+	var d Delegation
+	if d.PreferKind("execute") {
+		t.Fatal("PreferKind(\"execute\") = true, want false when Prefer is empty (nudge disabled)")
+	}
+	if d.PreferKind("") {
+		t.Fatal("PreferKind(\"\") = true, want false for an empty kind")
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
 func TestLoad_MergesAgentPoliciesAndRouting(t *testing.T) {
 	path := writeTempPolicy(t, `
 claude:

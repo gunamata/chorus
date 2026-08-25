@@ -5,12 +5,14 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"fmt"
 	"io"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -57,14 +59,9 @@ func run(fresh bool) error {
 		return err
 	}
 
-	agentSpecs, err := registry.Load(filepath.Join(cwd, "agents.yaml"))
+	agentSpecs, cfg, err := loadAgentConfig(cwd)
 	if err != nil {
-		return fmt.Errorf("load agents.yaml: %w", err)
-	}
-
-	cfg, err := policy.Load(filepath.Join(cwd, "policy.yaml"))
-	if err != nil {
-		return fmt.Errorf("load policy.yaml: %w", err)
+		return err
 	}
 
 	store, err := sessionstore.Load(filepath.Join(cwd, ".chorus", "sessions.json"))
@@ -75,6 +72,7 @@ func run(fresh bool) error {
 	outputCh := make(chan bus.Update, 64)
 	permCh := make(chan bus.PermissionRequest, 4)
 	errCh := make(chan tui.ErrMsg, 8)
+	doneCh := make(chan tui.PromptDoneMsg, 8)
 	delegateLogCh := make(chan delegate.LogEntry, 8)
 
 	// logDir holds each agent subprocess's raw stderr — deliberately never
@@ -96,11 +94,20 @@ func run(fresh bool) error {
 	// creation because the delegate-mcp Hub (phase 2) needs to know the
 	// final set of successfully connected agents before any of them gets
 	// a session with the delegate tool attached.
+	// costTiers feeds acpclient.Client's delegation-nudge logic (CLAUDE.md's
+	// delegation-maximization plan item 2) — built once, upfront, from the
+	// full registry (unlike idle-checking, which needs tui.AgentWorker
+	// instances that only exist later, in phase 3 below).
+	costTiers := make(map[string]string, len(agentSpecs))
+	for _, spec := range agentSpecs {
+		costTiers[spec.Name] = spec.CostTier
+	}
+
 	conns := make(map[string]*session.Connection)
 	var startErrs []string
 	for _, spec := range agentSpecs {
 		fmt.Printf("starting %s (%s %s)...\n", spec.Name, spec.Command, strings.Join(spec.Args, " "))
-		conn, err := session.Connect(ctx, spec, outputCh, permCh, cfg.Agents, agentStderr(logDir, spec.Name))
+		conn, err := session.Connect(ctx, spec, outputCh, permCh, cfg.Agents, cfg.Delegation, costTiers, agentStderr(logDir, spec.Name))
 		if err != nil {
 			startErrs = append(startErrs, fmt.Sprintf("%s: %v", spec.Name, err))
 			continue
@@ -147,6 +154,16 @@ func run(fresh bool) error {
 	// don't keep retrying it.
 	sessions := make(map[string]*session.AgentSession)
 	workers := make(map[string]*tui.AgentWorker)
+	// workersMu guards every access to workers below. The main goroutine
+	// keeps writing new entries into it as later agents in agentSpecs
+	// finish starting, while the SetIdleChecker/SetNudgeFunc closures wired
+	// up per-iteration below can be invoked from a DIFFERENT agent's
+	// connection read-loop goroutine as soon as that agent's worker starts
+	// processing its queued briefing — i.e. concurrently with this loop
+	// still running for later agents. Without this lock that's an
+	// unsynchronized concurrent map read+write, which is a fatal Go runtime
+	// error, not a recoverable one.
+	var workersMu sync.Mutex
 	for _, spec := range agentSpecs {
 		conn, ok := conns[spec.Name]
 		if !ok {
@@ -171,27 +188,72 @@ func run(fresh bool) error {
 		if err := store.Set(spec.Name, string(s.SessionID)); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to save session ID for %s: %v\n", spec.Name, err)
 		}
+		if !resumed {
+			// A genuinely fresh session's history is empty — whatever
+			// briefing status a PRIOR session under this agent name reached
+			// (e.g. before a stale ID was rejected, or before --fresh) no
+			// longer applies. See ResetBriefed's doc comment.
+			if err := store.ResetBriefed(spec.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to reset delegation-briefing status for %s: %v\n", spec.Name, err)
+			}
+		}
 
 		sessions[spec.Name] = s
-		workers[spec.Name] = tui.StartWorker(ctx, s, errCh)
+		workersMu.Lock()
+		workers[spec.Name] = tui.StartWorker(ctx, s, errCh, doneCh)
+		workersMu.Unlock()
+		// Wire up the delegation-nudge callbacks now that this agent's
+		// worker exists (CLAUDE.md's delegation-maximization plan item 2).
+		// Both closures capture the `workers` map by reference, not by
+		// value — later iterations of this loop still populate entries
+		// these closures will see correctly whenever they're actually
+		// invoked (well after startup, from a connection's own read-loop
+		// goroutine), even though not every agent's worker exists yet at
+		// the moment the closures are created. Guarded by workersMu since
+		// these run concurrently with this loop's own writes — see its
+		// declaration above.
+		conn.SetIdleChecker(func(name string) bool {
+			workersMu.Lock()
+			w, ok := workers[name]
+			workersMu.Unlock()
+			return ok && w.Idle()
+		})
+		conn.SetNudgeFunc(func(agent, text string) {
+			workersMu.Lock()
+			defer workersMu.Unlock()
+			tui.QueuePrompt(agent, text, workers)
+		})
 		if resumed {
 			fmt.Printf("%s resumed (session %s)\n", spec.Name, s.SessionID)
 		} else {
 			fmt.Printf("%s ready (session %s)\n", spec.Name, s.SessionID)
 		}
-		// Seed a one-time delegation briefing on brand-new sessions, once
-		// delegation is actually possible (2+ agents). Real ACP history
-		// replay (session/load) means this becomes part of the agent's
-		// own conversation and persists across every future resume — no
-		// "resend periodically" logic needed on top of the !resumed
-		// check. Sent as a real, visible turn (not hidden like a
-		// delegation sub-session) so the user can see exactly what bias
-		// was introduced. Known gap, documented in CLAUDE.md: a session
-		// resumed from before a 2nd agent existed never gets this —
-		// restart with --fresh to pick it up.
-		if attachDelegate && !resumed && cfg.BriefingEnabled() {
+		// Seed a one-time delegation briefing once delegation is actually
+		// possible (2+ agents) AND this agent's session hasn't already
+		// received one — tracked persistently in sessionstore
+		// (Store.Briefed/MarkBriefed), independent of whether THIS run
+		// resumed or started fresh. Real ACP history replay (session/load)
+		// means this becomes part of the agent's own conversation and
+		// persists across every future resume — no "resend periodically"
+		// logic needed once sent. Sent as a real, visible turn (not hidden
+		// like a delegation sub-session) so the user can see exactly what
+		// bias was introduced.
+		//
+		// This used to be gated on plain `!resumed`, which meant a session
+		// that existed before a 2nd agent ever connected — the ordinary
+		// shape of a chorus session that's been running a while — would
+		// never receive it no matter how many later runs happened with
+		// delegation fully possible (CLAUDE.md's delegation-maximization
+		// plan flagged this as a known, deliberately deferred gap). Tracking
+		// "briefed" as its own fact fixes that: it now fires on the very
+		// next run where attachDelegate is true, for any session that
+		// hasn't seen it yet, resumed or not.
+		if attachDelegate && !store.Briefed(spec.Name) && cfg.BriefingEnabled() {
 			roster := delegate.BuildRoster(agentSpecs, conns, spec.Name)
 			tui.QueuePrompt(spec.Name, buildBriefingText(roster), workers)
+			if err := store.MarkBriefed(spec.Name); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to record delegation briefing for %s: %v\n", spec.Name, err)
+			}
 		}
 	}
 	if len(sessions) == 0 {
@@ -220,7 +282,7 @@ func run(fresh bool) error {
 		r.WithImageDir(imageDir)
 	}
 
-	fmt.Println(`Type "<agent>: <text>" to prompt a specific agent, or just type a prompt to auto-route it. Type "/name ..." to run a known slash command, "commands" to list them, "capabilities" to show what each agent advertises, "thoughts" to toggle agent thinking output, quit/exit to end.`)
+	fmt.Println(`Type "<agent>: <text>" to prompt a specific agent, or just type a prompt to auto-route it. Type "/name ..." to run a known slash command, "commands" to list them, "capabilities" to show what each agent advertises, "stats" to show direct-vs-delegated tool activity, "thoughts" to toggle agent thinking output, quit/exit to end.`)
 
 	// The rest of chorus's interactive behavior — permission Q&A, route-
 	// ambiguity prompts, slash commands, auto-routing, the scrolling
@@ -230,13 +292,21 @@ func run(fresh bool) error {
 	// visible on the normal screen buffer until then, then are hidden
 	// until the program exits — see chorus-spec.md's TUI design notes,
 	// this is a deliberate trade-off, not an oversight).
-	// Deliberately NOT tea.WithMouseCellMotion(): enabling mouse capture
-	// stops the terminal from treating click-drag as native text
-	// selection (the mouse events go to chorus instead) — confirmed live
-	// to actually break copy/paste, which matters more for a coding tool
-	// than scroll-wheel support. PgUp/PgDn/Home/End (Model.handleKey)
-	// cover scrolling without this trade-off; Claude Code's own CLI makes
-	// the same call.
+	// tea.WithMouseCellMotion() enables mouse wheel scrolling
+	// (Model.Update's tea.MouseMsg case, forwarded to viewport.Update).
+	// This does take over plain click-drag (it goes to chorus, not the
+	// terminal) — confirmed live this breaks native text selection with
+	// no workaround on at least one Windows console. Re-enabled anyway
+	// (2026-08, reverting an earlier removal) once it became clear most
+	// terminal emulators (confirmed: Windows Terminal) let a modifier key
+	// (commonly Shift) held during click-drag override a program's mouse
+	// capture and select text natively regardless — the same mechanism
+	// Claude Code/Gemini CLI's own UIs rely on, not evidence they avoid
+	// mouse capture altogether. Whether the SAME override works in
+	// classic cmd.exe/conhost specifically (vs. Windows Terminal) is
+	// unconfirmed — if selection turns out to be unrecoverable on a given
+	// terminal, that terminal's own mouse-mode override is the thing to
+	// chase, not another removal of this line.
 	p := tea.NewProgram(tui.New(tui.Config{
 		Ctx:           ctx,
 		Renderer:      r,
@@ -248,8 +318,9 @@ func run(fresh bool) error {
 		OutputCh:      outputCh,
 		PermCh:        permCh,
 		ErrCh:         errCh,
+		DoneCh:        doneCh,
 		DelegateLogCh: delegateLogCh,
-	}), tea.WithAltScreen())
+	}), tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err = p.Run()
 	return err
 }
@@ -277,6 +348,99 @@ func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *se
 		return nil, false
 	}
 	return s, false
+}
+
+// embeddedAgentsYAML/embeddedPolicyYAML are this repo's own agents.yaml/
+// policy.yaml, baked into the binary at build time — chorus's reference
+// config (claude/gemini/opencode, the policy tuned for them in
+// CLAUDE.md's delegation-maximization plan) doubles as the shipped
+// default, rather than maintaining a second, separate "default" pair
+// that could drift from what's actually tested. loadAgentConfig falls
+// back to these only when no local file exists in cwd.
+//
+//go:embed agents.yaml
+var embeddedAgentsYAML []byte
+
+//go:embed policy.yaml
+var embeddedPolicyYAML []byte
+
+// loadAgentConfig resolves agents.yaml and policy.yaml for this run. A
+// local file in cwd always takes precedence over the embedded default,
+// checked independently for each of the two files — EXCEPT that a local
+// agents.yaml requires a local policy.yaml too, rather than silently
+// pairing a custom agent set with the embedded default policy:
+// policy.yaml's auto_allow/routing/delegation settings are keyed to
+// specific agent names (claude/gemini/opencode in the embedded default),
+// so applying it to a different agent set could silently under- or
+// over-permission agents it was never written for, or route to agent
+// names that don't even exist in the custom set. Requiring an explicit
+// local policy.yaml forces that to be a conscious choice, not a silent
+// mismatch. The reverse (a local policy.yaml with no local agents.yaml,
+// pairing it with the embedded default agent set) has no such hazard —
+// nothing about policy.yaml's shape depends on where the agent processes
+// come from — so it's allowed.
+func loadAgentConfig(cwd string) ([]session.Spec, policy.Config, error) {
+	agentsPath := filepath.Join(cwd, "agents.yaml")
+	policyPath := filepath.Join(cwd, "policy.yaml")
+
+	localAgents, err := fileExists(agentsPath)
+	if err != nil {
+		return nil, policy.Config{}, fmt.Errorf("check %s: %w", agentsPath, err)
+	}
+	localPolicy, err := fileExists(policyPath)
+	if err != nil {
+		return nil, policy.Config{}, fmt.Errorf("check %s: %w", policyPath, err)
+	}
+	if localAgents && !localPolicy {
+		return nil, policy.Config{}, fmt.Errorf(
+			"found a local agents.yaml in %s but no local policy.yaml — "+
+				"providing your own agents.yaml requires providing a matching policy.yaml too "+
+				"(its auto_allow/routing/delegation settings are keyed to specific agent names, "+
+				"so chorus won't silently pair a custom agent set with its built-in default policy)",
+			cwd)
+	}
+
+	agentsYAML := embeddedAgentsYAML
+	if localAgents {
+		b, err := os.ReadFile(agentsPath)
+		if err != nil {
+			return nil, policy.Config{}, fmt.Errorf("read %s: %w", agentsPath, err)
+		}
+		agentsYAML = b
+	}
+	agentSpecs, err := registry.Parse(agentsYAML)
+	if err != nil {
+		return nil, policy.Config{}, fmt.Errorf("load agents.yaml: %w", err)
+	}
+
+	policyYAML := embeddedPolicyYAML
+	if localPolicy {
+		b, err := os.ReadFile(policyPath)
+		if err != nil {
+			return nil, policy.Config{}, fmt.Errorf("read %s: %w", policyPath, err)
+		}
+		policyYAML = b
+	}
+	cfg, err := policy.Parse(policyYAML)
+	if err != nil {
+		return nil, policy.Config{}, fmt.Errorf("load policy.yaml: %w", err)
+	}
+
+	return agentSpecs, cfg, nil
+}
+
+// fileExists distinguishes "doesn't exist" (fine, fall back to the
+// embedded default) from a real stat error (permissions, a bad path
+// component, etc. — surfaced rather than silently treated as "missing").
+func fileExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
 }
 
 func hasFlag(args []string, flag string) bool {
@@ -367,8 +531,13 @@ func buildBriefingText(roster []delegate.RosterEntry) string {
 	b.WriteString(delegate.FormatRosterLines(roster))
 	b.WriteString("\nYou have a `delegate` tool that hands a self-contained sub-task to one of them and returns ")
 	b.WriteString("its text reply — it runs in a fresh sub-session with no memory of this conversation, so give it ")
-	b.WriteString("full context. When part of what the user asks fits a listed agent's cost tier or notes better ")
-	b.WriteString("than doing it yourself, proactively delegate that part instead of doing everything yourself by ")
-	b.WriteString("default. Treat a delegate reply as an unverified draft you're responsible for checking, not a final answer.")
+	b.WriteString("full context. Delegate isn't just for analysis-shaped work (summarize/explain/review) — once ")
+	b.WriteString("you've done the judgment part of a task (deciding WHAT needs to change, and why) the mechanical ")
+	b.WriteString("part of actually making a well-specified change often doesn't need your own context anymore, ")
+	b.WriteString("only the spec you just worked out. That part is delegable too: hand a cheaper agent the exact ")
+	b.WriteString("file, the exact change, and the reason, then verify what comes back, instead of applying it ")
+	b.WriteString("yourself by default. Proactively look for this split — a task that's \"figure out X, then do X\" ")
+	b.WriteString("is rarely one indivisible unit of work. Treat a delegate reply as an unverified draft you're ")
+	b.WriteString("responsible for checking, not a final answer — that's true whether you delegated analysis or an edit.")
 	return b.String()
 }

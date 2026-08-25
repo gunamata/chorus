@@ -5,13 +5,17 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
+	tea "github.com/charmbracelet/bubbletea"
 	acp "github.com/coder/acp-go-sdk"
 
 	"chorus/internal/bus"
@@ -32,6 +36,41 @@ import (
 type AgentWorker struct {
 	sess *session.AgentSession
 	in   chan []acp.ContentBlock
+	// busy is true while a prompt is in flight (between dequeuing from in
+	// and PromptContent returning) — read via Idle() by
+	// acpclient.Client's delegation-nudge logic (CLAUDE.md's delegation-
+	// maximization plan item 2) to decide whether a cheaper agent is
+	// actually free to take a delegated sub-task right now, not just
+	// connected. atomic rather than a mutex: the only operations are a
+	// single bool set/read, and Idle() is called from a different agent's
+	// connection read-loop goroutine, not this worker's own.
+	busy atomic.Bool
+	// startedAt records when the current in-flight prompt was dequeued —
+	// read by Model's View() (via StartedAt) every render to show a
+	// persistent "<agent> working (12s)" status line, since without it a
+	// long-running turn with no streamed output yet (an agent silently
+	// "thinking" before its first token) looked identical to nothing
+	// happening at all. atomic.Value rather than a plain field for the
+	// same cross-goroutine-read reason busy is atomic; set right alongside
+	// busy so the two never observably disagree.
+	startedAt atomic.Value // time.Time
+}
+
+// Idle reports whether w currently has no prompt in flight.
+func (w *AgentWorker) Idle() bool {
+	return !w.busy.Load()
+}
+
+// StartedAt reports when w's current in-flight prompt began, if it's busy
+// right now. The second return is false while idle — callers must check
+// Idle() (or this) before trusting the time, since startedAt isn't cleared
+// on completion, only overwritten by the next prompt.
+func (w *AgentWorker) StartedAt() (time.Time, bool) {
+	if w.Idle() {
+		return time.Time{}, false
+	}
+	t, ok := w.startedAt.Load().(time.Time)
+	return t, ok
 }
 
 // ErrMsg is a per-prompt error tagged with which agent it came from.
@@ -40,20 +79,116 @@ type ErrMsg struct {
 	Err   error
 }
 
+// PromptDoneMsg reports that agent's in-flight prompt finished (success or
+// error — Err is nil on success), and how long it took. Sent unconditionally
+// by StartWorker's goroutine so Model can append a "finished in Xs" line
+// regardless of outcome; exported (like ErrMsg) since main.go constructs
+// the channel it travels on.
+type PromptDoneMsg struct {
+	Agent    string
+	Duration time.Duration
+	Err      error
+}
+
+// formatDuration renders d as a short, human-scaled duration — "45s",
+// "2m14s", "1h05m" — used both for PromptDoneMsg's "finished in ..." line
+// and the persistent "<agent> working (...)" status line, so a long-running
+// turn reads the same way whether you're watching it live or saw it after
+// the fact.
+func formatDuration(d time.Duration) string {
+	d = d.Round(time.Second)
+	h := d / time.Hour
+	d -= h * time.Hour
+	m := d / time.Minute
+	d -= m * time.Minute
+	s := d / time.Second
+	switch {
+	case h > 0:
+		return fmt.Sprintf("%dh%02dm", h, m)
+	case m > 0:
+		return fmt.Sprintf("%dm%02ds", m, s)
+	default:
+		return fmt.Sprintf("%ds", s)
+	}
+}
+
 // StartWorker launches the goroutine that drains w.in and calls
-// s.PromptContent for each queued prompt, reporting any error on errCh.
-// Called from main.go's startup phase 3, before the Model exists — the
-// returned worker is handed to New via Config.Workers.
-func StartWorker(ctx context.Context, s *session.AgentSession, errCh chan<- ErrMsg) *AgentWorker {
+// s.PromptContent for each queued prompt, reporting any error on errCh and,
+// once the turn finishes either way, its duration on doneCh — Model uses
+// that to append a "finished in Xs" line, since otherwise a completed turn
+// looked no different in the document from one still running (nothing
+// resembling "done" was ever printed at all). Called from main.go's startup
+// phase 3, before the Model exists — the returned worker is handed to New
+// via Config.Workers.
+func StartWorker(ctx context.Context, s *session.AgentSession, errCh chan<- ErrMsg, doneCh chan<- PromptDoneMsg) *AgentWorker {
 	w := &AgentWorker{sess: s, in: make(chan []acp.ContentBlock, 16)}
 	go func() {
 		for blocks := range w.in {
-			if err := s.PromptContent(ctx, blocks); err != nil {
+			start := time.Now()
+			w.startedAt.Store(start)
+			w.busy.Store(true)
+			err := s.PromptContent(ctx, blocks)
+			w.busy.Store(false)
+			if err != nil {
 				errCh <- ErrMsg{Agent: s.Name, Err: err}
 			}
+			doneCh <- PromptDoneMsg{Agent: s.Name, Duration: time.Since(start), Err: err}
 		}
 	}()
 	return w
+}
+
+// nativeCommandTimeout bounds a "!"-command's run — without this, a
+// command that waits on stdin (chorus never connects one — see
+// shellCommand) or otherwise hangs would tie up its goroutine forever with
+// no feedback and no way to cancel it (bubbletea's ctrl+c quits the whole
+// program, it doesn't reach into a running tea.Cmd).
+const nativeCommandTimeout = 5 * time.Minute
+
+// nativeCmdResultMsg reports a completed "!"-command — see
+// runNativeCommand's doc comment.
+type nativeCmdResultMsg struct {
+	cmdline  string
+	output   string
+	err      error
+	duration time.Duration
+}
+
+// shellCommand returns an *exec.Cmd that runs line through the platform's
+// shell (cmd /C on Windows, sh -c elsewhere) rather than as a single bare
+// argv, so a "!"-command supports the pipes/redirects/&&-chains a user
+// would expect from a real terminal. Stdin is left unset (nil), i.e.
+// connected to /dev/null-equivalent, deliberately — bubbletea owns the
+// real stdin once the program is running (concurrency invariant #2,
+// CLAUDE.md), so a command that tries to read from it would just hang
+// until nativeCommandTimeout kills it, not silently steal keystrokes from
+// the TUI.
+func shellCommand(ctx context.Context, line string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.CommandContext(ctx, "cmd", "/C", line)
+	}
+	return exec.CommandContext(ctx, "sh", "-c", line)
+}
+
+// runNativeCommand executes cmdline directly via the OS shell, bypassing
+// every connected agent entirely — chorus's answer to "deterministic,
+// zero-reasoning work (go test, gofmt -l, a build) shouldn't spend an LLM
+// turn, metered or free, just to run a command with one already-correct
+// answer" (CLAUDE.md's delegation-maximization plan, item #1). Runs as a
+// tea.Cmd (bubbletea's own async pattern for one-off work) rather than
+// through an AgentWorker's queue — there's no agent turn to serialize
+// against, and Update() must stay non-blocking exactly as it does for a
+// real agent prompt (concurrency invariant #1). ctx is expected to be
+// Model.ctx, wrapped here with nativeCommandTimeout so a hung command
+// can't block forever with no feedback.
+func runNativeCommand(ctx context.Context, cmdline string) tea.Cmd {
+	return func() tea.Msg {
+		cctx, cancel := context.WithTimeout(ctx, nativeCommandTimeout)
+		defer cancel()
+		start := time.Now()
+		out, err := shellCommand(cctx, cmdline).CombinedOutput()
+		return nativeCmdResultMsg{cmdline: cmdline, output: string(out), err: err, duration: time.Since(start)}
+	}
 }
 
 // pendingRoute is a prompt awaiting a user choice of agent — either §9's
@@ -63,20 +198,6 @@ func StartWorker(ctx context.Context, s *session.AgentSession, errCh chan<- ErrM
 type pendingRoute struct {
 	text       string
 	candidates []string
-}
-
-// joinMsgs joins non-empty parts with a newline — used to combine an
-// informational line (e.g. "(auto-routed to X)") with a possible error
-// from the queuePrompt call that followed it, without a stray blank line
-// when the second part is empty (the common case).
-func joinMsgs(parts ...string) string {
-	var nonEmpty []string
-	for _, p := range parts {
-		if p != "" {
-			nonEmpty = append(nonEmpty, p)
-		}
-	}
-	return strings.Join(nonEmpty, "\n")
 }
 
 // dispatch handles one input line, exactly as chorus-spec.md's REPL
@@ -92,38 +213,49 @@ func joinMsgs(parts ...string) string {
 //     prefix, e.g. a colon appearing naturally inside free text —
 //     auto-routes via router.Choose.
 //
-// Returns any informational text to display (may be "") and, if routing
-// was ambiguous, a non-nil pendingRoute the caller should prompt for and
-// later resolve via queuePrompt once the user answers.
+// Returns the agent that actually received a prompt (empty if none did —
+// on failure, or when ask is non-nil and nothing's been sent yet) and the
+// exact text sent to it (which for the "<agent>: text" form is the part
+// after the colon, not the raw line) — the caller uses these to echo
+// what was actually asked via render.FormatUserPrompt, since ACP has no
+// mechanism for that to come back from the agent itself on a live turn.
+// Also returns any informational text to display (may be "") and, if
+// routing was ambiguous, a non-nil pendingRoute the caller should prompt
+// for and later resolve via queuePrompt once the user answers.
 //
 // Unlike the line-based REPL this was ported from, dispatch never prints
 // directly — bubbletea owns the terminal, so every informational message
 // is returned as text for Update() to append as a block instead.
-func dispatch(line string, workers map[string]*AgentWorker, routing policy.Routing, commands map[string][]acp.AvailableCommand) (string, *pendingRoute) {
-	if agent, rest, ok := strings.Cut(line, ":"); ok {
-		agent = strings.TrimSpace(agent)
+func dispatch(line string, workers map[string]*AgentWorker, routing policy.Routing, commands map[string][]acp.AvailableCommand) (agent, sentText, msg string, ask *pendingRoute) {
+	if a, rest, ok := strings.Cut(line, ":"); ok {
+		a = strings.TrimSpace(a)
 		rest = strings.TrimSpace(rest)
 		// Only treat this as a prefix attempt if the part before ":" has
 		// no spaces — "please fix this: it's broken" isn't someone typing
 		// an agent name, so let it fall through to auto-routing instead.
-		if agent != "" && !strings.ContainsAny(agent, " \t") {
+		if a != "" && !strings.ContainsAny(a, " \t") {
 			if rest == "" {
-				return fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
+				return "", "", fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
 			}
-			if !knownAgent(agent, workers) {
-				return fmt.Sprintf("unknown agent %q (agents: %s)", agent, strings.Join(agentNames(workers), ", ")), nil
+			if !knownAgent(a, workers) {
+				return "", "", fmt.Sprintf("unknown agent %q (agents: %s)", a, strings.Join(agentNames(workers), ", ")), nil
 			}
-			return queuePrompt(agent, rest, workers), nil
+			if errMsg := queuePrompt(a, rest, workers); errMsg != "" {
+				return "", "", errMsg, nil
+			}
+			return a, rest, "", nil
 		}
 	}
 
 	if strings.HasPrefix(line, "/") {
 		if owners := commandOwners(commands, line); len(owners) > 0 {
 			if len(owners) == 1 {
-				msg := queuePrompt(owners[0], line, workers)
-				return joinMsgs(fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), msg), nil
+				if errMsg := queuePrompt(owners[0], line, workers); errMsg != "" {
+					return "", "", errMsg, nil
+				}
+				return owners[0], line, fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), nil
 			}
-			return "", &pendingRoute{text: line, candidates: owners}
+			return "", "", "", &pendingRoute{text: line, candidates: owners}
 		}
 		// No agent has advertised this command (yet, or at all) — fall
 		// through to ordinary routing below rather than erroring; it
@@ -132,13 +264,36 @@ func dispatch(line string, workers map[string]*AgentWorker, routing policy.Routi
 
 	decision := router.Choose(routing, line)
 	if !decision.Matched && routing.AskWhenAmbiguous {
-		return "", &pendingRoute{text: line}
+		return "", "", "", &pendingRoute{text: line}
 	}
-	if decision.Agent == "" || !knownAgent(decision.Agent, workers) {
-		return fmt.Sprintf("no route for this prompt — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
+
+	target := decision.Agent
+	fellBack := false
+	if target == "" || !knownAgent(target, workers) {
+		// Only fall back when a RULE matched an agent that isn't
+		// currently connected — routing.Default already came back as
+		// decision.Agent when nothing matched (decision.Matched ==
+		// false), so falling back to it here would just be falling back
+		// to itself and failing the same way again. Deliberately scoped
+		// to auto-routing only: an explicit "<agent>: text" override or
+		// a slash command still fails outright if that agent isn't
+		// connected, never silently rerouted — you asked for that agent
+		// specifically, chorus doesn't get to override an explicit ask.
+		if decision.Matched && routing.Default != "" && knownAgent(routing.Default, workers) {
+			target = routing.Default
+			fellBack = true
+		} else {
+			return "", "", fmt.Sprintf("no route for this prompt — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
+		}
 	}
-	msg := queuePrompt(decision.Agent, line, workers)
-	return joinMsgs(fmt.Sprintf("(auto-routed to %s)", decision.Agent), msg), nil
+
+	if errMsg := queuePrompt(target, line, workers); errMsg != "" {
+		return "", "", errMsg, nil
+	}
+	if fellBack {
+		return target, line, fmt.Sprintf("(matched %s, but it's not connected — falling back to default: %s)", decision.Agent, target), nil
+	}
+	return target, line, fmt.Sprintf("(auto-routed to %s)", target), nil
 }
 
 // commandName extracts the command name from a "/name ..." line, without
@@ -216,6 +371,43 @@ func formatCapabilities(specs []session.Spec, conns map[string]*session.Connecti
 		fmt.Fprintf(&b, "%s:\n", spec.Name)
 		fmt.Fprintf(&b, "  loadSession (resume):  %v\n", conn.SupportsLoadSession)
 		fmt.Fprintf(&b, "  promptCapabilities.image: %v\n", conn.SupportsImagePrompts)
+	}
+	return b.String()
+}
+
+// formatStats prints each agent's direct-vs-delegated tool activity for
+// this run — CLAUDE.md's delegation-maximization plan item 4, added so
+// policy.yaml's delegation.prefer/nudge_threshold can be tuned against
+// real numbers instead of guesswork. specs is walked in registry order
+// (the same determinism convention formatCapabilities/formatCommands
+// use), not sorted, so this reads the same way run to run.
+func formatStats(specs []session.Spec, s agentStats) string {
+	var b strings.Builder
+	anyActivity := false
+	for _, spec := range specs {
+		direct := s.direct[spec.Name]
+		sent := s.delegateSent[spec.Name]
+		recv := s.delegateRecv[spec.Name]
+		failed := s.delegateFail[spec.Name]
+		if direct == 0 && sent == 0 && recv == 0 {
+			continue
+		}
+		anyActivity = true
+		fmt.Fprintf(&b, "%s:\n", spec.Name)
+		fmt.Fprintf(&b, "  direct tool calls:       %d\n", direct)
+		if sent > 0 {
+			fmt.Fprintf(&b, "  delegate calls sent:     %d", sent)
+			if failed > 0 {
+				fmt.Fprintf(&b, " (%d failed)", failed)
+			}
+			b.WriteString("\n")
+		} else {
+			fmt.Fprintf(&b, "  delegate calls sent:     0\n")
+		}
+		fmt.Fprintf(&b, "  delegate calls received: %d\n", recv)
+	}
+	if !anyActivity {
+		return "no tool activity recorded yet this run\n"
 	}
 	return b.String()
 }

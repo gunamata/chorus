@@ -60,7 +60,7 @@ func TestWriteTextFile_AutoAllowedSkipsPrompt(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
 	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllow: []string{"edit"}}}
-	c := New("claude", outputCh, permCh, pol)
+	c := New("claude", outputCh, permCh, pol, policy.Delegation{}, nil)
 
 	path := filepath.Join(t.TempDir(), "out.txt")
 	_, err := c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{Path: path, Content: "hello"})
@@ -78,7 +78,7 @@ func TestWriteTextFile_AutoAllowedSkipsPrompt(t *testing.T) {
 func TestWriteTextFile_AskedAndDeniedDoesNotWrite(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
-	c := New("claude", outputCh, permCh, policy.Policy{}) // edit not auto-allowed
+	c := New("claude", outputCh, permCh, policy.Policy{}, policy.Delegation{}, nil) // edit not auto-allowed
 
 	path := filepath.Join(t.TempDir(), "out.txt")
 	done := make(chan error, 1)
@@ -101,7 +101,7 @@ func TestWriteTextFile_AskedAndDeniedDoesNotWrite(t *testing.T) {
 func TestWriteTextFile_AskedAndAllowedWrites(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
-	c := New("claude", outputCh, permCh, policy.Policy{})
+	c := New("claude", outputCh, permCh, policy.Policy{}, policy.Delegation{}, nil)
 
 	path := filepath.Join(t.TempDir(), "out.txt")
 	done := make(chan error, 1)
@@ -125,7 +125,7 @@ func TestWriteTextFile_RejectsUNCPath_NeverAsks(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
 	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllow: []string{"edit"}}} // even if auto-allowed
-	c := New("claude", outputCh, permCh, pol)
+	c := New("claude", outputCh, permCh, pol, policy.Delegation{}, nil)
 
 	_, err := c.WriteTextFile(context.Background(), acp.WriteTextFileRequest{
 		Path:    `\\attacker.example.com\share\payload.txt`,
@@ -141,7 +141,7 @@ func TestReadTextFile_RejectsUNCPath(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
 	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllow: []string{"read"}}}
-	c := New("claude", outputCh, permCh, pol)
+	c := New("claude", outputCh, permCh, pol, policy.Delegation{}, nil)
 
 	_, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{
 		Path: `\\attacker.example.com\share\secret.txt`,
@@ -156,7 +156,7 @@ func TestReadTextFile_RejectsForwardSlashUNCPath(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
 	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllow: []string{"read"}}}
-	c := New("claude", outputCh, permCh, pol)
+	c := New("claude", outputCh, permCh, pol, policy.Delegation{}, nil)
 
 	_, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{
 		Path: `//attacker.example.com/share/secret.txt`,
@@ -170,7 +170,7 @@ func TestReadTextFile_RejectsForwardSlashUNCPath(t *testing.T) {
 func TestReadTextFile_RejectsRelativePath(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
-	c := New("claude", outputCh, permCh, policy.Policy{})
+	c := New("claude", outputCh, permCh, policy.Policy{}, policy.Delegation{}, nil)
 
 	_, err := c.ReadTextFile(context.Background(), acp.ReadTextFileRequest{Path: "relative/path.txt"})
 	if err == nil {
@@ -182,7 +182,7 @@ func TestReadTextFile_RejectsRelativePath(t *testing.T) {
 func TestCreateTerminal_AskedAndDeniedNeverStarts(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
-	c := New("claude", outputCh, permCh, policy.Policy{}) // execute not auto-allowed
+	c := New("claude", outputCh, permCh, policy.Policy{}, policy.Delegation{}, nil) // execute not auto-allowed
 
 	done := make(chan error, 1)
 	go func() {
@@ -201,7 +201,7 @@ func TestCreateTerminal_AutoAllowedRunsImmediately(t *testing.T) {
 	outputCh := make(chan bus.Update, 8)
 	permCh := make(chan bus.PermissionRequest, 1)
 	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllow: []string{"execute"}}}
-	c := New("claude", outputCh, permCh, pol)
+	c := New("claude", outputCh, permCh, pol, policy.Delegation{}, nil)
 
 	cmd, args := echoCommand("audit-ok")
 	resp, err := c.CreateTerminal(context.Background(), acp.CreateTerminalRequest{Command: cmd, Args: args})
@@ -222,6 +222,187 @@ func TestCreateTerminal_AutoAllowedRunsImmediately(t *testing.T) {
 		t.Fatalf("terminal output = %q, want it to contain %q", out.Output, "audit-ok")
 	}
 }
+
+// --- delegation-nudge tests (CLAUDE.md's delegation-maximization plan
+// item 2) — trackDelegationPreference, exercised through RequestPermission
+// since that's the code path every agent-initiated tool call goes
+// through, and it's the simplest way to drive kind/title without needing
+// a real subprocess.
+
+// requestPermission builds a minimal allow-by-default RequestPermission
+// call for kind/title, options offering both allow and deny, and returns
+// once answered (or immediately if auto-allowed) — a test helper for the
+// nudge tests below, which care about trackDelegationPreference's side
+// effects, not the specific outcome of any one call.
+func requestPermission(t *testing.T, c *Client, permCh chan bus.PermissionRequest, kind acp.ToolKind, title string) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+			ToolCall: acp.ToolCallUpdate{
+				ToolCallId: "tc",
+				Title:      &title,
+				Kind:       &kind,
+			},
+			Options: []acp.PermissionOption{
+				{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+				{OptionId: "deny", Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+			},
+		})
+		done <- err
+	}()
+	select {
+	case req := <-permCh:
+		req.Resp <- acp.RequestPermissionResponse{
+			Outcome: acp.RequestPermissionOutcome{Selected: &acp.RequestPermissionOutcomeSelected{OptionId: "allow"}},
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected a permission request, got none")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("RequestPermission() error = %v", err)
+	}
+}
+
+func TestDelegationNudge_FiresAtThreshold(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	delegation := policy.Delegation{Prefer: []string{"execute"}, NudgeThreshold: intPtr(3)}
+	costTiers := map[string]string{"claude": "metered", "opencode": "free"}
+	c := New("claude", outputCh, permCh, policy.Policy{}, delegation, costTiers)
+	c.SetIdler(func(agent string) bool { return agent == "opencode" })
+
+	var nudges []string
+	c.SetNudgeFunc(func(agent, text string) { nudges = append(nudges, agent+": "+text) })
+
+	for i := 0; i < 2; i++ {
+		requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+		if len(nudges) != 0 {
+			t.Fatalf("nudge fired after only %d calls, want it to wait for the configured threshold (3)", i+1)
+		}
+	}
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	if len(nudges) != 1 {
+		t.Fatalf("nudges = %v, want exactly 1 after hitting the threshold", nudges)
+	}
+	if !contains(nudges[0], "opencode") {
+		t.Fatalf("nudge text = %q, want it to name the idle cheaper agent (opencode)", nudges[0])
+	}
+
+	// Counter resets after firing — the next 2 calls shouldn't fire again.
+	for i := 0; i < 2; i++ {
+		requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	}
+	if len(nudges) != 1 {
+		t.Fatalf("nudges = %v, want still exactly 1 (counter should reset after firing)", nudges)
+	}
+}
+
+func TestDelegationNudge_DelegateCallResetsCounter(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	delegation := policy.Delegation{Prefer: []string{"execute"}, NudgeThreshold: intPtr(3)}
+	costTiers := map[string]string{"claude": "metered", "opencode": "free"}
+	pol := policy.Policy{"claude": policy.AgentPolicy{AutoAllowTools: []string{"mcp__chorus-delegate__"}}}
+	c := New("claude", outputCh, permCh, pol, delegation, costTiers)
+	c.SetIdler(func(agent string) bool { return agent == "opencode" })
+
+	var nudges []string
+	c.SetNudgeFunc(func(agent, text string) { nudges = append(nudges, text) })
+
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	// A delegate call (auto-allowed by title prefix, per policy.yaml
+	// convention, so it never reaches permCh at all) — should reset the
+	// streak instead of counting toward it.
+	kind := acp.ToolKindOther
+	title := "mcp__chorus-delegate__delegate"
+	if _, err := c.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+		ToolCall: acp.ToolCallUpdate{ToolCallId: "tc", Title: &title, Kind: &kind},
+		Options: []acp.PermissionOption{
+			{OptionId: "allow", Name: "Allow", Kind: acp.PermissionOptionKindAllowOnce},
+		},
+	}); err != nil {
+		t.Fatalf("RequestPermission() error = %v", err)
+	}
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+
+	if len(nudges) != 0 {
+		t.Fatalf("nudges = %v, want none — the delegate call should have reset the streak below the threshold", nudges)
+	}
+}
+
+func TestDelegationNudge_NoIdleCheaperAgent_NeverFires(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	delegation := policy.Delegation{Prefer: []string{"execute"}, NudgeThreshold: intPtr(1)}
+	costTiers := map[string]string{"claude": "metered", "opencode": "free"}
+	c := New("claude", outputCh, permCh, policy.Policy{}, delegation, costTiers)
+	c.SetIdler(func(agent string) bool { return false }) // opencode busy
+
+	var nudges []string
+	c.SetNudgeFunc(func(agent, text string) { nudges = append(nudges, text) })
+
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	if len(nudges) != 0 {
+		t.Fatalf("nudges = %v, want none — no cheaper agent is idle", nudges)
+	}
+}
+
+func TestDelegationNudge_NonMeteredAgent_NeverFires(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	delegation := policy.Delegation{Prefer: []string{"execute"}, NudgeThreshold: intPtr(1)}
+	costTiers := map[string]string{"opencode": "free", "claude": "metered"}
+	c := New("opencode", outputCh, permCh, policy.Policy{}, delegation, costTiers)
+	c.SetIdler(func(agent string) bool { return true })
+
+	var nudges []string
+	c.SetNudgeFunc(func(agent, text string) { nudges = append(nudges, text) })
+
+	requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	if len(nudges) != 0 {
+		t.Fatalf("nudges = %v, want none — opencode itself isn't the metered agent", nudges)
+	}
+}
+
+func TestDelegationNudge_EmptyPreferDisablesTrackingEntirely(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	costTiers := map[string]string{"claude": "metered", "opencode": "free"}
+	c := New("claude", outputCh, permCh, policy.Policy{}, policy.Delegation{}, costTiers) // Prefer unset
+	c.SetIdler(func(agent string) bool { return true })
+
+	nudgeCalled := false
+	c.SetNudgeFunc(func(agent, text string) { nudgeCalled = true })
+
+	for i := 0; i < 10; i++ {
+		requestPermission(t, c, permCh, acp.ToolKindExecute, "run something")
+	}
+	if nudgeCalled {
+		t.Fatal("nudge fired despite an empty Delegation.Prefer, which should disable tracking entirely")
+	}
+}
+
+func TestDelegationNudge_UnmatchedKind_NeverCounts(t *testing.T) {
+	outputCh := make(chan bus.Update, 8)
+	permCh := make(chan bus.PermissionRequest, 4)
+	delegation := policy.Delegation{Prefer: []string{"execute"}, NudgeThreshold: intPtr(1)}
+	costTiers := map[string]string{"claude": "metered", "opencode": "free"}
+	c := New("claude", outputCh, permCh, policy.Policy{}, delegation, costTiers)
+	c.SetIdler(func(agent string) bool { return true })
+
+	nudgeCalled := false
+	c.SetNudgeFunc(func(agent, text string) { nudgeCalled = true })
+
+	requestPermission(t, c, permCh, acp.ToolKindRead, "read a file") // "read" isn't in Prefer
+	if nudgeCalled {
+		t.Fatal("nudge fired for a tool kind not listed in Delegation.Prefer")
+	}
+}
+
+func intPtr(n int) *int { return &n }
 
 func waitForTerminalDone(t *testing.T, c *Client, id string) {
 	t.Helper()

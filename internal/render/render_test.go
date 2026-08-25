@@ -2,10 +2,12 @@ package render
 
 import (
 	"encoding/base64"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/charmbracelet/glamour"
 	acp "github.com/coder/acp-go-sdk"
@@ -153,6 +155,50 @@ func TestFormatMenuLine_MarksOnlyTheCursorRow(t *testing.T) {
 	}
 	if !strings.Contains(selected, "❯") {
 		t.Errorf("FormatMenuLine(1, cursor=1, ...) = %q, want a cursor marker on the selected row", selected)
+	}
+}
+
+func TestFormatUserPrompt_HighlightsFullWidth(t *testing.T) {
+	r := newTestRenderer()
+	r.SetWidth(40)
+	out := r.FormatUserPrompt("claude", "fix the bug")
+
+	if !strings.Contains(out, "claude") {
+		t.Errorf("text = %q, want the agent tag present", out)
+	}
+	if !strings.Contains(out, "fix the bug") {
+		t.Errorf("text = %q, want the prompt text present", out)
+	}
+	if !strings.Contains(out, "\x1b[100m") {
+		t.Errorf("text = %q, want the background-highlight escape present", out)
+	}
+	// The highlighted line (agent tag + "\n" + highlighted content + "\n")
+	// should pad the content out to the full configured width, not just
+	// wrap the bare text — strip the tag line and the trailing newline to
+	// isolate it.
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("FormatUserPrompt() produced %d lines, want 2 (agent tag, then the highlighted content)", len(lines))
+	}
+	visible := StripANSI(lines[1])
+	if len([]rune(visible)) != 40 {
+		t.Errorf("highlighted line visible width = %d, want exactly 40 (r.width)", len([]rune(visible)))
+	}
+}
+
+func TestFormatUserPrompt_EmptyTextReturnsEmpty(t *testing.T) {
+	r := newTestRenderer()
+	if out := r.FormatUserPrompt("claude", ""); out != "" {
+		t.Fatalf("FormatUserPrompt(agent, \"\") = %q, want empty", out)
+	}
+}
+
+func TestFormatUserPrompt_MultilinePromptHighlightsEachLine(t *testing.T) {
+	r := newTestRenderer()
+	r.SetWidth(30)
+	out := r.FormatUserPrompt("claude", "line one\nline two")
+	if strings.Count(out, "\x1b[100m") != 2 {
+		t.Errorf("text = %q, want a highlight escape on each of the 2 lines", out)
 	}
 }
 
@@ -646,5 +692,70 @@ func TestSetStyle_ForcesDeterministicStylingRegardlessOfTTY(t *testing.T) {
 	}
 	if !strings.Contains(out, "bold") {
 		t.Fatalf("renderMarkdown() = %q, want the word itself preserved", out)
+	}
+}
+
+// --- native ("!") command formatting -----------------------------------
+
+func TestFormatNativeCommandEcho_ShowsCommandOnHighlightedLine(t *testing.T) {
+	r := newTestRenderer()
+	r.SetWidth(40)
+	out := r.FormatNativeCommandEcho("go test ./...")
+	if !strings.Contains(out, "go test ./...") {
+		t.Errorf("text = %q, want the command line present", out)
+	}
+	if !strings.Contains(out, "\x1b[100m") {
+		t.Errorf("text = %q, want the background-highlight escape present, same convention as FormatUserPrompt", out)
+	}
+	if !strings.Contains(out, "[!]") {
+		t.Errorf("text = %q, want the native-command tag [!]", out)
+	}
+}
+
+func TestFormatNativeCommandEcho_EmptyReturnsEmpty(t *testing.T) {
+	r := newTestRenderer()
+	if out := r.FormatNativeCommandEcho(""); out != "" {
+		t.Fatalf("FormatNativeCommandEcho(\"\") = %q, want empty", out)
+	}
+}
+
+func TestFormatNativeCommandResult_SuccessShowsOutputAndDuration(t *testing.T) {
+	out := FormatNativeCommandResult("echo hi", "hi\n", nil, 250*time.Millisecond)
+	if !strings.Contains(out, "hi") {
+		t.Errorf("text = %q, want the command's output present", out)
+	}
+	if !strings.Contains(out, "done in 250ms") {
+		t.Errorf("text = %q, want a success status line with duration", out)
+	}
+	if strings.Contains(out, "failed") {
+		t.Errorf("text = %q, want no failure wording on a nil error", out)
+	}
+}
+
+func TestFormatNativeCommandResult_FailureShowsError(t *testing.T) {
+	out := FormatNativeCommandResult("false", "", errors.New("exit status 1"), 10*time.Millisecond)
+	if !strings.Contains(out, "failed") || !strings.Contains(out, "exit status 1") {
+		t.Errorf("text = %q, want a failure status line including the error", out)
+	}
+}
+
+func TestFormatNativeCommandResult_StripsEmbeddedANSI(t *testing.T) {
+	out := FormatNativeCommandResult("cmd", "before\x1b[31mred\x1b[0mafter", nil, time.Second)
+	if strings.Contains(out, "\x1b[31m") {
+		t.Errorf("text = %q, want output ANSI stripped, same as agent-supplied text (security invariant #3)", out)
+	}
+	if !strings.Contains(out, "beforeredafter") {
+		t.Errorf("text = %q, want the underlying text preserved after stripping", out)
+	}
+}
+
+func TestFormatNativeCommandResult_TruncatesOversizedOutput(t *testing.T) {
+	huge := strings.Repeat("a", nativeCommandOutputLimit+1000)
+	out := FormatNativeCommandResult("cmd", huge, nil, time.Second)
+	if !strings.Contains(out, "truncated") {
+		t.Fatalf("text missing 'truncated' marker for output over the %d-byte limit", nativeCommandOutputLimit)
+	}
+	if strings.Count(out, "a") > nativeCommandOutputLimit+100 {
+		t.Fatalf("output not actually capped near the %d-byte limit", nativeCommandOutputLimit)
 	}
 }

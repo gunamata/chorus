@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	acp "github.com/coder/acp-go-sdk"
@@ -12,6 +13,7 @@ import (
 	"chorus/internal/delegate"
 	"chorus/internal/policy"
 	"chorus/internal/render"
+	"chorus/internal/session"
 )
 
 func newTestModel(t *testing.T, workers map[string]*AgentWorker, routing policy.Routing) Model {
@@ -25,6 +27,7 @@ func newTestModel(t *testing.T, workers map[string]*AgentWorker, routing policy.
 		OutputCh:      make(chan bus.Update, 64),
 		PermCh:        make(chan bus.PermissionRequest, 4),
 		ErrCh:         make(chan ErrMsg, 8),
+		DoneCh:        make(chan PromptDoneMsg, 8),
 		DelegateLogCh: make(chan delegate.LogEntry, 8),
 	})
 	// Simulate the initial WindowSizeMsg bubbletea sends on startup, so
@@ -376,6 +379,65 @@ func TestModel_ArrowCursorWrapsAtBoundaries(t *testing.T) {
 	}
 }
 
+// TestModel_PermissionMenuForcesScrollIntoViewEvenWhenScrolledUp
+// reproduces a live user report: a permission menu that appears (or is
+// re-rendered by an arrow-key press) while the viewport is scrolled away
+// from the bottom rendered only its first line or two on screen — the
+// user could see option 1 but not option 2+, and since arrow-key up/down
+// are captured for menu-cursor movement rather than viewport scrolling
+// while a menu is pending, there was no way to scroll the rest into view.
+// syncViewport's old "only GotoBottom if already atBottom" rule is right
+// for ordinary streamed output (don't yank a reading user back down) but
+// wrong for a blocking menu that needs an answer before anything else can
+// proceed.
+func TestModel_PermissionMenuForcesScrollIntoViewEvenWhenScrolledUp(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	// Fill the document with enough lines to make the viewport's height
+	// (20 lines, given the 80x24 window newTestModel sizes it to) matter,
+	// then scroll away from the bottom exactly like a user reading back
+	// through earlier output would.
+	for i := 0; i < 60; i++ {
+		m.appendLine(strings.Repeat("x", 10) + "\n")
+	}
+	m.syncViewport()
+	m.viewport.GotoTop()
+	if m.viewport.AtBottom() {
+		t.Fatal("test setup: viewport should not be at bottom after GotoTop")
+	}
+
+	updated, _ := m.Update(permissionMsg{bus.PermissionRequest{
+		Agent: "claude",
+		Req: acp.RequestPermissionRequest{
+			ToolCall: acp.ToolCallUpdate{Title: strPtrTUI("Write auth.py")},
+			Options: []acp.PermissionOption{
+				{OptionId: "deny", Name: "Deny", Kind: acp.PermissionOptionKindRejectOnce},
+				{OptionId: "allow", Name: "Allow Once", Kind: acp.PermissionOptionKindAllowOnce},
+			},
+		},
+		Resp: make(chan acp.RequestPermissionResponse, 1),
+	}})
+	m = updated.(Model)
+
+	if !m.viewport.AtBottom() {
+		t.Fatal("viewport did not scroll to bottom when a permission menu appeared while scrolled up")
+	}
+	view := m.viewport.View()
+	if !strings.Contains(view, "Deny") || !strings.Contains(view, "Allow Once") {
+		t.Fatalf("viewport.View() = %q, want both permission options visible, not just the first", view)
+	}
+
+	// An arrow-key press while the menu is up must keep it fully visible
+	// too, even if something scrolled the view away in between.
+	m.viewport.GotoTop()
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if !m.viewport.AtBottom() {
+		t.Fatal("viewport did not re-scroll to bottom after an arrow-key menu move")
+	}
+}
+
 func TestModel_ArrowKeyUpdatesMenuInPlaceDespiteInterleavedOutput(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
 	m := newTestModel(t, workers, policy.Routing{})
@@ -447,5 +509,415 @@ func TestModel_ArrowKeysSelectRouteAskCandidate(t *testing.T) {
 		}
 	default:
 		t.Fatalf("%s never received the queued prompt after arrow-selecting it", names[1])
+	}
+}
+
+// --- prompt echo ---------------------------------------------------------
+//
+// ACP never sends a submitted prompt back to the client on a live turn
+// (UserMessageChunk only arrives during session/load history replay), so
+// without an explicit echo, nothing records what was actually asked —
+// found live: several turns into a real session, there was no way to
+// tell which agent reply answered which question.
+
+func TestModel_ExplicitAgentPromptIsEchoed(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "claude: fix the login bug")
+
+	if !strings.Contains(m.viewport.View(), "fix the login bug") {
+		t.Fatalf("viewport.View() = %q, want the submitted prompt echoed", m.viewport.View())
+	}
+	if strings.Contains(m.viewport.View(), "claude: fix the login bug") {
+		t.Fatal("echoed text still contains the \"claude: \" prefix — should echo just the text sent, not the raw line")
+	}
+}
+
+func TestModel_AutoRoutedPromptIsEchoed(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Default: "claude"})
+
+	m, _ = enterWithInput(m, "summarize the changelog")
+
+	out := m.viewport.View()
+	if !strings.Contains(out, "summarize the changelog") {
+		t.Fatalf("viewport.View() = %q, want the submitted prompt echoed", out)
+	}
+	if !strings.Contains(out, "auto-routed") {
+		t.Fatalf("viewport.View() = %q, want the routing rationale still shown alongside the echo", out)
+	}
+}
+
+func TestModel_RouteAskResolvedPromptIsEchoed(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{AskWhenAmbiguous: true})
+
+	m, _ = enterWithInput(m, "do the thing")
+	if m.pendingRoute == nil {
+		t.Fatal("pendingRoute = nil, want a pending route")
+	}
+	m, _ = enterWithInput(m, "claude")
+
+	if !strings.Contains(m.viewport.View(), "do the thing") {
+		t.Fatalf("viewport.View() = %q, want the original prompt echoed once the routeAsk resolves", m.viewport.View())
+	}
+}
+
+func TestModel_FailedDispatchIsNotEchoed(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "gemini: do something")
+
+	out := m.viewport.View()
+	if strings.Contains(out, "do something") {
+		t.Fatalf("viewport.View() = %q, want nothing echoed for a prompt that was never actually sent (unknown agent)", out)
+	}
+	if !strings.Contains(out, "unknown agent") {
+		t.Fatalf("viewport.View() = %q, want the unknown-agent error shown", out)
+	}
+}
+
+// TestModel_EchoedPromptHighlightSurvivesWordWrap guards the real risk in
+// render.FormatUserPrompt's full-width background padding: renderDocument
+// re-wraps the WHOLE document through wordwrap.String (needed so
+// bubbles/viewport doesn't truncate un-wrapped blocks — see
+// renderDocument's doc comment). If FormatUserPrompt's padding were ever
+// off by even one visible column, the padded line would exceed the
+// viewport's width and wordwrap would break it across two lines,
+// splitting the highlight's background-color escape from its reset and
+// bleeding the highlight color into whatever follows. This only exercises
+// through the real Model pipeline (Update -> syncViewport -> wordwrap),
+// not FormatUserPrompt in isolation, since that's exactly where the two
+// pieces could interact badly without either one, alone, revealing it.
+func TestModel_EchoedPromptHighlightSurvivesWordWrap(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	// newTestModel already sends a WindowSizeMsg{80, 24}, sizing the
+	// renderer/viewport to 80 — matches what FormatUserPrompt pads to.
+
+	m, _ = enterWithInput(m, "claude: a reasonably ordinary length prompt")
+
+	out := m.viewport.View()
+	if !strings.Contains(out, "\x1b[100m") {
+		t.Fatalf("viewport.View() = %q, want the highlight escape intact after the wordwrap pass", out)
+	}
+	// If the highlighted line got split, the color would still be "on"
+	// (no intervening reset) when the NEXT block's own text starts —
+	// look for the reset appearing before the input box's border, i.e.
+	// somewhere before the end of the visible output, not missing/pushed
+	// past unrelated content.
+	hIdx := strings.Index(out, "\x1b[100m")
+	rIdx := strings.Index(out[hIdx:], "\x1b[0m")
+	if rIdx == -1 {
+		t.Fatal("no reset (\\x1b[0m) found after the highlight started — the color would bleed into everything that follows")
+	}
+}
+
+// --- native ("!") command execution --------------------------------------
+
+func TestModel_NativeCommandEchoesImmediatelyAndReturnsCmd(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{}, policy.Routing{})
+
+	m, cmd := enterWithInput(m, "!echo hello-native")
+	if cmd == nil {
+		t.Fatal("handleNativeCommand returned a nil tea.Cmd — the command must run asynchronously, not block Update()")
+	}
+	out := m.viewport.View()
+	if !strings.Contains(out, "echo hello-native") {
+		t.Fatalf("viewport.View() = %q, want the command line echoed immediately, before it finishes", out)
+	}
+	if !strings.Contains(out, "[!]") {
+		t.Fatalf("viewport.View() = %q, want the native-command tag present", out)
+	}
+}
+
+func TestModel_NativeCommandEmptyShowsUsageAndDoesNotRun(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{}, policy.Routing{})
+
+	m, cmd := enterWithInput(m, "!   ")
+	if cmd != nil {
+		t.Fatal("an empty ! command should not launch a tea.Cmd")
+	}
+	out := m.viewport.View()
+	if !strings.Contains(out, "usage:") {
+		t.Fatalf("viewport.View() = %q, want a usage message for an empty ! command", out)
+	}
+}
+
+// TestModel_NativeCommandResultRendersOutputOnCompletion runs the real
+// tea.Cmd handleNativeCommand returns (a real subprocess, not a mock) and
+// feeds its result back through Update — end-to-end confirmation that a
+// "!" command never touches any agent (workers is empty) and its output
+// still renders correctly once complete.
+func TestModel_NativeCommandResultRendersOutputOnCompletion(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{}, policy.Routing{})
+
+	_, cmd := enterWithInput(m, "!echo hello-native")
+	if cmd == nil {
+		t.Fatal("expected a non-nil tea.Cmd from a real ! command")
+	}
+	msg := cmd()
+	result, ok := msg.(nativeCmdResultMsg)
+	if !ok {
+		t.Fatalf("tea.Cmd produced %T, want nativeCmdResultMsg", msg)
+	}
+	if result.err != nil {
+		t.Fatalf("native command failed: %v (output: %q)", result.err, result.output)
+	}
+
+	updated, _ := m.Update(result)
+	m = updated.(Model)
+
+	out := m.viewport.View()
+	if !strings.Contains(out, "hello-native") {
+		t.Fatalf("viewport.View() = %q, want the command's real output rendered", out)
+	}
+	if !strings.Contains(out, "done in") {
+		t.Fatalf("viewport.View() = %q, want a completion status line", out)
+	}
+}
+
+// --- stats tallying (CLAUDE.md's delegation-maximization plan item 4) --
+
+func TestModel_HandleOutput_TalliesDirectToolCallButNotDelegateCall(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(outputMsg{u: bus.Update{
+		Agent: "claude",
+		Notification: acp.SessionNotification{
+			SessionId: "main-session",
+			Update: acp.SessionUpdate{
+				ToolCall: &acp.SessionUpdateToolCall{ToolCallId: "tc1", Title: "Edit foo.go", Status: acp.ToolCallStatusCompleted},
+			},
+		},
+	}})
+	m = updated.(Model)
+
+	updated, _ = m.Update(outputMsg{u: bus.Update{
+		Agent: "claude",
+		Notification: acp.SessionNotification{
+			SessionId: "main-session",
+			Update: acp.SessionUpdate{
+				ToolCall: &acp.SessionUpdateToolCall{ToolCallId: "tc2", Title: delegate.ToolTitlePrefix + "delegate", Status: acp.ToolCallStatusCompleted},
+			},
+		},
+	}})
+	m = updated.(Model)
+
+	if got := m.stats.direct["claude"]; got != 1 {
+		t.Fatalf("stats.direct[claude] = %d, want 1 (only the non-delegate ToolCall should count)", got)
+	}
+}
+
+func TestModel_DelegateLogMsg_TalliesSentReceivedAndFailed(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(delegateLogMsg{e: delegate.LogEntry{Source: "claude", Target: "opencode", Task: "do X"}})
+	m = updated.(Model)
+	updated, _ = m.Update(delegateLogMsg{e: delegate.LogEntry{Source: "claude", Target: "opencode", Task: "do Y", Err: context.DeadlineExceeded}})
+	m = updated.(Model)
+
+	if got := m.stats.delegateSent["claude"]; got != 2 {
+		t.Fatalf("stats.delegateSent[claude] = %d, want 2", got)
+	}
+	if got := m.stats.delegateRecv["opencode"]; got != 2 {
+		t.Fatalf("stats.delegateRecv[opencode] = %d, want 2", got)
+	}
+	if got := m.stats.delegateFail["claude"]; got != 1 {
+		t.Fatalf("stats.delegateFail[claude] = %d, want 1 (only the errored call)", got)
+	}
+}
+
+func TestModel_StatsCommand_RendersFormattedStats(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+	m.stats.direct["claude"] = 3
+
+	m, _ = enterWithInput(m, "stats")
+
+	out := m.viewport.View()
+	if !strings.Contains(out, "claude") || !strings.Contains(out, "3") {
+		t.Fatalf("viewport.View() = %q, want the stats command's output rendered", out)
+	}
+}
+
+// --- multi-line input: wrapping, ctrl+j, home/end, history --------------
+//
+// These cover the textinput->textarea swap (chorus-spec.md's same-day
+// entry): wrapping is bubbles/textarea's own job (not independently unit
+// tested here — there's nothing chorus-specific to verify beyond "we
+// configured it," and SetWidth is exercised by handleResize already), but
+// ctrl+j-for-newline, home/end/ctrl+a/ctrl+e line editing, and prompt
+// history are chorus's own additions on top of it.
+
+func typeRunes(t *testing.T, m Model, s string) Model {
+	t.Helper()
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)})
+	return updated.(Model)
+}
+
+func pressKey(t *testing.T, m Model, kt tea.KeyType) Model {
+	t.Helper()
+	updated, _ := m.Update(tea.KeyMsg{Type: kt})
+	return updated.(Model)
+}
+
+func TestModel_CtrlJInsertsNewlineInsteadOfSubmitting(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m = typeRunes(t, m, "line one")
+	m = pressKey(t, m, tea.KeyCtrlJ)
+	m = typeRunes(t, m, "line two")
+
+	if got, want := m.input.Value(), "line one\nline two"; got != want {
+		t.Fatalf("input.Value() = %q, want %q — ctrl+j should insert a newline, not submit", got, want)
+	}
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("ctrl+j must not submit the prompt (enter is the only submit key)")
+	default:
+	}
+}
+
+func TestModel_HomeEndMoveCursorToLineStartAndEnd(t *testing.T) {
+	cases := []struct {
+		name             string
+		startKey, endKey tea.KeyType
+	}{
+		{"home/end", tea.KeyHome, tea.KeyEnd},
+		{"ctrl+a/ctrl+e (macOS readline bindings)", tea.KeyCtrlA, tea.KeyCtrlE},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			workers := map[string]*AgentWorker{"claude": newWorker()}
+			m := newTestModel(t, workers, policy.Routing{})
+
+			m = typeRunes(t, m, "abc")
+			m = pressKey(t, m, c.startKey)
+			m = typeRunes(t, m, "X")
+			if got, want := m.input.Value(), "Xabc"; got != want {
+				t.Fatalf("after start-of-line + typing X: input.Value() = %q, want %q", got, want)
+			}
+
+			m = pressKey(t, m, c.endKey)
+			m = typeRunes(t, m, "Y")
+			if got, want := m.input.Value(), "XabcY"; got != want {
+				t.Fatalf("after end-of-line + typing Y: input.Value() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestModel_ArrowUpDownAtInputBoundsWalksPromptHistory(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "claude: first")
+	m, _ = enterWithInput(m, "claude: second")
+	m = typeRunes(t, m, "in progress draft")
+
+	m = pressKey(t, m, tea.KeyUp)
+	if got, want := m.input.Value(), "claude: second"; got != want {
+		t.Fatalf("after Up from an in-progress draft: input.Value() = %q, want the most recent history entry %q", got, want)
+	}
+
+	m = pressKey(t, m, tea.KeyUp)
+	if got, want := m.input.Value(), "claude: first"; got != want {
+		t.Fatalf("after a second Up: input.Value() = %q, want the older history entry %q", got, want)
+	}
+
+	// Already at the oldest entry — one more Up must not go further/panic.
+	m = pressKey(t, m, tea.KeyUp)
+	if got, want := m.input.Value(), "claude: first"; got != want {
+		t.Fatalf("Up at the oldest history entry: input.Value() = %q, want it to stay at %q", got, want)
+	}
+
+	m = pressKey(t, m, tea.KeyDown)
+	if got, want := m.input.Value(), "claude: second"; got != want {
+		t.Fatalf("after Down: input.Value() = %q, want %q", got, want)
+	}
+	m = pressKey(t, m, tea.KeyDown)
+	if got, want := m.input.Value(), "in progress draft"; got != want {
+		t.Fatalf("after Down past the newest history entry: input.Value() = %q, want the original draft restored", got)
+	}
+}
+
+func TestModel_ArrowUpMovesWithinMultiLineDraftBeforeRecallingHistory(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m, _ = enterWithInput(m, "claude: earlier prompt")
+
+	m = typeRunes(t, m, "second line")
+	m = pressKey(t, m, tea.KeyCtrlJ)
+	m = typeRunes(t, m, "third line")
+
+	// Cursor is on the last of 3 logical lines — Up should move the cursor
+	// within the draft, not touch history yet.
+	m = pressKey(t, m, tea.KeyUp)
+	if got, want := m.input.Value(), "second line\nthird line"; got != want {
+		t.Fatalf("Up while not at the top line changed the draft: input.Value() = %q, want unchanged %q", got, want)
+	}
+	if m.historyIndex != -1 {
+		t.Fatalf("historyIndex = %d after Up within the draft, want -1 (history untouched)", m.historyIndex)
+	}
+}
+
+func TestModel_ContinuationLinePromptIsBlankNotRepeated(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m = typeRunes(t, m, "line one")
+	m = pressKey(t, m, tea.KeyCtrlJ)
+	m = typeRunes(t, m, "line two")
+
+	view := m.input.View()
+	if got := strings.Count(view, "❯"); got != 1 {
+		t.Fatalf("input.View() contains %d \"❯\" glyph(s) across a 2-line prompt, want exactly 1 — continuation lines should get a blank prompt of the same width, not repeat \"❯ \": %q", got, view)
+	}
+}
+
+func TestModel_PromptDoneMsg_AppendsFinishedLineOnSuccessOnly(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(promptDoneMsg{PromptDoneMsg{Agent: "claude", Duration: 2*time.Second + 500*time.Millisecond}})
+	m = updated.(Model)
+	if !strings.Contains(m.viewport.View(), "finished in") {
+		t.Fatalf("viewport.View() = %q, want a \"finished in\" line after a successful prompt", m.viewport.View())
+	}
+
+	blocksBefore := len(m.blocks)
+	updated, _ = m.Update(promptDoneMsg{PromptDoneMsg{Agent: "claude", Duration: time.Second, Err: context.DeadlineExceeded}})
+	m = updated.(Model)
+	if len(m.blocks) != blocksBefore {
+		t.Fatal("a failed prompt's promptDoneMsg appended a block — want no \"finished in\" line when Err != nil, since errChMsg already reports the failure")
+	}
+}
+
+func TestModel_FormatBusyStatus(t *testing.T) {
+	w := newWorker()
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+
+	if got := m.formatBusyStatus(); got != "" {
+		t.Fatalf("formatBusyStatus() = %q, want empty when no agent is busy", got)
+	}
+
+	w.startedAt.Store(time.Now().Add(-5 * time.Second))
+	w.busy.Store(true)
+
+	got := m.formatBusyStatus()
+	if !strings.Contains(got, "claude") {
+		t.Fatalf("formatBusyStatus() = %q, want it to mention the busy agent", got)
+	}
+	if !strings.Contains(got, "5s") {
+		t.Fatalf("formatBusyStatus() = %q, want it to show roughly the elapsed time", got)
 	}
 }

@@ -59,8 +59,9 @@ type Connection struct {
 	// rather than just tolerated or rejected. Populated by Connect.
 	SupportsImagePrompts bool
 
-	cmd  *exec.Cmd
-	conn *acp.ClientSideConnection
+	cmd    *exec.Cmd
+	conn   *acp.ClientSideConnection
+	client *acpclient.Client
 }
 
 // Connect starts the agent subprocess and performs the ACP initialize
@@ -78,7 +79,14 @@ type Connection struct {
 // bubbletea stops repainting, e.g. at shutdown) looking like it came from
 // nowhere. Callers should pass a per-agent log file (main.go does); pass
 // io.Discard to drop it entirely rather than risk that.
-func Connect(ctx context.Context, spec Spec, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, stderr io.Writer) (*Connection, error) {
+// delegation and costTiers feed the client-owned delegation-nudge logic
+// (CLAUDE.md's delegation-maximization plan item 2,
+// acpclient.Client.trackDelegationPreference) — costTiers must include
+// every registered agent (not just this one), since the nudge needs to
+// know about OTHER agents' cost tiers too. Both are safe to pass
+// zero-valued (nil/empty) when the feature isn't configured in
+// policy.yaml; the tracking logic no-ops when Delegation.Prefer is empty.
+func Connect(ctx context.Context, spec Spec, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, delegation policy.Delegation, costTiers map[string]string, stderr io.Writer) (*Connection, error) {
 	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
 	cmd.Stderr = stderr
 
@@ -95,7 +103,7 @@ func Connect(ctx context.Context, spec Spec, outputCh chan<- bus.Update, permCh 
 		return nil, fmt.Errorf("%s: start %q: %w", spec.Name, spec.Command, err)
 	}
 
-	client := acpclient.New(spec.Name, outputCh, permCh, pol)
+	client := acpclient.New(spec.Name, outputCh, permCh, pol, delegation, costTiers)
 	conn := acp.NewClientSideConnection(client, stdin, stdout)
 
 	initResp, err := conn.Initialize(ctx, acp.InitializeRequest{
@@ -116,7 +124,26 @@ func Connect(ctx context.Context, spec Spec, outputCh chan<- bus.Update, permCh 
 		SupportsImagePrompts: initResp.AgentCapabilities.PromptCapabilities.Image,
 		cmd:                  cmd,
 		conn:                 conn,
+		client:               client,
 	}, nil
+}
+
+// SetIdleChecker wires up the delegation-nudge logic's way of asking
+// "is this other agent currently free to take a delegated sub-task?" —
+// see acpclient.Client.SetIdler's doc comment for why this has to be a
+// post-construction setter rather than a Connect param: it needs
+// tui.AgentWorker instances, which don't exist until main.go's phase 3,
+// well after every Connection is already established in phase 1.
+func (c *Connection) SetIdleChecker(fn func(agent string) bool) {
+	c.client.SetIdler(fn)
+}
+
+// SetNudgeFunc wires up delivery of a delegation nudge once one's due —
+// same post-construction timing as SetIdleChecker. fn is expected to
+// queue text as the named agent's next turn (main.go closes over
+// tui.QueuePrompt).
+func (c *Connection) SetNudgeFunc(fn func(agent, text string)) {
+	c.client.SetNudgeFunc(fn)
 }
 
 // NewSession creates a fresh session on this connection. mcpServers may be

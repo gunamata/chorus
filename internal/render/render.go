@@ -25,6 +25,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/glamour"
 	acp "github.com/coder/acp-go-sdk"
@@ -42,10 +44,28 @@ const (
 	colCyan   = "\x1b[36m"
 	colMag    = "\x1b[35m"
 	colBlue   = "\x1b[34m"
+	// colHighlightBg sets a solid background — used only to set an echoed
+	// user prompt visually apart from what follows it (FormatUserPrompt),
+	// the same convention Claude Code's own CLI uses. SGR 100 (bright
+	// black background) rather than a specific 256-color code, since it
+	// works on any ANSI-compatible terminal without needing extended
+	// color support.
+	colHighlightBg = "\x1b[100m"
 )
 
 // spinnerFrames animates in-progress tool calls — see TickSpinner.
 var spinnerFrames = []rune("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+
+// SpinnerFrame returns the animation frame for tick (any monotonically
+// increasing counter), using the same frame set FormatSpinnerTick animates
+// in-document tool-call/thinking spinners with. Exported so internal/tui
+// can animate its own persistent "agent busy" status line — which has no
+// in-place block to attach to and so can't go through Renderer's own
+// tick-driven FormatSpinnerTick/activeToolCall state — with a visually
+// consistent spinner rather than a second, different-looking one.
+func SpinnerFrame(tick int) rune {
+	return spinnerFrames[tick%len(spinnerFrames)]
+}
 
 // thinkingWords are the whimsical single-word indicators shown while an
 // agent is reasoning and ShowThoughts is off (the default) — the same
@@ -319,6 +339,133 @@ func (r *Renderer) FormatUpdate(u bus.Update) (key, text string, ok bool) {
 		r.clearInPlaceState()
 		return "", fmt.Sprintf("%s %s(unrecognized update kind) %s%s\n", agentTag(u.Agent), colYellow, rawJSON(up), colReset), true
 	}
+}
+
+// FormatUserPrompt formats text the user is actively sending to agent, for
+// internal/tui to echo into the document at the moment of submission.
+// ACP has no mechanism for this to come back from the agent on a live
+// turn — UserMessageChunk (see the FormatUpdate case below) only ever
+// arrives during session/load history replay, not for a prompt this
+// client itself just sent — so without an explicit echo, nothing records
+// what was actually asked, only the reply that follows it. Found live: a
+// real user, several turns into a session, had no way to tell which
+// agent reply answered which question. Same visual convention as a
+// resumed session's replayed user turns (agentTag + dim text), so a
+// fresh prompt and a replayed-from-history one read identically.
+func (r *Renderer) FormatUserPrompt(agent, text string) string {
+	if text == "" {
+		return ""
+	}
+	text = StripANSI(text)
+	var b strings.Builder
+	fmt.Fprintln(&b, agentTag(agent))
+	for _, line := range strings.Split(text, "\n") {
+		fmt.Fprintln(&b, r.highlightLine(line))
+	}
+	return b.String()
+}
+
+// highlightLine wraps line in a full-width background highlight — the
+// same visual convention Claude Code's own CLI uses to set an echoed
+// user prompt apart from the reply that follows it — padded with
+// colHighlightBg-colored spaces so the block reads as solid, not just
+// colored text with a ragged right edge.
+//
+// Padding is rune-counted (utf8.RuneCountInString), not measured as true
+// terminal display width — a deliberate, documented approximation: a
+// wide glyph (CJK, emoji) renders as 2 terminal columns but counts as 1
+// rune here, which would under-pad by one column per such glyph. Real
+// prompt text is overwhelmingly plain-width in practice, and getting
+// this exactly right needs a terminal-width-aware library render.go
+// doesn't otherwise depend on — not worth the addition for a cosmetic
+// edge, but worth this comment if wide-character prompts ever become a
+// real complaint.
+func (r *Renderer) highlightLine(line string) string {
+	content := " " + line
+	pad := r.width - utf8.RuneCountInString(content)
+	if pad < 0 {
+		pad = 0
+	}
+	return colHighlightBg + content + strings.Repeat(" ", pad) + colReset
+}
+
+// nativeCommandOutputLimit caps how much of a "!"-command's combined
+// stdout/stderr gets rendered into the document — mirrors CreateTerminal's
+// OutputByteLimit (internal/acpclient), same rationale: an unbounded
+// command (a runaway build log, an accidental `find /`) shouldn't be able
+// to balloon the in-memory document/viewport without limit.
+const nativeCommandOutputLimit = 200_000
+
+// nativeTag marks a "!"-command block as chorus's own native execution,
+// not any agent's — a distinct color/glyph from agentTag so it reads
+// unambiguously as "chorus ran this directly, no LLM involved" even at a
+// glance, matching CLAUDE.md's plan-item-#1 rationale: deterministic work
+// (a build, a test run, a lint check) doesn't need an agent turn, metered
+// or free, to execute.
+func nativeTag() string {
+	return colYellow + "[!]" + colReset
+}
+
+// FormatNativeCommandEcho formats a "!"-command the moment it's dispatched
+// — the same "echo what was actually asked" convention FormatUserPrompt
+// uses for agent prompts (chorus-spec.md/CLAUDE.md: found live that a
+// submitted prompt needs to be echoed since nothing else records it), so a
+// native command reads the same way in the scrollback: the exact command
+// line on a highlighted background, immediately, before its result
+// streams in.
+func (r *Renderer) FormatNativeCommandEcho(cmdline string) string {
+	if cmdline == "" {
+		return ""
+	}
+	cmdline = StripANSI(cmdline)
+	var b strings.Builder
+	fmt.Fprintln(&b, nativeTag())
+	fmt.Fprintln(&b, r.highlightLine(cmdline))
+	return b.String()
+}
+
+// FormatNativeCommandResult formats a completed "!"-command's output.
+// output is StripANSI'd and length-capped the same way agent-supplied
+// text is (security invariant #3, CLAUDE.md) — even though this text
+// originates from a command the user themselves chose to run, not from an
+// agent, it's still external, untrusted-by-construction text that could
+// otherwise corrupt the viewport's rendering the same way agent output
+// could; cheap to sanitize defensively regardless of source. runErr is
+// whatever exec.Cmd.CombinedOutput's error was (nil on exit 0, an
+// *exec.ExitError on a nonzero exit, or a context/start error) — reported
+// as-is rather than special-cased, since Go's own "exit status N" text is
+// already clear.
+func FormatNativeCommandResult(cmdline, output string, runErr error, dur time.Duration) string {
+	output = strings.TrimRight(StripANSI(output), "\n")
+	truncated := false
+	if len(output) > nativeCommandOutputLimit {
+		// Walk back to a rune boundary rather than slicing at a raw byte
+		// offset — otherwise a multi-byte UTF-8 character straddling the
+		// cut point gets sliced mid-rune, producing invalid UTF-8 that
+		// renders corrupted (mirrors terminalWriter.Write's same
+		// RuneStart-walking fix in internal/acpclient/client.go).
+		cut := nativeCommandOutputLimit
+		for cut > 0 && !utf8.RuneStart(output[cut]) {
+			cut--
+		}
+		output = output[:cut]
+		truncated = true
+	}
+
+	var b strings.Builder
+	if output != "" {
+		fmt.Fprintln(&b, output)
+	}
+	if truncated {
+		fmt.Fprintf(&b, "%s(output truncated at %d bytes)%s\n", colDim, nativeCommandOutputLimit, colReset)
+	}
+	if runErr != nil {
+		fmt.Fprintf(&b, "%s%s failed after %s: %s%s\n", colRed, nativeTag(), dur.Round(time.Millisecond), StripANSI(runErr.Error()), colReset)
+	} else {
+		fmt.Fprintf(&b, "%s%s done in %s%s\n", colDim, nativeTag(), dur.Round(time.Millisecond), colReset)
+	}
+	fmt.Fprintln(&b)
+	return b.String()
 }
 
 func (r *Renderer) formatText(agent string, cb acp.ContentBlock, prefix string) string {

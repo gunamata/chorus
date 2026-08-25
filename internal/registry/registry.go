@@ -33,7 +33,20 @@ type file struct {
 	Agents []entry `yaml:"agents"`
 }
 
-// Load reads agents.yaml and returns agent specs in file order.
+// Load reads agents.yaml at path and returns agent specs in file order.
+// Thin wrapper around Parse — see its doc comment for the actual decode
+// logic, shared with main.go's embedded-default fallback (compiled-in
+// bytes, no file on disk at all).
+func Load(path string) ([]session.Spec, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return Parse(b)
+}
+
+// Parse decodes agents.yaml content already read into memory, in file
+// order.
 //
 // Deviation from the spec's agents.yaml mockup, noted deliberately (§0's
 // priority order): the mockup showed a top-level map keyed by agent name
@@ -41,11 +54,7 @@ type file struct {
 // no iteration order — agent startup order (and therefore the order
 // startup messages print in) would vary run to run. Using a top-level
 // `agents:` list instead preserves file order deterministically.
-func Load(path string) ([]session.Spec, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
+func Parse(b []byte) ([]session.Spec, error) {
 	var f file
 	if err := yaml.Unmarshal(b, &f); err != nil {
 		return nil, fmt.Errorf("agents.yaml: %w", err)

@@ -55,12 +55,29 @@ type Routing struct {
 }
 
 // Delegation is optional top-level policy.yaml config for the seeded
-// first-turn delegation briefing (main.go, chorus-spec.md §11). Missing
-// entirely, or with Briefing omitted, defaults to enabled — opt-out, not
-// opt-in, since the whole point of the briefing is that delegation
-// shouldn't depend on the user remembering to ask for it every time.
+// first-turn delegation briefing (main.go, chorus-spec.md §11) and the
+// permission-gate delegation nudge (CLAUDE.md's delegation-maximization
+// plan, item 2). Missing entirely, or with Briefing omitted, defaults to
+// enabled — opt-out, not opt-in, since the whole point of the briefing is
+// that delegation shouldn't depend on the user remembering to ask for it
+// every time. Prefer and NudgeThreshold default to "off" instead (empty
+// Prefer disables the nudge entirely) — unlike the briefing, this is a
+// judgment call about an agent's ongoing behavior, not a one-time
+// explanation, so it stays opt-in until a project deliberately configures
+// which tool kinds are worth nudging about.
 type Delegation struct {
 	Briefing *bool `yaml:"briefing"`
+	// Prefer lists ACP ToolKinds (the same vocabulary as AgentPolicy's
+	// AutoAllow) for which a metered agent should be nudged toward
+	// delegating instead of executing directly, when a non-metered agent
+	// is connected and idle. Empty (the default) disables the nudge
+	// mechanism entirely — see acpclient.Client.trackDelegationPreference.
+	Prefer []string `yaml:"prefer"`
+	// NudgeThreshold is how many direct Prefer-kind tool calls a metered
+	// agent can make in a row (since its last delegate call) before
+	// chorus prepends a suggestion to its next queued prompt. Defaults to
+	// 3 when unset or non-positive — see Threshold.
+	NudgeThreshold *int `yaml:"nudge_threshold"`
 }
 
 // Config is policy.yaml's fully parsed content.
@@ -76,10 +93,56 @@ func (c Config) BriefingEnabled() bool {
 	return c.Delegation.Briefing == nil || *c.Delegation.Briefing
 }
 
+// defaultNudgeThreshold is used when nudge_threshold is unset or
+// non-positive — picked as "a small handful," not derived from data (no
+// real usage numbers exist yet; see CLAUDE.md's item 4, the planned
+// `stats` command, for tuning this against reality later).
+const defaultNudgeThreshold = 3
+
+// Threshold reports how many direct Prefer-kind tool calls trigger a
+// delegation nudge. Defaults to defaultNudgeThreshold when NudgeThreshold
+// is unset or <= 0 (a configured 0 or negative value would either nudge
+// on every single call or never validate, neither of which is a sensible
+// "unset" behavior).
+func (d Delegation) Threshold() int {
+	if d.NudgeThreshold == nil || *d.NudgeThreshold <= 0 {
+		return defaultNudgeThreshold
+	}
+	return *d.NudgeThreshold
+}
+
+// PreferKind reports whether kind is one of Prefer's listed ToolKinds.
+func (d Delegation) PreferKind(kind string) bool {
+	if kind == "" {
+		return false
+	}
+	for _, k := range d.Prefer {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
 // Load reads policy.yaml at path. A missing file is not an error — it
 // yields an empty Config: every tool call falls through to the permission
 // queue (safe default) and routing has no rules or default, so dispatch
-// falls back to requiring an explicit agent prefix.
+// falls back to requiring an explicit agent prefix. Thin wrapper around
+// Parse for the actual decode logic — see its doc comment.
+func Load(path string) (Config, error) {
+	b, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return Config{Agents: Policy{}}, nil
+	}
+	if err != nil {
+		return Config{}, err
+	}
+	return Parse(b)
+}
+
+// Parse decodes policy.yaml content already read into memory — shared by
+// Load (a real file) and main.go's embedded-default fallback (compiled-in
+// bytes, no file on disk at all).
 //
 // The file's top-level keys are a mix of per-agent policy blocks and one
 // "routing" block. yaml.v3 can't decode that directly into one typed
@@ -87,16 +150,8 @@ func (c Config) BriefingEnabled() bool {
 // "everything else" isn't expressible), so this decodes to
 // map[string]yaml.Node first and dispatches each key's node to the right
 // type.
-func Load(path string) (Config, error) {
+func Parse(b []byte) (Config, error) {
 	cfg := Config{Agents: Policy{}}
-
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return cfg, nil
-	}
-	if err != nil {
-		return Config{}, err
-	}
 
 	var raw map[string]yaml.Node
 	if err := yaml.Unmarshal(b, &raw); err != nil {
