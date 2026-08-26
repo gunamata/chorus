@@ -253,6 +253,35 @@ agents:
 	}
 }
 
+func TestParse_DecodesWorkDir(t *testing.T) {
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: opencode
+    spawn: ["docker", "run", "--rm", "-i", "-v", "{{CWD}}:/workspace", "chorus-opencode-sandbox"]
+    workdir: /workspace
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if specs[0].WorkDir != "/workspace" {
+		t.Errorf("specs[0].WorkDir = %q, want /workspace", specs[0].WorkDir)
+	}
+}
+
+func TestParse_WorkDirOptional(t *testing.T) {
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if specs[0].WorkDir != "" {
+		t.Errorf("specs[0].WorkDir = %q, want empty when omitted", specs[0].WorkDir)
+	}
+}
+
 func TestParse_ModelsOptional(t *testing.T) {
 	specs, _, err := Parse([]byte(`
 agents:

@@ -1,0 +1,231 @@
+# Sandboxed variant of agents.yaml for macOS — see agents.yaml.sandbox.windows
+# / agents.yaml.sandbox.linux for the other platforms (identical except for
+# volume-mount path syntax and which env var supplies the gcloud config
+# directory). See plain agents.yaml for the non-sandboxed default. Claude
+# and opencode run inside Docker containers instead of bare host
+# subprocesses, for filesystem/network containment (sandbox/,
+# chorus-spec.md §0's 2026-08-26 entry). NOT auto-loaded and NOT embedded
+# into the binary: unlike agents.yaml, this file only takes effect when
+# explicitly named:
+#
+#   ./chorus.exe --agents=agents.yaml.sandbox.macos
+#
+# Build the images first (tags below use the matamagu/ namespace — adjust
+# if you push these somewhere else):
+#   docker build -t matamagu/chorus-claude-sandbox sandbox/claude/
+#   docker build -t matamagu/chorus-opencode-sandbox sandbox/opencode/
+#
+# Run plain `./chorus.exe` (no --agents flag) to use the non-sandboxed
+# agents.yaml instead — all these files coexist in this directory, chosen
+# per-invocation rather than by renaming/swapping any of them.
+#
+# The Claude entry's gcloud config mount uses {{ENV:HOME}} (chorus's own
+# {{ENV:NAME}} substitution, session.go — resolved to os.Getenv("HOME") at
+# spawn time, NOT shell-expanded, since chorus execs argv directly with no
+# shell involved) instead of a hardcoded user home directory, so this file
+# doesn't need editing per-machine/per-user. Note gcloud puts its config at
+# ~/.config/gcloud on macOS too, NOT ~/Library/Application Support — this
+# is gcloud's own documented cross-platform convention, not a mistake.
+#
+# Rancher Desktop on macOS runs its Docker-compatible daemon inside a Lima
+# VM rather than WSL2 — this only matters if the container needs to reach
+# something the VM itself can't route to (see sandbox/opencode/README.md's
+# VPN-reachability note); the docker CLI/API surface this file uses is
+# otherwise identical to Windows/Linux.
+
+# default_agent is used whenever routing.mode is "off", or an LLM routing
+# decision (routing.mode: llm) fails to resolve to a known agent.
+default_agent: opencode
+
+# delegation: whether the `delegate` MCP tool is attached to agent
+# sessions at all. OFF by default in the code when this whole section (or
+# just `enabled`) is omitted — deliberately opt-in: live use found
+# agents rarely call `delegate` on their own, and the tool's schema costs
+# ~500-1400+ tokens on EVERY turn of EVERY agent it's attached to, whether
+# used or not. This project's own config turns it on (below) since it's
+# also chorus's own reference/testing setup for the feature; the
+# mechanics (briefing/nudge) stay fully implemented either way, just
+# inert while enabled: false.
+delegation:
+  enabled: false
+  # briefing: a one-time priming message sent to each agent's session on
+  # its first-ever turn once delegation is enabled AND 2+ agents are
+  # connected (tracked persistently per-agent, independent of session
+  # resume — chorus-spec.md §0), explaining the roster and encouraging
+  # proactive use of the delegate tool. Defaults to true when omitted.
+  briefing: true
+  # prefer / nudge_threshold: when a metered agent (see cost_tier below)
+  # makes nudge_threshold direct tool calls in a row of a kind listed in
+  # `prefer`, AND a non-metered agent is connected and idle, chorus
+  # prepends a one-time reminder to that agent's next queued prompt
+  # suggesting it delegate similar work instead. Off by default (empty
+  # prefer) when delegation.enabled is false; harmless but inert here too
+  # if enabled is flipped off without also blanking this.
+  prefer: [execute, edit]
+  nudge_threshold: 2
+
+# compaction: proactively trigger a compaction-style command (discovered
+# dynamically from each agent's own advertised commands — never
+# hardcoded as a literal "/compact") once context usage crosses
+# threshold_percent, instead of waiting for (or never getting) an
+# agent's own late/automatic compaction. OFF by default in the code when
+# omitted; this project's config turns it on at the researched sweet
+# spot (chorus-spec.md §0): compacting deliberately around 60% produces
+# much better, cheaper summaries than an agent's own late auto-compact,
+# which can otherwise trigger multiple times per long session at 100K+
+# tokens each.
+compaction:
+  enabled: true
+  threshold_percent: 60
+  aliases: [compact, summarize, condense]
+
+# routing: how an unprefixed prompt (no "<agent>: " override — that
+# always bypasses routing entirely, at every mode) picks which agent
+# handles it. "off" always uses default_agent, no exceptions. "llm" asks
+# decision_agent (which SHOULD be non-metered — chorus warns, doesn't
+# refuse, if it isn't) to pick both an agent and, optionally, a model
+# tier, given each agent's declared `models` below plus recent activity
+# context (context_level: prompt | digest | full — mutable live via the
+# `context` REPL command, independent of this file). Replaces v1's
+# keyword-matching router entirely (chorus-spec.md §0).
+#
+# decision_timeout_seconds: how long chorus waits for decision_agent's
+# reply before giving up and falling back to default_agent. Set
+# explicitly here (matches the code default, 60) because a free/shared-
+# capacity decision agent's own upstream provider can be intermittently
+# slow or need an internal retry (observed live on opencode's free tier:
+# repeated "Endpoint is unavailable" errors, each retried 3x internally,
+# in its own log) — a too-tight timeout here cuts that off and surfaces
+# as a generic decision-failed error indistinguishable from a real
+# problem. Lower this if your decision_agent is fast/reliable and you'd
+# rather fail fast; raise it further if you see intermittent
+# "decision failed" fallbacks with an empty raw reply.
+routing:
+  mode: llm
+  decision_agent: opencode
+  context_level: digest
+  decision_timeout_seconds: 60
+
+# Each entry's `spawn` is a full command line: the executable followed by
+# its arguments. `transport` must be "acp" (the only one chorus implements
+# today). `cost_tier` and `notes` are surfaced to every OTHER connected
+# agent via the `delegate` tool's description, the seeded first-turn
+# briefing, and the LLM routing decision — concrete signal for deciding
+# whether/to whom to delegate, or which agent+model fits a given prompt.
+# `auto_allow`/`auto_allow_tools` are this agent's permission allow-list
+# (moved here from the old policy.yaml — ACP's standardized
+# ToolCallUpdate.Kind, not per-agent tool names, since Kind is the one
+# thing every agent reports uniformly; auto_allow_tools matches by a
+# tool call's title instead, needed for chorus's own `delegate` tool
+# since its Kind is generically "other" to every agent, like any
+# external MCP tool). `models` is each agent's optional model catalog for
+# the LLM router to pick from — omit entirely (as opencode does below) to
+# let the router only ever choose the agent, never a specific model for
+# it. Exact model IDs/labels below are researched, not live-verified
+# against the installed CLI versions — treat them the way this project
+# treats any unverified CLI/protocol detail (chorus-spec.md §0's Gemini
+# playbook): confirm on a real machine before trusting them, and update
+# this file with what's actually found.
+#
+# gemini is kept configured even though it's currently blocked by a
+# Google-side free-tier restriction on this machine (see chorus-spec.md
+# §0) — try it on a machine where that isn't the case.
+agents:
+  # Sandboxed (2026-08-26, sandbox/claude/ — adapted from Anthropic's own
+  # official devcontainer): runs inside chorus-claude-sandbox instead of
+  # bare npx, so its shell tool can only touch /workspace (the {{CWD}}
+  # bind mount, substituted by chorus itself) and only reach an
+  # explicitly allowlisted set of hosts. Build the image first:
+  #   docker build -t chorus-claude-sandbox sandbox/claude/
+  # Auth is Vertex AI (this deployment's real setup) via GCP Application
+  # Default Credentials — run `gcloud auth application-default login` on
+  # the HOST first so the mounted config directory below actually has
+  # something in it. CLOUD_ML_REGION/ANTHROPIC_VERTEX_PROJECT_ID/
+  # CHORUS_SANDBOX_ALLOW_HOSTS are bare `-e NAME` (no "="), which pulls
+  # each value from chorus's own process environment at launch time —
+  # set them in the shell you run chorus.exe from, not in this file (see
+  # sandbox/claude/README.md for the exact Vertex endpoint hostnames
+  # CHORUS_SANDBOX_ALLOW_HOSTS needs). {{ENV:HOME}} resolves to your home
+  # directory at spawn time — no per-machine editing needed here.
+  - name: claude
+    spawn: ["docker", "run", "--rm", "-i",
+            "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
+            "-v", "{{CWD}}:/workspace",
+            "-v", "{{ENV:HOME}}/.config/gcloud:/home/node/.config/gcloud:ro",
+            "-e", "CLAUDE_CODE_USE_VERTEX=1",
+            "-e", "CLOUD_ML_REGION",
+            "-e", "ANTHROPIC_VERTEX_PROJECT_ID",
+            "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
+            "matamagu/chorus-claude-sandbox"]
+    workdir: /workspace
+    cost_tier: metered
+    notes: "metered/paid usage; reserve for architecture/ambiguous/high-stakes work the LLM router judges genuinely needs it"
+    transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
+    models:
+      - id: claude-opus-4-8
+        label: Opus
+        capabilities: "highest reasoning quality, slowest, most expensive"
+        when_to_use: "complex or ambiguous architecture, high-stakes correctness"
+      - id: claude-sonnet-5
+        label: Sonnet
+        capabilities: "strong general coding ability, balanced cost — Claude Code's own default"
+        when_to_use: "the default for most implementation/debugging work"
+      - id: claude-haiku-4-5-20251001
+        label: Haiku
+        capabilities: "fast, cheap, less deep reasoning"
+        when_to_use: "mechanical, well-specified, low-ambiguity tasks"
+
+  # Sandboxed via Gemini CLI's OWN built-in Docker sandboxing (2026-08-26
+  # — see sandbox/README.md) rather than chorus wrapping it in `docker
+  # run` itself — no image lives under sandbox/ for Gemini, and `spawn`
+  # below is deliberately unchanged. Set these in the shell you run
+  # chorus.exe from instead:
+  #   GEMINI_SANDBOX=docker
+  #   GOOGLE_GENAI_USE_VERTEXAI=true
+  #   GOOGLE_CLOUD_PROJECT=<project>
+  #   GOOGLE_CLOUD_LOCATION=<region>
+  # plus `gcloud auth application-default login` on the host (same ADC
+  # Claude's Vertex path uses above). UNVERIFIED whether --acp's stdio
+  # framing survives being proxied through Gemini's own nested sandbox
+  # container cleanly (chorus-spec.md §0) — this is the first thing to
+  # check once these env vars are set: does `gemini ready` still appear
+  # normally, or does startup hang/error.
+  - name: gemini
+    spawn: ["gemini", "--acp"]
+    cost_tier: seat
+    notes: "seat/subscription usage; strong at summarize/explain/review/analyze-style work"
+    transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
+    models: []   # Gemini's own model lineup/switching mechanism over ACP is
+                 # unconfirmed (chorus-spec.md §0) — router picks the agent
+                 # only, never attempts a model switch, until verified
+
+  # Sandboxed (2026-08-26, sandbox/opencode/ — no official image exists,
+  # so this is fully custom): runs inside chorus-opencode-sandbox. Build
+  # first: docker build -t chorus-opencode-sandbox sandbox/opencode/
+  # This deployment points opencode at a self-run Ollama endpoint
+  # reachable only over the company VPN — set CHORUS_SANDBOX_ALLOW_HOSTS
+  # (bare `-e NAME`, pulled from chorus's own process environment, e.g.
+  # "ollama.internal.company.com:11434") in the shell you run chorus.exe
+  # from. Read sandbox/opencode/README.md before assuming this "just
+  # works": the allowlist only controls what the CONTAINER may reach —
+  # whether Rancher Desktop's backend VM (Lima, on macOS) can route to
+  # the VPN at all is a separate, live, per-machine question. Verify
+  # without VPN first (point CHORUS_SANDBOX_ALLOW_HOSTS at something
+  # publicly reachable) to isolate "does the sandbox mechanism work" from
+  # "can it reach the VPN-bound endpoint."
+  - name: opencode
+    spawn: ["docker", "run", "--rm", "-i",
+            "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
+            "-v", "{{CWD}}:/workspace",
+            "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
+            "matamagu/chorus-opencode-sandbox"]
+    workdir: /workspace
+    cost_tier: free
+    notes: "free by default (opencode's own hosted free tier, zero configured credentials); this project's default agent and LLM-routing decision agent"
+    transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]

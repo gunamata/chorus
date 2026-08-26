@@ -1,0 +1,137 @@
+#!/bin/bash
+# Default-deny egress firewall — same mechanism as sandbox/claude/'s
+# (adapted from Anthropic's own reference), tailored for opencode.
+#
+# Base allowlist covers only GitHub (git/gh operations) and npm's
+# registry (installing a project's own dependencies) — deliberately NOT
+# including any LLM backend domain, since unlike Claude/Gemini there's
+# no single confirmed default here: this deployment points opencode at a
+# self-run Ollama endpoint reachable only over the company VPN, a
+# different setup than opencode's public free-tier backend used
+# elsewhere in this project. Set CHORUS_SANDBOX_ALLOW_HOSTS to whichever
+# applies (comma-separated; an optional ":port" suffix is accepted and
+# ignored — this firewall allowlists by destination IP, not port).
+#
+# Note: this only controls what the CONTAINER is allowed to reach. If
+# the backend is VPN-bound, Rancher Desktop's own backend VM (WSL2 on
+# Windows, Lima on macOS/Linux) also needs a network path to that VPN —
+# a separate, host-level question this script can't answer. See
+# sandbox/opencode/README.md.
+set -euo pipefail
+IFS=$'\n\t'
+
+DOCKER_DNS_RULES=$(iptables-save -t nat | grep "127\.0\.0\.11" || true)
+
+iptables -F
+iptables -X
+iptables -t nat -F
+iptables -t nat -X
+iptables -t mangle -F
+iptables -t mangle -X
+ipset destroy allowed-domains 2>/dev/null || true
+
+if [ -n "$DOCKER_DNS_RULES" ]; then
+    echo "Restoring Docker DNS rules..."
+    iptables -t nat -N DOCKER_OUTPUT 2>/dev/null || true
+    iptables -t nat -N DOCKER_POSTROUTING 2>/dev/null || true
+    echo "$DOCKER_DNS_RULES" | xargs -L 1 iptables -t nat
+else
+    echo "No Docker DNS rules to restore"
+fi
+
+iptables -A OUTPUT -p udp --dport 53 -j ACCEPT
+iptables -A INPUT -p udp --sport 53 -j ACCEPT
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+ipset create allowed-domains hash:net
+
+echo "Fetching GitHub IP ranges..."
+gh_ranges=$(curl -s https://api.github.com/meta)
+if [ -z "$gh_ranges" ]; then
+    echo "ERROR: Failed to fetch GitHub IP ranges"
+    exit 1
+fi
+if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
+    echo "ERROR: GitHub API response missing required fields"
+    exit 1
+fi
+echo "Processing GitHub IPs..."
+while read -r cidr; do
+    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
+        exit 1
+    fi
+    echo "Adding GitHub range $cidr"
+    ipset add allowed-domains "$cidr"
+done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
+
+add_domain() {
+    local domain="$1"
+    echo "Resolving $domain..."
+    local ips
+    ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
+    if [ -z "$ips" ]; then
+        echo "ERROR: Failed to resolve $domain"
+        exit 1
+    fi
+    while read -r ip; do
+        if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+            echo "ERROR: Invalid IP from DNS for $domain: $ip"
+            exit 1
+        fi
+        echo "Adding $ip for $domain"
+        ipset add allowed-domains "$ip" 2>/dev/null || true
+    done < <(echo "$ips")
+}
+
+add_domain "registry.npmjs.org"
+
+# Deployment-specific: the self-run Ollama endpoint (or opencode's own
+# free-tier backend, for a deployment not using a private endpoint) —
+# never baked into the image itself.
+if [ -n "${CHORUS_SANDBOX_ALLOW_HOSTS:-}" ]; then
+    IFS=',' read -ra extra_hosts <<< "$CHORUS_SANDBOX_ALLOW_HOSTS"
+    for host in "${extra_hosts[@]}"; do
+        host="${host%%:*}"
+        host="$(echo -n "$host" | xargs)"
+        [ -z "$host" ] && continue
+        add_domain "$host"
+    done
+else
+    echo "WARNING: CHORUS_SANDBOX_ALLOW_HOSTS is unset — opencode will only be able to reach GitHub and npm. Set it to your Ollama endpoint (or opencode's free-tier backend) or every prompt will fail to reach a model."
+fi
+
+HOST_IP=$(ip route | grep default | cut -d" " -f3)
+if [ -z "$HOST_IP" ]; then
+    echo "ERROR: Failed to detect host IP"
+    exit 1
+fi
+HOST_NETWORK=$(echo "$HOST_IP" | sed "s/\.[0-9]*$/.0\/24/")
+echo "Host network detected as: $HOST_NETWORK"
+iptables -A INPUT -s "$HOST_NETWORK" -j ACCEPT
+iptables -A OUTPUT -d "$HOST_NETWORK" -j ACCEPT
+
+iptables -P INPUT DROP
+iptables -P FORWARD DROP
+iptables -P OUTPUT DROP
+
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+iptables -A OUTPUT -m set --match-set allowed-domains dst -j ACCEPT
+iptables -A OUTPUT -j REJECT --reject-with icmp-admin-prohibited
+
+echo "Firewall configuration complete"
+echo "Verifying firewall rules..."
+if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - was able to reach https://example.com"
+    exit 1
+else
+    echo "Firewall verification passed - unable to reach https://example.com as expected"
+fi
+if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
+    exit 1
+else
+    echo "Firewall verification passed - able to reach https://api.github.com as expected"
+fi

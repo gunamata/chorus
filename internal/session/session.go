@@ -19,7 +19,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"regexp"
+	"strings"
 
 	acp "github.com/coder/acp-go-sdk"
 
@@ -28,12 +31,40 @@ import (
 	"chorus/internal/policy"
 )
 
+// cwdToken is substituted in Spec.Args (by Connect) with the real host
+// working directory before the subprocess is exec'd — lets a sandboxed
+// agent's spawn command line (e.g. `docker run -v {{CWD}}:/workspace ...`)
+// stay portable across clones/machines instead of hardcoding an absolute
+// path in agents.yaml.
+const cwdToken = "{{CWD}}"
+
+// envTokenPattern matches {{ENV:NAME}} in Spec.Args — substituted with
+// os.Getenv(NAME) by substituteTokens, the same way cwdToken is. Lets a
+// spawn command line reference a machine-specific host path (e.g. a
+// sandboxed agent's mounted credential directory) without hardcoding a
+// particular user's home directory into agents.yaml — chorus execs argv
+// directly with no shell involved, so this substitution is the only place
+// such a reference can be expanded; the OS never sees {{ENV:...}} and
+// won't expand it itself. An unset variable substitutes as empty string,
+// same as an unset shell variable would.
+var envTokenPattern = regexp.MustCompile(`\{\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}\}`)
+
 // Spec describes how to launch one agent's ACP subprocess (§10's
 // agents.yaml registry).
 type Spec struct {
 	Name    string
 	Command string
 	Args    []string
+
+	// WorkDir, if set, is the cwd chorus sends to the agent via ACP's own
+	// NewSessionRequest.Cwd/LoadSessionRequest.Cwd (see EffectiveCwd) —
+	// for an agent chorus itself runs inside a container (a sandboxed
+	// Claude/opencode spawned via `docker run -v {{CWD}}:/workspace ...`),
+	// this is the in-container mount point (e.g. "/workspace"), since the
+	// container has no way to resolve the host's real path. Empty (the
+	// default, non-sandboxed case) leaves today's behavior unchanged: the
+	// real host cwd is sent as-is.
+	WorkDir string
 
 	// CostTier and Notes are metadata carried through from agents.yaml,
 	// surfaced to other agents via the delegate tool's description and
@@ -49,6 +80,32 @@ type Spec struct {
 	// a model-switch command. Empty/nil is fine: the router simply never
 	// picks a model for that agent, only the agent itself.
 	Models []ModelInfo
+}
+
+// EffectiveCwd returns the cwd to send to this agent via ACP: WorkDir if
+// set (the sandboxed case — see WorkDir's doc comment), otherwise the
+// real host cwd unchanged.
+func (s Spec) EffectiveCwd(hostCwd string) string {
+	if s.WorkDir != "" {
+		return s.WorkDir
+	}
+	return hostCwd
+}
+
+// substituteTokens replaces every occurrence of cwdToken with cwd and
+// every {{ENV:NAME}} with os.Getenv(NAME) in each arg, leaving args with
+// no token untouched (the ordinary, non-sandboxed case).
+func substituteTokens(args []string, cwd string) []string {
+	out := make([]string, len(args))
+	for i, a := range args {
+		a = strings.ReplaceAll(a, cwdToken, cwd)
+		a = envTokenPattern.ReplaceAllStringFunc(a, func(token string) string {
+			name := envTokenPattern.FindStringSubmatch(token)[1]
+			return os.Getenv(name)
+		})
+		out[i] = a
+	}
+	return out
 }
 
 // ModelInfo describes one selectable model for an agent, in terms an LLM
@@ -106,8 +163,13 @@ type Connection struct {
 // know about OTHER agents' cost tiers too. Both are safe to pass
 // zero-valued (nil/empty) when the feature isn't configured in
 // policy.yaml; the tracking logic no-ops when Delegation.Prefer is empty.
-func Connect(ctx context.Context, spec Spec, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, delegation policy.Delegation, costTiers map[string]string, stderr io.Writer) (*Connection, error) {
-	cmd := exec.CommandContext(ctx, spec.Command, spec.Args...)
+//
+// cwd is the real host working directory — substituted for any {{CWD}}
+// token found in spec.Args before exec'ing, alongside any {{ENV:NAME}}
+// token (see cwdToken/envTokenPattern's doc comments). Non-sandboxed
+// spawns with no such tokens are unaffected.
+func Connect(ctx context.Context, spec Spec, cwd string, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, delegation policy.Delegation, costTiers map[string]string, stderr io.Writer) (*Connection, error) {
+	cmd := exec.CommandContext(ctx, spec.Command, substituteTokens(spec.Args, cwd)...)
 	cmd.Stderr = stderr
 
 	stdin, err := cmd.StdinPipe()

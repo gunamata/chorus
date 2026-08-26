@@ -43,14 +43,15 @@ func main() {
 	}
 
 	fresh := hasFlag(os.Args[1:], "--fresh")
+	agentsOverride := flagValue(os.Args[1:], "--agents=")
 
-	if err := run(fresh); err != nil {
+	if err := run(fresh, agentsOverride); err != nil {
 		fmt.Fprintln(os.Stderr, "chorus:", err)
 		os.Exit(1)
 	}
 }
 
-func run(fresh bool) error {
+func run(fresh bool, agentsOverride string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -59,7 +60,7 @@ func run(fresh bool) error {
 		return err
 	}
 
-	agentSpecs, cfg, err := loadAgentConfig(cwd)
+	agentSpecs, cfg, err := loadAgentConfig(cwd, agentsOverride)
 	if err != nil {
 		return err
 	}
@@ -110,7 +111,7 @@ func run(fresh bool) error {
 	var startErrs []string
 	for _, spec := range agentSpecs {
 		fmt.Printf("starting %s (%s %s)...\n", spec.Name, spec.Command, strings.Join(spec.Args, " "))
-		conn, err := session.Connect(ctx, spec, outputCh, permCh, cfg.Agents, cfg.Delegation, costTiers, agentStderr(logDir, spec.Name))
+		conn, err := session.Connect(ctx, spec, cwd, outputCh, permCh, cfg.Agents, cfg.Delegation, costTiers, agentStderr(logDir, spec.Name))
 		if err != nil {
 			startErrs = append(startErrs, fmt.Sprintf("%s: %v", spec.Name, err))
 			continue
@@ -189,7 +190,7 @@ func run(fresh bool) error {
 			mcpServers = ms
 		}
 
-		s, resumed := resumeOrNewSession(ctx, conn, store, fresh, spec.Name, cwd, mcpServers)
+		s, resumed := resumeOrNewSession(ctx, conn, store, fresh, spec.Name, spec.EffectiveCwd(cwd), mcpServers)
 		if s == nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to create session for %s\n", spec.Name)
 			conn.Close()
@@ -389,9 +390,35 @@ func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *se
 //go:embed agents.yaml
 var embeddedAgentsYAML []byte
 
-// loadAgentConfig resolves agents.yaml for this run. A local file in cwd
-// always takes precedence over the embedded default.
-func loadAgentConfig(cwd string) ([]session.Spec, policy.Config, error) {
+// loadAgentConfig resolves agents.yaml for this run.
+//
+// override (from --agents=<path>, e.g. --agents=agents.yaml.sandbox) lets
+// more than one config coexist in the same directory without renaming —
+// added so a sandboxed config can sit alongside the default one, picked
+// explicitly per invocation rather than by swapping files in place. An
+// override that doesn't exist is a hard error (the user asked for that
+// specific file), unlike the no-override case below, where a missing
+// agents.yaml silently falls back to the embedded default by design.
+//
+// With no override: a local agents.yaml file in cwd always takes
+// precedence over the embedded default.
+func loadAgentConfig(cwd string, override string) ([]session.Spec, policy.Config, error) {
+	if override != "" {
+		agentsPath := override
+		if !filepath.IsAbs(agentsPath) {
+			agentsPath = filepath.Join(cwd, agentsPath)
+		}
+		b, err := os.ReadFile(agentsPath)
+		if err != nil {
+			return nil, policy.Config{}, fmt.Errorf("read %s (from --agents): %w", agentsPath, err)
+		}
+		agentSpecs, cfg, err := registry.Parse(b)
+		if err != nil {
+			return nil, policy.Config{}, fmt.Errorf("load %s: %w", agentsPath, err)
+		}
+		return agentSpecs, cfg, nil
+	}
+
 	agentsPath := filepath.Join(cwd, "agents.yaml")
 
 	localAgents, err := fileExists(agentsPath)
@@ -459,6 +486,18 @@ func hasFlag(args []string, flag string) bool {
 		}
 	}
 	return false
+}
+
+// flagValue returns the value of a "prefix<value>" style flag (e.g.
+// flagValue(args, "--agents=") for "--agents=agents.yaml.sandbox"), or ""
+// if not present.
+func flagValue(args []string, prefix string) string {
+	for _, a := range args {
+		if strings.HasPrefix(a, prefix) {
+			return strings.TrimPrefix(a, prefix)
+		}
+	}
+	return ""
 }
 
 // agentStderr opens (truncating) a per-agent log file under dir for

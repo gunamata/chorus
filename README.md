@@ -67,8 +67,9 @@ go build -o chorus.exe .
 ## Run
 
 ```sh
-./chorus.exe          # resumes prior sessions where possible
-./chorus.exe --fresh  # start every agent clean, ignoring saved sessions
+./chorus.exe                                      # resumes prior sessions where possible
+./chorus.exe --fresh                              # start every agent clean, ignoring saved sessions
+./chorus.exe --agents=agents.yaml.sandbox.windows # use a different agents.yaml than the default
 ```
 
 On startup chorus spawns all three agent subprocesses and creates (or
@@ -352,6 +353,21 @@ falls back to it when no local `agents.yaml` exists in the directory you
 run it from, so `chorus` works out of the box with zero setup. A local
 file always takes precedence over the embedded default.
 
+**More than one config can coexist via `--agents=<path>`** — e.g. keep a
+plain `agents.yaml` for normal use and a separate sandboxed one (this
+repo ships `agents.yaml.sandbox.windows`/`.macos`/`.linux` — see
+[Sandboxing](#sandboxing-containers)) for a containerized run, switching
+per-invocation instead of renaming/swapping files:
+
+```sh
+./chorus.exe                                      # loads agents.yaml (or the embedded default)
+./chorus.exe --agents=agents.yaml.sandbox.windows # loads that file explicitly instead
+```
+
+Unlike the no-flag case, a missing `--agents` path is a hard error
+rather than a silent fallback to the embedded default — you asked for
+that specific file.
+
 **`agents.yaml` is trusted, executable configuration, not passive
 data** — `spawn` is a literal command line chorus runs unconditionally
 at startup. Never point chorus at an `agents.yaml` you didn't write or
@@ -547,6 +563,69 @@ touches the network). This is a deliberate, narrow exception to "no
 sockets" — see `chorus-spec.md` §0/§2 for why it's unavoidable given
 how ACP's `mcpServers` mechanism actually works.
 
+## Sandboxing (containers)
+
+Opt-in filesystem/blast-radius containment and network-exfiltration
+prevention: run an agent's subprocess inside a Docker container instead
+of directly on the host, so its shell tool can only touch the mounted
+project directory and only reach an explicitly allowlisted set of
+hosts. Off by default — a normal `spawn` entry is unaffected.
+
+A `workdir` field and two token substitutions in `spawn`'s argv make this
+possible — chorus execs `spawn` directly with no shell involved, so
+these are chorus's own substitution, not OS/shell environment expansion:
+
+- `workdir` — the in-container path chorus tells the agent its cwd is
+  (via ACP's own `Cwd` field), since a container has no way to resolve
+  the host's real path.
+- `{{CWD}}` anywhere in `spawn`'s argv is substituted with the real host
+  project directory before chorus execs the command — lets a sandboxed
+  `spawn` line (e.g. `docker run -v {{CWD}}:/workspace ...`) stay
+  portable across clones/machines instead of hardcoding an absolute
+  path.
+- `{{ENV:NAME}}` anywhere in `spawn`'s argv is substituted with
+  `os.Getenv("NAME")` — lets a `spawn` line reference a machine-specific
+  host path (e.g. `{{ENV:HOME}}/.config/gcloud` for a mounted credential
+  directory) without hardcoding a particular user's name into
+  `agents.yaml`. An unset variable substitutes as an empty string.
+
+```yaml
+- name: opencode
+  spawn: ["docker", "run", "--rm", "-i", "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
+          "-v", "{{CWD}}:/workspace", "chorus-opencode-sandbox"]
+  workdir: /workspace
+  cost_tier: free
+```
+
+Ready-to-build sandbox images live under [`sandbox/`](sandbox/) — one
+per agent, each following whichever mechanism is most official for that
+agent rather than one uniform wrapper (Claude: adapted directly from
+Anthropic's own official devcontainer; Gemini: the CLI's own built-in
+`GEMINI_SANDBOX=docker` sandboxing, no image needed here at all;
+opencode: a custom image, since no official one exists). See
+[`sandbox/README.md`](sandbox/README.md) for the full picture, and each
+subdirectory's own README for auth options (direct API key, AWS
+Bedrock, Google Vertex AI, or a private endpoint) and the firewall's
+`CHORUS_SANDBOX_ALLOW_HOSTS` extension mechanism — none of these are
+hardcoded into an image, since most enterprise environments authenticate
+through their own mechanism rather than a personal API key.
+
+Cross-agent delegation is explicitly not supported for a sandboxed
+agent yet (its loopback hub isn't reachable from inside a firewalled
+container without extra plumbing) — see `sandbox/README.md`'s
+out-of-scope section.
+
+**Keep a sandboxed config alongside your normal one** rather than
+editing `agents.yaml` in place — this repo ships three worked examples,
+one per OS (`agents.yaml.sandbox.windows`, `.macos`, `.linux` — identical
+except for volume-mount path syntax and whether the mounted gcloud
+config directory comes from `{{ENV:APPDATA}}` or `{{ENV:HOME}}`; Claude/
+opencode wrapped in `docker run`, Gemini left as a plain `spawn` with a
+comment on which env vars to set), loaded via
+`--agents=agents.yaml.sandbox.<os>` (see [Agent
+registry](#agent-registry-agentsyaml)) instead of the default
+`./chorus.exe`.
+
 ## Session persistence
 
 Quit chorus and come back later — `claude:`/`opencode:` prompts pick up
@@ -665,6 +744,8 @@ internal/delegate/         Cross-agent delegation (§11): the delegate-mcp subpr
                             mode and the loopback Hub it calls back into
 internal/sessionstore/     .chorus/sessions.json persistence for session resume
 internal/bus/               Shared message types between agent connections and main
+sandbox/                   Opt-in per-agent container images for filesystem/network
+                            containment — see Sandboxing above and sandbox/README.md
 ```
 
 ## Known limitations
@@ -713,3 +794,22 @@ internal/bus/               Shared message types between agent connections and m
   terminal restoration on quit) — see `chorus-spec.md` §0's most recent
   entry and `CLAUDE.md`'s Known open issues before assuming this is
   fully verified.
+- **Sandboxing (2026-08-26): the core containment mechanism is
+  live-verified; the full agent round-trip isn't yet.** The Go-side
+  mechanism (`workdir`/`{{CWD}}`) is unit-tested, and both
+  `sandbox/claude/` and `sandbox/opencode/` have been built and run for
+  real (not just designed): a host file was confirmed readable through
+  the workspace mount with nothing else on the host reachable, the
+  default-deny firewall was confirmed actually blocking an unrelated
+  host while allowing the built-in allowlist, and
+  `CHORUS_SANDBOX_ALLOW_HOSTS` was confirmed to actually extend it. What
+  hasn't been verified: the real Claude/opencode ACP adapter completing
+  a real prompt inside these images (needs real Vertex AI credentials,
+  unavailable when this was tested), Gemini's `--acp` mode through its
+  own built-in `GEMINI_SANDBOX=docker` sandbox at all, and opencode's
+  actual VPN-bound Ollama endpoint reachability from inside the
+  container (a live, per-machine question — see
+  `sandbox/opencode/README.md`). See `chorus-spec.md` §0's 2026-08-26
+  entries for the full account, including a real bug found and fixed
+  along the way (the Claude image's base `node:20` no longer satisfies
+  `@anthropic-ai/claude-code`'s own `engines.node >= 22` requirement).

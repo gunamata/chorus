@@ -52,7 +52,7 @@ agents:
 `
 
 func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFile(t *testing.T) {
-	agentSpecs, cfg, err := loadAgentConfig(t.TempDir())
+	agentSpecs, cfg, err := loadAgentConfig(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("loadAgentConfig() error = %v, want it to fall back to the embedded default cleanly", err)
 	}
@@ -75,7 +75,7 @@ func TestLoadAgentConfig_LocalFileTakesPrecedenceOverEmbedded(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
 
-	agentSpecs, cfg, err := loadAgentConfig(dir)
+	agentSpecs, cfg, err := loadAgentConfig(dir, "")
 	if err != nil {
 		t.Fatalf("loadAgentConfig() error = %v", err)
 	}
@@ -84,6 +84,64 @@ func TestLoadAgentConfig_LocalFileTakesPrecedenceOverEmbedded(t *testing.T) {
 	}
 	if cfg.DefaultAgent != "test-only-agent" {
 		t.Fatalf("cfg.DefaultAgent = %q, want the local file's value", cfg.DefaultAgent)
+	}
+}
+
+// --- loadAgentConfig: --agents=<path> override ---------------------------
+//
+// Added so more than one config can coexist in the same directory without
+// renaming (e.g. agents.yaml.sandbox alongside the default agents.yaml),
+// selected explicitly per invocation via --agents=<path>.
+
+func TestLoadAgentConfig_OverrideTakesPrecedenceOverLocalAndEmbedded(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
+	writeFile(t, filepath.Join(dir, "agents.yaml.sandbox"), `
+default_agent: sandboxed-agent
+agents:
+  - name: sandboxed-agent
+    spawn: ["true"]
+    cost_tier: free
+`)
+
+	agentSpecs, cfg, err := loadAgentConfig(dir, "agents.yaml.sandbox")
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v", err)
+	}
+	if len(agentSpecs) != 1 || agentSpecs[0].Name != "sandboxed-agent" {
+		t.Fatalf("agentSpecs = %+v, want only the override file's sandboxed-agent (override must win over local agents.yaml)", agentSpecs)
+	}
+	if cfg.DefaultAgent != "sandboxed-agent" {
+		t.Fatalf("cfg.DefaultAgent = %q, want the override file's value", cfg.DefaultAgent)
+	}
+}
+
+func TestLoadAgentConfig_OverrideResolvesRelativeToCwd(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "agents.yaml.sandbox"), testAgentsYAML)
+
+	agentSpecs, _, err := loadAgentConfig(dir, "agents.yaml.sandbox")
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v", err)
+	}
+	if len(agentSpecs) != 1 || agentSpecs[0].Name != "test-only-agent" {
+		t.Fatalf("agentSpecs = %+v, want the relative override file resolved against cwd", agentSpecs)
+	}
+}
+
+func TestLoadAgentConfig_MissingOverrideIsAHardError(t *testing.T) {
+	dir := t.TempDir()
+	if _, _, err := loadAgentConfig(dir, "does-not-exist.yaml"); err == nil {
+		t.Fatal("loadAgentConfig() error = nil, want an error for a missing --agents override (unlike the no-override case, this must not silently fall back to the embedded default)")
+	}
+}
+
+func TestFlagValue(t *testing.T) {
+	if got := flagValue([]string{"--fresh", "--agents=agents.yaml.sandbox"}, "--agents="); got != "agents.yaml.sandbox" {
+		t.Errorf("flagValue() = %q, want %q", got, "agents.yaml.sandbox")
+	}
+	if got := flagValue([]string{"--fresh"}, "--agents="); got != "" {
+		t.Errorf("flagValue() = %q, want empty when the flag is absent", got)
 	}
 }
 

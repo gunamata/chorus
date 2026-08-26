@@ -36,6 +36,13 @@ type entry struct {
 	Notes     string `yaml:"notes"`
 	Transport string `yaml:"transport"`
 
+	// WorkDir is the in-container cwd sent to this agent over ACP when its
+	// spawn command runs it inside a container (a sandboxed Claude/opencode
+	// spawned via `docker run -v {{CWD}}:/workspace ...`) — see
+	// session.Spec.WorkDir's doc comment. Omit for a normal, non-sandboxed
+	// spawn.
+	WorkDir string `yaml:"workdir"`
+
 	// AutoAllow/AutoAllowTools moved here from the old policy.yaml — see
 	// policy.AgentPolicy's doc comment for their meaning.
 	AutoAllow      []string `yaml:"auto_allow"`
@@ -110,6 +117,7 @@ func Parse(b []byte) ([]session.Spec, policy.Config, error) {
 			Name:     e.Name,
 			Command:  e.Spawn[0],
 			Args:     e.Spawn[1:],
+			WorkDir:  e.WorkDir,
 			CostTier: e.CostTier,
 			Notes:    e.Notes,
 			Models:   e.Models,
