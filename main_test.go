@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"chorus/internal/delegate"
+	"chorus/internal/policy"
+	"chorus/internal/session"
 )
 
 func TestBuildBriefingText_MentionsEachRosterAgent(t *testing.T) {
@@ -35,25 +37,24 @@ func TestBuildBriefingText_EmptyRoster(t *testing.T) {
 	}
 }
 
-// --- loadAgentConfig: embedded defaults, local-file precedence, and the
-// local-agents-requires-local-policy guard ------------------------------
+// --- loadAgentConfig: embedded defaults, local-file precedence ----------
+//
+// policy.yaml no longer exists (chorus-spec.md §0) — everything lives in
+// one agents.yaml, so there's no more "local agents requires local
+// policy" guard to test; a local agents.yaml is simply all-or-nothing.
 
 const testAgentsYAML = `
+default_agent: test-only-agent
 agents:
   - name: test-only-agent
     spawn: ["true"]
     cost_tier: free
 `
 
-const testPolicyYAML = `
-routing:
-  default: test-only-agent
-`
-
-func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFiles(t *testing.T) {
+func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFile(t *testing.T) {
 	agentSpecs, cfg, err := loadAgentConfig(t.TempDir())
 	if err != nil {
-		t.Fatalf("loadAgentConfig() error = %v, want it to fall back to the embedded defaults cleanly", err)
+		t.Fatalf("loadAgentConfig() error = %v, want it to fall back to the embedded default cleanly", err)
 	}
 	if len(agentSpecs) == 0 {
 		t.Fatal("agentSpecs is empty, want the embedded default agent set")
@@ -65,28 +66,14 @@ func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFiles(t *testing.
 	if !contains(names, "claude") {
 		t.Fatalf("agentSpecs = %v, want the embedded default's \"claude\" entry present", names)
 	}
-	if cfg.Routing.Default == "" {
-		t.Fatal("cfg.Routing.Default is empty, want the embedded default policy's routing.default")
+	if cfg.DefaultAgent == "" {
+		t.Fatal("cfg.DefaultAgent is empty, want the embedded default's default_agent")
 	}
 }
 
-func TestLoadAgentConfig_LocalAgentsWithoutLocalPolicyErrors(t *testing.T) {
+func TestLoadAgentConfig_LocalFileTakesPrecedenceOverEmbedded(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
-
-	_, _, err := loadAgentConfig(dir)
-	if err == nil {
-		t.Fatal("loadAgentConfig() error = nil, want an error: a local agents.yaml with no local policy.yaml must be rejected")
-	}
-	if !strings.Contains(err.Error(), "policy.yaml") {
-		t.Fatalf("loadAgentConfig() error = %q, want it to mention policy.yaml", err)
-	}
-}
-
-func TestLoadAgentConfig_LocalFilesTakePrecedenceOverEmbedded(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
-	writeFile(t, filepath.Join(dir, "policy.yaml"), testPolicyYAML)
 
 	agentSpecs, cfg, err := loadAgentConfig(dir)
 	if err != nil {
@@ -95,28 +82,8 @@ func TestLoadAgentConfig_LocalFilesTakePrecedenceOverEmbedded(t *testing.T) {
 	if len(agentSpecs) != 1 || agentSpecs[0].Name != "test-only-agent" {
 		t.Fatalf("agentSpecs = %+v, want only the local file's test-only-agent (local must win over embedded)", agentSpecs)
 	}
-	if cfg.Routing.Default != "test-only-agent" {
-		t.Fatalf("cfg.Routing.Default = %q, want the local policy.yaml's value", cfg.Routing.Default)
-	}
-}
-
-func TestLoadAgentConfig_LocalPolicyAloneAllowedWithEmbeddedAgents(t *testing.T) {
-	dir := t.TempDir()
-	writeFile(t, filepath.Join(dir, "policy.yaml"), testPolicyYAML)
-
-	agentSpecs, cfg, err := loadAgentConfig(dir)
-	if err != nil {
-		t.Fatalf("loadAgentConfig() error = %v, want a local policy.yaml with no local agents.yaml to be allowed", err)
-	}
-	var names []string
-	for _, s := range agentSpecs {
-		names = append(names, s.Name)
-	}
-	if !contains(names, "claude") {
-		t.Fatalf("agentSpecs = %v, want the embedded default agent set since no local agents.yaml was provided", names)
-	}
-	if cfg.Routing.Default != "test-only-agent" {
-		t.Fatalf("cfg.Routing.Default = %q, want the local policy.yaml's value to still apply", cfg.Routing.Default)
+	if cfg.DefaultAgent != "test-only-agent" {
+		t.Fatalf("cfg.DefaultAgent = %q, want the local file's value", cfg.DefaultAgent)
 	}
 }
 
@@ -146,4 +113,39 @@ func contains(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// --- validateRoutingConfig ------------------------------------------
+
+func TestValidateRoutingConfig_OffModeSkipsValidation(t *testing.T) {
+	err := validateRoutingConfig(nil, policy.Routing{Mode: "off", DecisionAgent: "does-not-exist"})
+	if err != nil {
+		t.Fatalf("validateRoutingConfig() error = %v, want nil — decision_agent is never consulted when routing is off", err)
+	}
+}
+
+func TestValidateRoutingConfig_LLMModeRequiresKnownDecisionAgent(t *testing.T) {
+	specs := []session.Spec{{Name: "opencode", CostTier: "free"}}
+	err := validateRoutingConfig(specs, policy.Routing{Mode: "llm", DecisionAgent: "nonexistent"})
+	if err == nil {
+		t.Fatal("validateRoutingConfig() error = nil, want an error for an unknown decision_agent")
+	}
+}
+
+func TestValidateRoutingConfig_LLMModeAcceptsKnownNonMeteredDecisionAgent(t *testing.T) {
+	specs := []session.Spec{{Name: "opencode", CostTier: "free"}}
+	err := validateRoutingConfig(specs, policy.Routing{Mode: "llm", DecisionAgent: "opencode"})
+	if err != nil {
+		t.Fatalf("validateRoutingConfig() error = %v, want nil for a known, non-metered decision_agent", err)
+	}
+}
+
+func TestValidateRoutingConfig_LLMModeAcceptsMeteredDecisionAgentWithoutErroring(t *testing.T) {
+	// A metered decision_agent is a bad idea (warned about via stderr, not
+	// tested here), but not an error — it's still a valid configuration.
+	specs := []session.Spec{{Name: "claude", CostTier: "metered"}}
+	err := validateRoutingConfig(specs, policy.Routing{Mode: "llm", DecisionAgent: "claude"})
+	if err != nil {
+		t.Fatalf("validateRoutingConfig() error = %v, want nil (a warning, not a hard error) for a metered decision_agent", err)
+	}
 }

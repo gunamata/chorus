@@ -1,97 +1,38 @@
 package policy
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
+	"time"
 )
 
-func writeTempPolicy(t *testing.T, content string) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "policy.yaml")
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
+func intPtr(n int) *int    { return &n }
+func boolPtr(b bool) *bool { return &b }
 
-func TestLoad_MissingFileIsNotAnError(t *testing.T) {
-	cfg, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml"))
-	if err != nil {
-		t.Fatalf("Load() error = %v, want nil for a missing file", err)
+// --- Delegation ----------------------------------------------------
+
+func TestDelegation_EnabledOrDefault_DefaultsFalse(t *testing.T) {
+	var d Delegation
+	if d.EnabledOrDefault() {
+		t.Fatal("EnabledOrDefault() = true, want false when Enabled is unset")
 	}
-	if cfg.Agents == nil {
-		t.Fatal("Agents = nil, want a non-nil empty map")
+	d.Enabled = boolPtr(true)
+	if !d.EnabledOrDefault() {
+		t.Fatal("EnabledOrDefault() = false, want true when explicitly enabled")
 	}
-	if len(cfg.Agents) != 0 {
-		t.Fatalf("Agents = %+v, want empty", cfg.Agents)
-	}
-	if len(cfg.Routing.Rules) != 0 || cfg.Routing.Default != "" {
-		t.Fatalf("Routing = %+v, want zero value", cfg.Routing)
+	d.Enabled = boolPtr(false)
+	if d.EnabledOrDefault() {
+		t.Fatal("EnabledOrDefault() = true, want false when explicitly disabled")
 	}
 }
 
-func TestConfig_BriefingEnabled_DefaultsTrue(t *testing.T) {
-	var cfg Config
-	if !cfg.BriefingEnabled() {
-		t.Fatal("BriefingEnabled() = false, want true when Delegation is entirely unset")
+func TestDelegation_BriefingEnabled_DefaultsTrue(t *testing.T) {
+	var d Delegation
+	if !d.BriefingEnabled() {
+		t.Fatal("BriefingEnabled() = false, want true when Briefing is unset")
 	}
-}
-
-func TestConfig_BriefingEnabled_ExplicitFalse(t *testing.T) {
-	off := false
-	cfg := Config{Delegation: Delegation{Briefing: &off}}
-	if cfg.BriefingEnabled() {
+	d.Briefing = boolPtr(false)
+	if d.BriefingEnabled() {
 		t.Fatal("BriefingEnabled() = true, want false when explicitly disabled")
-	}
-}
-
-func TestLoad_ParsesDelegationSection(t *testing.T) {
-	path := writeTempPolicy(t, `
-delegation:
-  briefing: false
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if cfg.BriefingEnabled() {
-		t.Fatal("BriefingEnabled() = true, want false per policy.yaml's delegation.briefing: false")
-	}
-}
-
-func TestLoad_MissingDelegationSectionDefaultsBriefingOn(t *testing.T) {
-	path := writeTempPolicy(t, `
-claude:
-  auto_allow: [read]
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !cfg.BriefingEnabled() {
-		t.Fatal("BriefingEnabled() = false, want true when policy.yaml has no delegation section at all")
-	}
-}
-
-func TestLoad_ParsesDelegationPreferAndThreshold(t *testing.T) {
-	path := writeTempPolicy(t, `
-delegation:
-  prefer: [execute, edit]
-  nudge_threshold: 5
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
-	}
-	if !cfg.Delegation.PreferKind("execute") || !cfg.Delegation.PreferKind("edit") {
-		t.Fatalf("Delegation.Prefer = %v, want it to include execute and edit", cfg.Delegation.Prefer)
-	}
-	if cfg.Delegation.PreferKind("read") {
-		t.Fatal("PreferKind(\"read\") = true, want false — read wasn't listed")
-	}
-	if got := cfg.Delegation.Threshold(); got != 5 {
-		t.Fatalf("Threshold() = %d, want 5", got)
 	}
 }
 
@@ -111,76 +52,116 @@ func TestDelegation_Threshold_DefaultsWhenUnsetOrNonPositive(t *testing.T) {
 			}
 		})
 	}
+	if got := (Delegation{NudgeThreshold: intPtr(5)}).Threshold(); got != 5 {
+		t.Fatalf("Threshold() = %d, want 5", got)
+	}
 }
 
-func TestDelegation_PreferKind_EmptyPreferMatchesNothing(t *testing.T) {
-	var d Delegation
-	if d.PreferKind("execute") {
+func TestDelegation_PreferKind(t *testing.T) {
+	var empty Delegation
+	if empty.PreferKind("execute") {
 		t.Fatal("PreferKind(\"execute\") = true, want false when Prefer is empty (nudge disabled)")
 	}
-	if d.PreferKind("") {
+	if empty.PreferKind("") {
 		t.Fatal("PreferKind(\"\") = true, want false for an empty kind")
 	}
-}
 
-func intPtr(n int) *int { return &n }
-
-func TestLoad_MergesAgentPoliciesAndRouting(t *testing.T) {
-	path := writeTempPolicy(t, `
-claude:
-  auto_allow: [read, search]
-  auto_allow_tools: [mcp__chorus-delegate__]
-gemini:
-  auto_allow: [read]
-routing:
-  default: gemini
-  ask_when_ambiguous: true
-  rules:
-    - match: [fix, implement]
-      agent: claude
-`)
-	cfg, err := Load(path)
-	if err != nil {
-		t.Fatalf("Load() error = %v", err)
+	d := Delegation{Prefer: []string{"execute", "edit"}}
+	if !d.PreferKind("execute") || !d.PreferKind("edit") {
+		t.Fatalf("Prefer = %v, want it to include execute and edit", d.Prefer)
 	}
-
-	if len(cfg.Agents) != 2 {
-		t.Fatalf("len(Agents) = %d, want 2 (got %+v)", len(cfg.Agents), cfg.Agents)
-	}
-	if !cfg.Agents.AutoAllow("claude", "read") {
-		t.Error("expected claude to auto-allow \"read\"")
-	}
-	if cfg.Agents.AutoAllow("claude", "edit") {
-		t.Error("expected claude NOT to auto-allow \"edit\"")
-	}
-	if !cfg.Agents.AutoAllowTool("claude", "mcp__chorus-delegate__delegate") {
-		t.Error("expected claude to auto-allow the delegate tool by title prefix")
-	}
-
-	if cfg.Routing.Default != "gemini" {
-		t.Errorf("Routing.Default = %q, want gemini", cfg.Routing.Default)
-	}
-	if !cfg.Routing.AskWhenAmbiguous {
-		t.Error("Routing.AskWhenAmbiguous = false, want true")
-	}
-	if len(cfg.Routing.Rules) != 1 || cfg.Routing.Rules[0].Agent != "claude" {
-		t.Fatalf("Routing.Rules = %+v, want one rule routing to claude", cfg.Routing.Rules)
-	}
-
-	// The "routing" key must not leak into Agents as a bogus agent policy.
-	if _, ok := cfg.Agents["routing"]; ok {
-		t.Error(`Agents contains a "routing" entry — the routing key leaked into the agent map`)
+	if d.PreferKind("read") {
+		t.Fatal("PreferKind(\"read\") = true, want false — read wasn't listed")
 	}
 }
 
-func TestLoad_MalformedFieldTypeErrors(t *testing.T) {
-	// auto_allow must be a list; giving it a scalar should fail to decode
-	// rather than silently producing a useless zero value.
-	path := writeTempPolicy(t, "claude:\n  auto_allow: \"not-a-list\"\n")
-	if _, err := Load(path); err == nil {
-		t.Fatal("Load() error = nil, want an error for a malformed auto_allow field")
+// --- Compaction ------------------------------------------------------
+
+func TestCompaction_EnabledOrDefault_DefaultsFalse(t *testing.T) {
+	var c Compaction
+	if c.EnabledOrDefault() {
+		t.Fatal("EnabledOrDefault() = true, want false when unset")
+	}
+	c.Enabled = boolPtr(true)
+	if !c.EnabledOrDefault() {
+		t.Fatal("EnabledOrDefault() = false, want true when explicitly enabled")
 	}
 }
+
+func TestCompaction_Threshold_DefaultsWhenUnsetOrInvalid(t *testing.T) {
+	cases := []Compaction{{}, {ThresholdPercent: 0}, {ThresholdPercent: -5}, {ThresholdPercent: 150}}
+	for _, c := range cases {
+		if got := c.Threshold(); got != defaultCompactionThreshold {
+			t.Fatalf("Threshold() = %d, want default %d for %+v", got, defaultCompactionThreshold, c)
+		}
+	}
+	if got := (Compaction{ThresholdPercent: 75}).Threshold(); got != 75 {
+		t.Fatalf("Threshold() = %d, want 75", got)
+	}
+}
+
+func TestCompaction_AliasesOrDefault(t *testing.T) {
+	var c Compaction
+	if got := c.AliasesOrDefault(); len(got) == 0 {
+		t.Fatal("AliasesOrDefault() = empty, want the built-in default aliases")
+	}
+	custom := Compaction{Aliases: []string{"squash"}}
+	if got := custom.AliasesOrDefault(); len(got) != 1 || got[0] != "squash" {
+		t.Fatalf("AliasesOrDefault() = %v, want the configured [squash]", got)
+	}
+}
+
+// --- Routing ---------------------------------------------------------
+
+func TestRouting_ModeOrDefault(t *testing.T) {
+	cases := []struct {
+		mode string
+		want RoutingMode
+	}{
+		{"", RoutingOff},
+		{"garbage", RoutingOff},
+		{"off", RoutingOff},
+		{"llm", RoutingLLM},
+	}
+	for _, c := range cases {
+		if got := (Routing{Mode: c.mode}).ModeOrDefault(); got != c.want {
+			t.Errorf("Routing{Mode: %q}.ModeOrDefault() = %v, want %v", c.mode, got, c.want)
+		}
+	}
+}
+
+func TestRouting_ContextLevelOrDefault(t *testing.T) {
+	cases := []struct {
+		level string
+		want  string
+	}{
+		{"", "digest"},
+		{"garbage", "digest"},
+		{"prompt", "prompt"},
+		{"digest", "digest"},
+		{"full", "full"},
+	}
+	for _, c := range cases {
+		if got := (Routing{ContextLevel: c.level}).ContextLevelOrDefault(); got != c.want {
+			t.Errorf("Routing{ContextLevel: %q}.ContextLevelOrDefault() = %q, want %q", c.level, got, c.want)
+		}
+	}
+}
+
+func TestRouting_DecisionTimeout_DefaultsWhenUnsetOrNonPositive(t *testing.T) {
+	cases := []int{0, -1, -100}
+	for _, secs := range cases {
+		got := (Routing{DecisionTimeoutSeconds: secs}).DecisionTimeout()
+		if got != defaultDecisionTimeoutSeconds*time.Second {
+			t.Errorf("Routing{DecisionTimeoutSeconds: %d}.DecisionTimeout() = %v, want the %ds default", secs, got, defaultDecisionTimeoutSeconds)
+		}
+	}
+	if got := (Routing{DecisionTimeoutSeconds: 90}).DecisionTimeout(); got != 90*time.Second {
+		t.Errorf("DecisionTimeout() = %v, want 90s", got)
+	}
+}
+
+// --- Policy (auto_allow / auto_allow_tools) ---------------------------
 
 func TestPolicy_AutoAllow(t *testing.T) {
 	p := Policy{"claude": AgentPolicy{AutoAllow: []string{"read", "search"}}}

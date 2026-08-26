@@ -41,6 +41,26 @@ type Spec struct {
 	// AgentSession/Connection themselves.
 	CostTier string
 	Notes    string
+
+	// Models is this agent's declared model catalog (agents.yaml's
+	// optional per-agent `models:` list) — consumed by internal/router's
+	// LLM-based routing decision to pick a model tier, and by
+	// internal/tui to validate a decision's Model field before attempting
+	// a model-switch command. Empty/nil is fine: the router simply never
+	// picks a model for that agent, only the agent itself.
+	Models []ModelInfo
+}
+
+// ModelInfo describes one selectable model for an agent, in terms an LLM
+// routing decision can use to pick between them — not validated against
+// any provider's actual model list, since that would require live API
+// access chorus deliberately doesn't have (it only talks to agent CLIs
+// over ACP, never a model provider directly).
+type ModelInfo struct {
+	ID           string `yaml:"id"`
+	Label        string `yaml:"label"`
+	Capabilities string `yaml:"capabilities"`
+	WhenToUse    string `yaml:"when_to_use"`
 }
 
 // Connection is one subprocess and its initialized ACP connection. It can

@@ -1,7 +1,14 @@
-// Package registry implements the §10 agents.yaml registry: agent spawn
-// configuration lives in data, not code, so adding an agent is a registry
-// entry rather than a code change. AgentSession itself doesn't need to
-// change to add one — see chorus-spec.md §10.
+// Package registry implements the agents.yaml registry: agent spawn
+// configuration, permission settings, and delegation/compaction/routing
+// config all live in this one file (data, not code) — adding an agent, or
+// changing a permission/routing setting, is a config edit rather than a
+// code change. AgentSession itself doesn't need to change to add an
+// agent — see chorus-spec.md §10.
+//
+// This is the SINGLE decode point for the whole file (since the
+// policy.yaml/agents.yaml split was eliminated — chorus-spec.md §0):
+// Parse returns both the []session.Spec list AND the policy.Config that
+// used to come from a separate policy.Parse.
 package registry
 
 import (
@@ -10,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"chorus/internal/policy"
 	"chorus/internal/session"
 )
 
@@ -27,58 +35,76 @@ type entry struct {
 	CostTier  string `yaml:"cost_tier"`
 	Notes     string `yaml:"notes"`
 	Transport string `yaml:"transport"`
+
+	// AutoAllow/AutoAllowTools moved here from the old policy.yaml — see
+	// policy.AgentPolicy's doc comment for their meaning.
+	AutoAllow      []string `yaml:"auto_allow"`
+	AutoAllowTools []string `yaml:"auto_allow_tools"`
+
+	// Models is this agent's optional model catalog — see
+	// session.ModelInfo. Absent/empty is fine; the LLM router then never
+	// picks a model for this agent, only the agent itself.
+	Models []session.ModelInfo `yaml:"models"`
 }
 
+// file is agents.yaml's whole top-level shape.
 type file struct {
-	Agents []entry `yaml:"agents"`
+	DefaultAgent string            `yaml:"default_agent"`
+	Delegation   policy.Delegation `yaml:"delegation"`
+	Compaction   policy.Compaction `yaml:"compaction"`
+	Routing      policy.Routing    `yaml:"routing"`
+	Agents       []entry           `yaml:"agents"`
 }
 
-// Load reads agents.yaml at path and returns agent specs in file order.
-// Thin wrapper around Parse — see its doc comment for the actual decode
-// logic, shared with main.go's embedded-default fallback (compiled-in
-// bytes, no file on disk at all).
-func Load(path string) ([]session.Spec, error) {
+// Load reads agents.yaml at path. Thin wrapper around Parse — see its doc
+// comment for the actual decode logic, shared with main.go's
+// embedded-default fallback (compiled-in bytes, no file on disk at all).
+func Load(path string) ([]session.Spec, policy.Config, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return nil, err
+		return nil, policy.Config{}, err
 	}
 	return Parse(b)
 }
 
-// Parse decodes agents.yaml content already read into memory, in file
-// order.
-//
-// Deviation from the spec's agents.yaml mockup, noted deliberately (§0's
-// priority order): the mockup showed a top-level map keyed by agent name
-// (claude: ..., gemini: ...). A YAML map decodes into a Go map, which has
-// no iteration order — agent startup order (and therefore the order
-// startup messages print in) would vary run to run. Using a top-level
-// `agents:` list instead preserves file order deterministically.
-func Parse(b []byte) ([]session.Spec, error) {
+// Parse decodes agents.yaml content already read into memory, returning
+// agent specs in file order (deliberately a list, not a map keyed by
+// name — a YAML map decodes into a Go map, which has no iteration order,
+// so agent startup order, and therefore the order startup messages print
+// in, would vary run to run) alongside the rest of the file's config.
+func Parse(b []byte) ([]session.Spec, policy.Config, error) {
 	var f file
 	if err := yaml.Unmarshal(b, &f); err != nil {
-		return nil, fmt.Errorf("agents.yaml: %w", err)
+		return nil, policy.Config{}, fmt.Errorf("agents.yaml: %w", err)
+	}
+
+	cfg := policy.Config{
+		Agents:       policy.Policy{},
+		Delegation:   f.Delegation,
+		Compaction:   f.Compaction,
+		Routing:      f.Routing,
+		DefaultAgent: f.DefaultAgent,
 	}
 
 	specs := make([]session.Spec, 0, len(f.Agents))
 	seen := make(map[string]bool)
 	for _, e := range f.Agents {
 		if e.Name == "" {
-			return nil, fmt.Errorf("agents.yaml: an entry is missing 'name'")
+			return nil, policy.Config{}, fmt.Errorf("agents.yaml: an entry is missing 'name'")
 		}
 		if seen[e.Name] {
-			return nil, fmt.Errorf("agents.yaml: duplicate agent name %q", e.Name)
+			return nil, policy.Config{}, fmt.Errorf("agents.yaml: duplicate agent name %q", e.Name)
 		}
 		seen[e.Name] = true
 		if len(e.Spawn) == 0 {
-			return nil, fmt.Errorf("agents.yaml: %s: 'spawn' must have at least one element (the command)", e.Name)
+			return nil, policy.Config{}, fmt.Errorf("agents.yaml: %s: 'spawn' must have at least one element (the command)", e.Name)
 		}
 		transport := e.Transport
 		if transport == "" {
 			transport = "acp"
 		}
 		if transport != "acp" {
-			return nil, fmt.Errorf("agents.yaml: %s: unsupported transport %q (only \"acp\" is implemented — see chorus-spec.md §10)", e.Name, transport)
+			return nil, policy.Config{}, fmt.Errorf("agents.yaml: %s: unsupported transport %q (only \"acp\" is implemented — see chorus-spec.md §10)", e.Name, transport)
 		}
 		specs = append(specs, session.Spec{
 			Name:     e.Name,
@@ -86,7 +112,12 @@ func Parse(b []byte) ([]session.Spec, error) {
 			Args:     e.Spawn[1:],
 			CostTier: e.CostTier,
 			Notes:    e.Notes,
+			Models:   e.Models,
 		})
+		cfg.Agents[e.Name] = policy.AgentPolicy{
+			AutoAllow:      e.AutoAllow,
+			AutoAllowTools: e.AutoAllowTools,
+		}
 	}
-	return specs, nil
+	return specs, cfg, nil
 }

@@ -101,9 +101,10 @@ PERMISSION: claude wants to: Edit auth.py
 
 That first line — `[claude] fix the login bug in auth.py` — is chorus echoing your own submitted prompt back into the scrollback, tagged by which agent it went to, on a solid highlighted background (matching Claude Code's own convention for setting your input apart from the reply — not visible in this plain-text example, but real in the actual TUI). ACP has no way to do this for you on a live turn (ask returns the reply, not an echo of what was asked), so chorus does it explicitly — without it, a long session would give you replies with no record of which question each one answers.
 
-- Type a prompt with no prefix and chorus **auto-routes** it (see
-  [Routing](#routing-policyyaml) below). `<agent>: <text>` always
-  overrides the router and sends straight to that agent's persistent
+- Type a prompt with no prefix and chorus **routes** it (see
+  [Routing](#routing-agentsyaml) below — off by default, straight to
+  `default_agent`; optionally an LLM-based decision). `<agent>: <text>`
+  always overrides routing and sends straight to that agent's persistent
   session (`claude`, `gemini`, or `opencode`).
 - `!<command>` runs a shell command directly — no agent involved at all
   (see [Native commands](#native-commands-)).
@@ -261,7 +262,7 @@ A couple of things worth knowing:
 
 - It never asks for permission — you typed the exact command
   yourself, so there's nothing for chorus to gate the way it gates an
-  *agent's* tool calls (`policy.yaml`'s `execute` kind). This is the
+  *agent's* tool calls (`agents.yaml`'s `execute` kind). This is the
   same trust boundary as running the command in a plain terminal next
   to chorus; `!` doesn't grant any access chorus didn't already have.
 - Output is captured (stdout+stderr combined), capped at 200KB, and
@@ -275,124 +276,103 @@ A couple of things worth knowing:
 
 ## Agent registry (`agents.yaml`)
 
-Which agents chorus spawns, and how, lives in data, not code:
+**`agents.yaml` is chorus's only config file** (2026-08-25 — `policy.yaml`
+has been eliminated; everything that used to live there — the permission
+allow-list, routing, delegation — now lives in this one file). Which
+agents chorus spawns, their permissions, and how prompts get routed to
+them all live in data, not code:
 
 ```yaml
+default_agent: opencode
+
+delegation:
+  enabled: false      # off by default — see Cross-agent delegation below
+  briefing: true
+  prefer: [execute, edit]
+  nudge_threshold: 2
+
+compaction:
+  enabled: false      # see Auto-compaction below
+  threshold_percent: 60
+  aliases: [compact, summarize, condense]
+
+routing:
+  mode: off           # off | llm — see Routing below
+  decision_agent: opencode
+  context_level: digest
+
 agents:
   - name: claude
     spawn: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
     cost_tier: metered
     notes: "general-purpose, metered usage"
     transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
+    models:
+      - id: claude-opus-4-8
+        label: Opus
+        capabilities: "highest reasoning quality, slowest, most expensive"
+        when_to_use: "complex/ambiguous architecture, high-stakes correctness"
+      - id: claude-sonnet-5
+        label: Sonnet
+        when_to_use: "the default for most implementation/debugging work"
   - name: gemini
     spawn: ["gemini", "--acp"]
     cost_tier: seat
     notes: "seat/subscription usage"
     transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
   - name: opencode
     spawn: ["opencode", "acp"]
     cost_tier: free
     notes: "free by default, zero configured credentials"
     transport: acp
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
 ```
 
 Add an agent by adding an entry — nothing else needs to change.
 `transport` must be `acp` (the only one chorus implements). Entries
 are tried in file order at startup; one failing (e.g. Gemini's tier
 block) doesn't stop the others. `cost_tier` and `notes` are free text
-you edit to describe your own setup — they're now surfaced to every
-OTHER connected agent via the `delegate` tool's description and a
-seeded first-turn briefing, so an agent has concrete signal for
-deciding whether and to whom to delegate a sub-task (see
-[Cross-agent delegation](#cross-agent-delegation)).
+you edit to describe your own setup — they're surfaced to every OTHER
+connected agent via the `delegate` tool's description, the seeded
+first-turn briefing, and (if enabled) the LLM routing decision, so an
+agent has concrete signal for deciding whether/to whom to delegate, or
+which agent+model fits a given prompt. `models` is optional per agent —
+omit it entirely (as the registry's own `gemini`/`opencode` entries do)
+to let LLM-based routing pick that agent but never attempt to switch its
+model.
 
-**Neither `agents.yaml` nor `policy.yaml` is actually required** —
-chorus embeds its own copy of both (this repo's own reference config,
-baked in at build time) and falls back to them for whichever file isn't
-present in the directory you run it from, so `chorus` works out of the
-box with zero setup. A local file always takes precedence over the
-embedded default, checked independently for each — **except** that a
-local `agents.yaml` requires a local `policy.yaml` too; chorus refuses
-to start rather than silently pair your custom agent set with the
-built-in default policy, since `policy.yaml`'s `auto_allow`/routing/
-delegation settings are keyed to specific agent names and a mismatch
-could quietly under- or over-permission agents it was never written
-for. (A local `policy.yaml` with no local `agents.yaml` is fine — it
-just applies to the embedded default agent set.)
+**`agents.yaml` isn't actually required on disk** — chorus embeds its
+own copy (this repo's own reference config, baked in at build time) and
+falls back to it when no local `agents.yaml` exists in the directory you
+run it from, so `chorus` works out of the box with zero setup. A local
+file always takes precedence over the embedded default.
 
 **`agents.yaml` is trusted, executable configuration, not passive
 data** — `spawn` is a literal command line chorus runs unconditionally
-at startup. Never point chorus at an `agents.yaml` (or `policy.yaml`)
-you didn't write or don't fully trust; using someone else's is
-equivalent to running a script they handed you. Same trust model as a
-Makefile or a VS Code `tasks.json`.
+at startup. Never point chorus at an `agents.yaml` you didn't write or
+don't fully trust; using someone else's is equivalent to running a
+script they handed you. Same trust model as a Makefile or a VS Code
+`tasks.json`.
 
-## Routing (`policy.yaml`)
+## Permission policy (`agents.yaml`)
 
-A prompt with no `agent:` prefix is auto-routed by keyword, cheaply —
-this is whole-word matching (not a substring, and not a model call,
-since burning tokens on a classifier would defeat the point of routing
-cheap tasks away from an expensive agent). Whole-word matters: an
-earlier version matched substrings and mis-routed on "prefix"/"suffix"
-(false-matching "fix") and "checklist" (false-matching "list") —
-see `internal/router`'s tests.
+Each agent's `auto_allow`/`auto_allow_tools` (moved here from the old
+`policy.yaml`) is the §5 allow-list, keyed on ACP's standardized
+`ToolCallUpdate.Kind` (`read`, `edit`, `delete`, `move`, `search`,
+`execute`, `think`, `fetch`, `switch_mode`, `other`) since that's the one
+thing every agent reports uniformly — not on per-agent tool names, which
+aren't visible over ACP. `auto_allow_tools` matches by the tool call's
+title (case-insensitive **prefix**, not substring — see
+[Security](#security) for why) instead of kind — needed for chorus's own
+`delegate` tool, since an external MCP tool's kind is generically `other`
+to every agent, so kind-based matching can't single it out.
 
-```yaml
-routing:
-  default: opencode
-  ask_when_ambiguous: false
-  rules:
-    - match: [fix, implement, refactor, debug, architecture, bug, error]
-      agent: claude
-    - match: [summarize, explain, list, scan, review, analyze]
-      agent: gemini
-```
-
-First matching rule wins; an unmatched prompt falls back to `default`.
-Set `ask_when_ambiguous: true` to have chorus ask which agent should
-handle an unmatched prompt instead of guessing via `default`.
-
-**If a matched rule's agent isn't currently connected** (blocked,
-crashed, or just never configured to start this run), chorus falls
-back to `default` automatically — rather than failing outright — as
-long as `default` itself is connected. You'll see
-`(matched gemini, but it's not connected — falling back to default: opencode)`
-instead of a bare "no route" error. This only applies to auto-routing:
-an explicit `<agent>: text` override or a slash command still fails
-outright if that agent isn't connected — you asked for it specifically,
-so chorus never silently substitutes a different one.
-
-## Permission policy (`policy.yaml`)
-
-The same file also holds the §5 allow-list, keyed on ACP's
-standardized `ToolCallUpdate.Kind` (`read`, `edit`, `delete`, `move`,
-`search`, `execute`, `think`, `fetch`, `switch_mode`, `other`) since
-that's the one thing every agent reports uniformly — not on per-agent
-tool names, which aren't visible over ACP:
-
-```yaml
-claude:
-  auto_allow: [read, search, think]
-  auto_allow_tools: [mcp__chorus-delegate__]
-gemini:
-  auto_allow: [read, search, think]
-  auto_allow_tools: [mcp__chorus-delegate__]
-opencode:
-  auto_allow: [read, search, think]
-  auto_allow_tools: [mcp__chorus-delegate__]
-```
-
-`auto_allow_tools` matches by the tool call's title (case-insensitive
-**prefix**, not substring — see [Security](#security) for why) instead
-of kind — needed for chorus's own `delegate` tool below, since an
-external MCP tool's kind is generically `other` to every agent, so
-kind-based matching can't single it out.
-
-Anything not listed under either falls through and asks. A missing
-local `policy.yaml` isn't an error — chorus falls back to its embedded
-default policy (shown above) unless you also have a local `agents.yaml`
-with no matching local `policy.yaml`, which is rejected outright rather
-than guessed at (see [Agent registry](#agent-registry-agentsyaml)).
+Anything not listed under either falls through and asks.
 
 **This allow-list is enforced, not advisory**: `edit`/`execute` (and
 everything else not explicitly listed) require your approval even for
@@ -400,13 +380,88 @@ agents that route file writes and shell commands through chorus's own
 client-owned RPCs rather than doing it internally — see
 [Security](#security).
 
+## Routing (`agents.yaml`)
+
+A prompt with no `<agent>: ` prefix is routed one of two ways, set by
+`routing.mode`:
+
+- **`off`** (the code's default when unset) — always goes straight to
+  `default_agent`. No keyword matching, no LLM call.
+- **`llm`** — `routing.decision_agent` (should be a non-metered agent;
+  chorus warns, doesn't refuse, if it isn't) is asked, via a hidden
+  sub-session, to pick both an agent AND, optionally, a model tier from
+  each agent's declared `models`, given the prompt and some amount of
+  recent activity (`routing.context_level`: `prompt` sends none, `digest`
+  — the default — sends a short rolling summary, `full` sends everything
+  chorus has retained). This is chorus's replacement for the earlier
+  keyword-based router (deliberately removed entirely, not kept as a
+  cheaper alternative mode) — a real judgment call by a cheap agent, not
+  a fixed word list. Type `context` in the REPL to see/change the context
+  level live, without restarting.
+
+Either way, **an explicit `<agent>: text` prefix or a recognized slash
+command always bypasses routing entirely** — you asked for that agent
+specifically, chorus never second-guesses an explicit ask. If the LLM
+router's decision names an unknown agent, times out, or its reply can't
+be parsed (it has to ask the decision agent to reply in a specific JSON
+shape over plain text, since ACP has no structured-output primitive —
+this is inherently best-effort), chorus falls back to `default_agent`
+rather than failing the prompt.
+
+A failed decision (unknown agent, timeout, or a reply that couldn't be
+parsed as JSON) prints `[routing] decision failed (...) — falling back
+to <default_agent>` so a fallback is never silent.
+
+`routing.decision_timeout_seconds` (default 60) bounds how long chorus
+waits for the decision agent before giving up and falling back. Found
+live: a free/shared-capacity decision agent's own upstream provider can
+be intermittently slow or need an internal retry — the original 25s
+default cut those off, surfacing as a generic `decision failed`
+(`Internal error`). If you see that repeatedly, check the decision
+agent's own log first — for opencode,
+`~/.local/share/opencode/log/opencode.log` — before assuming it's
+chorus; raise this setting if it turns out to be provider-side
+slowness.
+
+**Continuing a task on a different agent than the one that last handled
+it** (whether via an LLM routing decision or you switching manually) gets
+a one-time handoff: chorus prepends everything it's retained about the
+task so far to the first prompt the new agent sees, self-identified as
+automated context from chorus (not the user) — the same framing already
+proven necessary to stop an agent from treating an unexplained
+instruction message as a possible prompt injection.
+
+## Auto-compaction (`agents.yaml`)
+
+Long sessions accumulate context — left alone, some agents only compact
+very late (and expensively). `compaction.enabled: true` makes chorus
+proactively trigger a compaction-style command once an agent's reported
+context usage crosses `threshold_percent` (default 60, based on research
+into Claude Code's own usage patterns — compacting around 60% produces
+much better, cheaper summaries than letting an agent wait until it's
+nearly full). Never hardcoded as `/compact`: chorus only sends a command
+an agent has actually advertised, matched against `compaction.aliases` by
+substring — if nothing matches, it says so instead of guessing.
+Deferred, not skipped, if the agent is mid-turn when the threshold is
+crossed; fires once idle.
+
 ## Cross-agent delegation
 
-With 2+ agents running, every agent's session gets a `delegate(agent,
-task)` tool: one agent can hand a self-contained sub-task to another
-and get back its text reply, instead of you manually copy-pasting
-between them. Example: ask Claude to delegate a summarization task to
-opencode, and Claude will call the tool itself if it decides to.
+**Off by default** (2026-08-25 — `delegation.enabled: false` unless set):
+live use found agents rarely call `delegate` on their own, and attaching
+the tool costs every agent ~500-1400+ tokens of schema on *every turn*,
+whether it's ever used or not — paying that cost by default for a
+feature that mostly sits idle wasn't a good trade. The mechanics below
+are fully implemented either way (this project's own `agents.yaml` turns
+it on, since it's chorus's own reference/testing setup for the feature)
+— flip `delegation.enabled: true` to revisit it.
+
+With delegation enabled and 2+ agents running, every agent's session
+gets a `delegate(agent, task)` tool: one agent can hand a self-contained
+sub-task to another and get back its text reply, instead of you manually
+copy-pasting between them. Example: ask Claude to delegate a
+summarization task to opencode, and Claude will call the tool itself if
+it decides to.
 
 - The delegated call runs in a **fresh, isolated sub-session** for the
   target agent — not its main conversation — so give it full context
@@ -447,7 +502,7 @@ something that's possible:**
   conversation history replay, this briefing persists automatically
   across every future resume of that session — it's sent once, ever,
   per session.
-- Disable the briefing with `policy.yaml`:
+- Disable the briefing in `agents.yaml`:
   ```yaml
   delegation:
     briefing: false
@@ -472,7 +527,7 @@ something that's possible:**
   idle — prepends a one-time suggestion to the metered agent's *next*
   turn naming the idle agent. The streak resets the moment the agent
   actually calls `delegate`. Off by default in the code (empty `prefer`
-  list) — but **this project's own `policy.yaml` enables it**, since the
+  list) — but **this project's own `agents.yaml` enables it**, since the
   briefing alone (a one-time message at session start) turned out not to
   be enough to make delegation reliable on a long session:
   ```yaml
@@ -550,7 +605,7 @@ public push. What that means in practice:
   a shell command — including chorus's own client-owned `terminal/create`/
   `fs/read_text_file`/`fs/write_text_file` RPCs, not just the
   agent-initiated ones you already saw prompts for — goes through
-  `policy.yaml`'s allow-list, and asks interactively for anything not
+  `agents.yaml`'s allow-list, and asks interactively for anything not
   explicitly allowed. This wasn't always true: earlier versions
   executed the client-owned RPCs unconditionally, bypassing the policy
   file entirely for any agent that used them instead of its own
@@ -563,8 +618,8 @@ public push. What that means in practice:
   read/write chorus mediates — Windows auto-authenticates network
   paths with the current user's credentials, a known credential-theft
   technique that needs no code execution at all.
-- **`agents.yaml`/`policy.yaml` are trusted, executable-adjacent
-  config** — see the warning under [Agent registry](#agent-registry-agentsyaml).
+- **`agents.yaml` is trusted, executable-adjacent config** — see the
+  warning under [Agent registry](#agent-registry-agentsyaml).
   This is the one class of risk chorus can't design away: if you run
   it against a config file, you're trusting that file the same way
   you'd trust a shell script.
@@ -600,9 +655,12 @@ internal/acpclient/        ACP Client role — receives updates/permission reque
                             answers file read/write and terminal RPCs
 internal/render/           Renders every session/update kind to the terminal,
                             including saving inbound images to disk
-internal/policy/           policy.yaml loading — auto-allow checks + routing config
-internal/router/           Keyword-based auto-routing (§9)
-internal/registry/         agents.yaml loading (§10)
+internal/policy/           Permission/delegation/compaction/routing config types +
+                            AutoAllow/AutoAllowTool matching (agents.yaml, §5)
+internal/router/           LLM-based routing decision: BuildDecisionPrompt/
+                            ParseDecision (§9 — keyword matching removed 2026-08-25)
+internal/registry/         agents.yaml loading (§10) — the single decode point for
+                            the whole file, registry + policy.Config together
 internal/delegate/         Cross-agent delegation (§11): the delegate-mcp subprocess
                             mode and the loopback Hub it calls back into
 internal/sessionstore/     .chorus/sessions.json persistence for session resume
@@ -634,6 +692,15 @@ internal/bus/               Shared message types between agent connections and m
   race on the very last streamed chunk of a sub-session's reply — see
   `chorus-spec.md` §0 for details.
 - No multi-hop delegation (by design, not a gap — see §2's non-goals).
+- **LLM-based routing (`routing.mode: llm`) is new and not yet
+  live-verified** (2026-08-25): whether any of Claude/Gemini/opencode
+  actually advertise a model-switch command at all is unconfirmed — the
+  common case may turn out to be "agent only, no model switch," not the
+  exception. The decision call also can't structurally prevent the
+  decision agent from using its own built-in tools during what's meant
+  to be a cheap classification turn (chorus can only ask it not to);
+  a 25s timeout bounds the damage if that happens. See `chorus-spec.md`
+  §0 for the full account and what to check first on a real run.
 - Inbound image rendering (agent -> you) is covered by unit tests but
   hasn't been triggered by a real agent in practice — most coding
   tasks never make one send image content back.

@@ -1,91 +1,131 @@
 package router
 
 import (
+	"strings"
 	"testing"
 
-	"chorus/internal/policy"
+	"chorus/internal/session"
 )
 
-func testRouting() policy.Routing {
-	return policy.Routing{
-		Default: "opencode",
-		Rules: []policy.Rule{
-			{Match: []string{"fix", "implement", "refactor", "debug", "architecture"}, Agent: "claude"},
-			{Match: []string{"summarize", "explain", "list", "scan"}, Agent: "gemini"},
-		},
+func testAgents() []DecisionAgentInfo {
+	return []DecisionAgentInfo{
+		{Name: "claude", CostTier: "metered", Notes: "general-purpose", Models: []session.ModelInfo{
+			{ID: "claude-opus-4-8", Label: "Opus", WhenToUse: "hard problems"},
+			{ID: "claude-haiku-4-5-20251001", Label: "Haiku", WhenToUse: "mechanical work"},
+		}},
+		{Name: "opencode", CostTier: "free", Notes: "free by default"},
 	}
 }
 
-func TestChoose_MatchesRule(t *testing.T) {
-	d := Choose(testRouting(), "please fix the login bug")
-	if !d.Matched || d.Agent != "claude" {
-		t.Fatalf("Choose() = %+v, want matched claude", d)
+func TestBuildDecisionPrompt_MentionsAgentsModelsAndPrompt(t *testing.T) {
+	p := BuildDecisionPrompt(testAgents(), "opencode", "claude did X earlier", "now do Y")
+	for _, want := range []string{
+		"automated routing-decision request from chorus itself",
+		"not a message from the user",
+		"do not use any tools",
+		"claude", "opencode",
+		"claude-opus-4-8", "claude-haiku-4-5-20251001",
+		"claude did X earlier",
+		"now do Y",
+	} {
+		if !strings.Contains(strings.ToLower(p), strings.ToLower(want)) {
+			t.Errorf("BuildDecisionPrompt() missing %q in:\n%s", want, p)
+		}
 	}
 }
 
-func TestChoose_CaseInsensitive(t *testing.T) {
-	d := Choose(testRouting(), "FIX this now")
-	if !d.Matched || d.Agent != "claude" {
-		t.Fatalf("Choose() = %+v, want matched claude", d)
+func TestBuildDecisionPrompt_OmitsContextSectionWhenEmpty(t *testing.T) {
+	p := BuildDecisionPrompt(testAgents(), "opencode", "", "hello")
+	if strings.Contains(p, "Recent activity") {
+		t.Fatalf("BuildDecisionPrompt() with empty contextText still included a context section:\n%s", p)
 	}
 }
 
-// Regression test: Choose used to match keywords as raw substrings, so
-// "fix" matched inside "prefix"/"suffix" and "list" matched inside
-// "checklist" — misrouting prompts that never used the word as a word.
-func TestChoose_WordBoundary_NoFalsePositive(t *testing.T) {
-	d := Choose(testRouting(), "add a prefix and suffix to the string, then update the checklist")
-	if d.Matched {
-		t.Fatalf("Choose() = %+v, expected no match (word-boundary false positive on prefix/suffix/checklist)", d)
+func TestParseDecision_CleanJSON(t *testing.T) {
+	d, err := ParseDecision(`{"agent": "claude", "model": "claude-opus-4-8", "reason": "hard task"}`, testAgents())
+	if err != nil {
+		t.Fatalf("ParseDecision() error = %v", err)
+	}
+	if d.Agent != "claude" || d.Model != "claude-opus-4-8" || d.Reason != "hard task" {
+		t.Fatalf("ParseDecision() = %+v, want claude/claude-opus-4-8/hard task", d)
+	}
+}
+
+func TestParseDecision_MarkdownFencedJSON(t *testing.T) {
+	raw := "```json\n{\"agent\": \"opencode\", \"model\": \"\", \"reason\": \"simple\"}\n```"
+	d, err := ParseDecision(raw, testAgents())
+	if err != nil {
+		t.Fatalf("ParseDecision() error = %v", err)
 	}
 	if d.Agent != "opencode" {
-		t.Fatalf("Agent = %q, want fallback to default opencode", d.Agent)
+		t.Fatalf("ParseDecision() = %+v, want opencode", d)
 	}
 }
 
-func TestChoose_FallsBackToDefault(t *testing.T) {
-	d := Choose(testRouting(), "give me a random word")
-	if d.Matched {
-		t.Fatalf("Choose() = %+v, expected no rule to match", d)
+func TestParseDecision_LeadingProseBeforeJSON(t *testing.T) {
+	raw := "Sure, here's my decision: {\"agent\": \"claude\", \"model\": \"\", \"reason\": \"needs judgment\"}"
+	d, err := ParseDecision(raw, testAgents())
+	if err != nil {
+		t.Fatalf("ParseDecision() error = %v", err)
+	}
+	if d.Agent != "claude" {
+		t.Fatalf("ParseDecision() = %+v, want claude", d)
+	}
+}
+
+func TestParseDecision_BraceInsideStringValueDoesNotConfuseBoundary(t *testing.T) {
+	raw := `{"agent": "claude", "model": "", "reason": "handles cases like {foo: bar} in code"}`
+	d, err := ParseDecision(raw, testAgents())
+	if err != nil {
+		t.Fatalf("ParseDecision() error = %v", err)
+	}
+	if d.Agent != "claude" || d.Reason == "" {
+		t.Fatalf("ParseDecision() = %+v, want claude with reason preserved", d)
+	}
+}
+
+func TestParseDecision_UnknownAgentErrors(t *testing.T) {
+	_, err := ParseDecision(`{"agent": "nonexistent", "model": "", "reason": "x"}`, testAgents())
+	if err == nil {
+		t.Fatal("ParseDecision() error = nil, want an error for an unknown agent")
+	}
+}
+
+func TestParseDecision_UnknownModelErrors(t *testing.T) {
+	_, err := ParseDecision(`{"agent": "claude", "model": "gpt-5", "reason": "x"}`, testAgents())
+	if err == nil {
+		t.Fatal("ParseDecision() error = nil, want an error for a model claude doesn't declare")
+	}
+}
+
+func TestParseDecision_EmptyModelAlwaysValid(t *testing.T) {
+	// opencode declares no models at all — an empty Model must still validate.
+	d, err := ParseDecision(`{"agent": "opencode", "model": "", "reason": "x"}`, testAgents())
+	if err != nil {
+		t.Fatalf("ParseDecision() error = %v, want empty model to always be valid", err)
 	}
 	if d.Agent != "opencode" {
-		t.Fatalf("Agent = %q, want default opencode", d.Agent)
+		t.Fatalf("ParseDecision() = %+v, want opencode", d)
 	}
 }
 
-func TestChoose_FirstRuleWins(t *testing.T) {
-	r := policy.Routing{
-		Default: "x",
-		Rules: []policy.Rule{
-			{Match: []string{"foo"}, Agent: "a"},
-			{Match: []string{"foo"}, Agent: "b"},
-		},
-	}
-	d := Choose(r, "foo bar")
-	if d.Agent != "a" {
-		t.Fatalf("Agent = %q, want first matching rule (a)", d.Agent)
+func TestParseDecision_NoJSONObjectErrors(t *testing.T) {
+	_, err := ParseDecision("I don't know, maybe claude?", testAgents())
+	if err == nil {
+		t.Fatal("ParseDecision() error = nil, want an error when there's no JSON object at all")
 	}
 }
 
-func TestChoose_EmptyMatchEntriesIgnored(t *testing.T) {
-	r := policy.Routing{
-		Default: "opencode",
-		Rules: []policy.Rule{
-			{Match: []string{"", "fix"}, Agent: "claude"},
-		},
-	}
-	d := Choose(r, "fix it")
-	if !d.Matched || d.Agent != "claude" {
-		t.Fatalf("Choose() = %+v, want matched claude despite an empty match entry", d)
+func TestParseDecision_MalformedJSONErrorsWithoutPanic(t *testing.T) {
+	_, err := ParseDecision(`{"agent": "claude", "model": `, testAgents())
+	if err == nil {
+		t.Fatal("ParseDecision() error = nil, want an error for truncated/malformed JSON")
 	}
 }
 
-func TestChoose_NoRulesNoDefault(t *testing.T) {
-	d := Choose(policy.Routing{}, "anything")
-	if d.Matched {
-		t.Fatalf("Choose() = %+v, expected no match with no rules", d)
-	}
-	if d.Agent != "" {
-		t.Fatalf("Agent = %q, want empty with no default configured", d.Agent)
+func TestParseDecision_EmptyStringErrorsWithoutPanic(t *testing.T) {
+	_, err := ParseDecision("", testAgents())
+	if err == nil {
+		t.Fatal("ParseDecision() error = nil, want an error for an empty reply")
 	}
 }

@@ -131,6 +131,33 @@ func TestCommandOwners_NoOwner(t *testing.T) {
 	}
 }
 
+// --- findCommandByAlias (auto-compaction / model-switch discovery) -----
+
+func TestFindCommandByAlias_MatchesSubstringCaseInsensitive(t *testing.T) {
+	cmds := []acp.AvailableCommand{{Name: "init"}, {Name: "Compact-History"}}
+	got, ok := findCommandByAlias(cmds, []string{"compact", "summarize", "condense"})
+	if !ok || got.Name != "Compact-History" {
+		t.Fatalf("findCommandByAlias() = (%+v, %v), want Compact-History matched via substring", got, ok)
+	}
+}
+
+func TestFindCommandByAlias_NoMatch(t *testing.T) {
+	cmds := []acp.AvailableCommand{{Name: "init"}, {Name: "review"}}
+	_, ok := findCommandByAlias(cmds, []string{"compact", "summarize", "condense"})
+	if ok {
+		t.Fatal("findCommandByAlias() ok = true, want false — none of the commands match any alias")
+	}
+}
+
+func TestFindCommandByAlias_EmptyCommandsOrAliases(t *testing.T) {
+	if _, ok := findCommandByAlias(nil, []string{"compact"}); ok {
+		t.Fatal("findCommandByAlias(nil, ...) ok = true, want false")
+	}
+	if _, ok := findCommandByAlias([]acp.AvailableCommand{{Name: "compact"}}, nil); ok {
+		t.Fatal("findCommandByAlias(..., nil) ok = true, want false")
+	}
+}
+
 func TestFormatCommands_ListsPerAgentSorted(t *testing.T) {
 	commands := map[string][]acp.AvailableCommand{
 		"claude": {
@@ -281,26 +308,27 @@ func containsPath(s, substr string) bool {
 	return indexOf(s, substr) != -1
 }
 
-// --- routing fallback when a matched rule's agent isn't connected -------
+// --- unprefixed prompts go straight to defaultAgent (keyword routing was
+// removed entirely — chorus-spec.md §0 — replaced by either "off"/this
+// direct path, or an LLM-based decision layered on top by the caller) ---
 
-func TestDispatch_FallsBackToDefaultWhenMatchedAgentNotConnected(t *testing.T) {
-	workers := map[string]*AgentWorker{"opencode": newWorker()} // gemini not connected
-	routing := policy.Routing{
-		Default: "opencode",
-		Rules:   []policy.Rule{{Match: []string{"list"}, Agent: "gemini"}},
-	}
-	agent, sentText, msg, ask := dispatch("list all the markdown files", workers, routing, nil)
+func TestDispatch_UnprefixedPromptGoesToDefaultAgent(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	agent, sentText, msg, ask, decisionReq := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
 	if ask != nil {
-		t.Fatal("ask != nil, want a direct fallback, not a routeAsk prompt")
+		t.Fatal("ask != nil, want a direct dispatch, not a routeAsk prompt")
+	}
+	if decisionReq != nil {
+		t.Fatal("decisionReq != nil, want direct dispatch when routing.Mode is off")
 	}
 	if agent != "opencode" {
-		t.Fatalf("agent = %q, want the fallback to default (opencode)", agent)
+		t.Fatalf("agent = %q, want the default agent (opencode)", agent)
 	}
 	if sentText != "list all the markdown files" {
 		t.Fatalf("sentText = %q, want the original prompt text", sentText)
 	}
-	if !strings.Contains(msg, "gemini") || !strings.Contains(msg, "opencode") {
-		t.Fatalf("msg = %q, want it to explain both the matched agent and the fallback", msg)
+	if msg != "" {
+		t.Fatalf("msg = %q, want no informational message on the ordinary path", msg)
 	}
 	select {
 	case blocks := <-workers["opencode"].in:
@@ -308,25 +336,35 @@ func TestDispatch_FallsBackToDefaultWhenMatchedAgentNotConnected(t *testing.T) {
 			t.Fatalf("opencode's queued blocks = %+v, unexpected shape", blocks)
 		}
 	default:
-		t.Fatal("opencode never received the prompt after falling back to it")
+		t.Fatal("opencode never received the prompt")
 	}
 }
 
-func TestDispatch_NoFallbackWhenDefaultAlsoNotConnected(t *testing.T) {
-	workers := map[string]*AgentWorker{"claude": newWorker()} // neither gemini nor opencode connected
-	routing := policy.Routing{
-		Default: "opencode",
-		Rules:   []policy.Rule{{Match: []string{"list"}, Agent: "gemini"}},
-	}
-	agent, _, msg, ask := dispatch("list all the markdown files", workers, routing, nil)
+func TestDispatch_ErrorsWhenDefaultAgentNotConnected(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()} // opencode not connected
+	agent, _, msg, ask, _ := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
 	if agent != "" {
-		t.Fatalf("agent = %q, want empty — default isn't connected either, there's nothing to fall back to", agent)
+		t.Fatalf("agent = %q, want empty — default agent isn't connected", agent)
 	}
 	if ask != nil {
 		t.Fatal("ask != nil, want a plain error, not a routeAsk prompt")
 	}
-	if !strings.Contains(msg, "no route") {
-		t.Fatalf("msg = %q, want the no-route error", msg)
+	if !strings.Contains(msg, "no default agent") {
+		t.Fatalf("msg = %q, want the no-default-agent error", msg)
+	}
+}
+
+func TestDispatch_ErrorsWhenDefaultAgentUnconfigured(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	agent, _, msg, ask, _ := dispatch("anything", workers, "", policy.Routing{}, nil)
+	if agent != "" {
+		t.Fatalf("agent = %q, want empty — no default_agent configured at all", agent)
+	}
+	if ask != nil {
+		t.Fatal("ask != nil, want a plain error, not a routeAsk prompt")
+	}
+	if !strings.Contains(msg, "no default agent") {
+		t.Fatalf("msg = %q, want the no-default-agent error", msg)
 	}
 }
 
@@ -335,8 +373,7 @@ func TestDispatch_ExplicitAgentOverrideIsNeverSilentlyRerouted(t *testing.T) {
 	// explicit "<agent>: text" override must still fail outright, never
 	// silently reroute to a different agent than the one asked for.
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
-	routing := policy.Routing{Default: "opencode"}
-	agent, _, msg, ask := dispatch("gemini: do something", workers, routing, nil)
+	agent, _, msg, ask, _ := dispatch("gemini: do something", workers, "opencode", policy.Routing{}, nil)
 	if agent != "" {
 		t.Fatalf("agent = %q, want empty — an explicit override to an unconnected agent must fail, not silently reroute", agent)
 	}
@@ -353,17 +390,41 @@ func TestDispatch_ExplicitAgentOverrideIsNeverSilentlyRerouted(t *testing.T) {
 	}
 }
 
-func TestDispatch_UnmatchedPromptStillRoutesToDefaultDirectly(t *testing.T) {
-	// Sanity check the ordinary (non-fallback) path is unaffected: no
-	// rule matches at all, default is connected — routes there directly,
-	// with the normal "(auto-routed to X)" message, not a fallback one.
+func TestDispatch_LLMRoutingModeReturnsDecisionRequestInstead(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
-	routing := policy.Routing{Default: "opencode"}
-	agent, _, msg, _ := dispatch("something nobody has a rule for", workers, routing, nil)
-	if agent != "opencode" {
-		t.Fatalf("agent = %q, want opencode", agent)
+	routing := policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "opencode"}
+
+	agent, _, msg, ask, decisionReq := dispatch("do something", workers, "opencode", routing, nil)
+	if agent != "" {
+		t.Fatalf("agent = %q, want empty — an LLM routing decision resolves asynchronously, not inside dispatch", agent)
 	}
-	if !strings.Contains(msg, "auto-routed") || strings.Contains(msg, "falling back") {
-		t.Fatalf("msg = %q, want a plain auto-routed message, not fallback wording", msg)
+	if msg != "" {
+		t.Fatalf("msg = %q, want empty", msg)
+	}
+	if ask != nil {
+		t.Fatal("ask != nil, want nil — this isn't a user-facing routeAsk menu")
+	}
+	if decisionReq == nil || decisionReq.text != "do something" {
+		t.Fatalf("decisionReq = %+v, want a request carrying the original prompt text", decisionReq)
+	}
+	select {
+	case blocks := <-workers["opencode"].in:
+		t.Fatalf("opencode received %+v — dispatch must not queue anything itself in llm routing mode", blocks)
+	default:
+	}
+}
+
+func TestDispatch_ExplicitPrefixBypassesLLMRoutingMode(t *testing.T) {
+	// An explicit "<agent>: text" override must win even when routing.Mode
+	// is "llm" — confirmed with the user: explicit always bypasses routing.
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	routing := policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "claude"}
+
+	agent, sentText, _, _, decisionReq := dispatch("claude: fix this", workers, "claude", routing, nil)
+	if decisionReq != nil {
+		t.Fatal("decisionReq != nil, want nil — an explicit prefix must bypass the LLM router entirely")
+	}
+	if agent != "claude" || sentText != "fix this" {
+		t.Fatalf("agent/sentText = %q/%q, want claude/\"fix this\"", agent, sentText)
 	}
 }

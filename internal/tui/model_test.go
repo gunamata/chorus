@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"chorus/internal/delegate"
 	"chorus/internal/policy"
 	"chorus/internal/render"
+	"chorus/internal/router"
 	"chorus/internal/session"
 )
 
@@ -58,12 +60,18 @@ func enterWithInput(m Model, text string) (Model, tea.Cmd) {
 
 func TestModel_PermissionInterruptsRouteAskAndResumes(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
-	m := newTestModel(t, workers, policy.Routing{AskWhenAmbiguous: true})
+	m := newTestModel(t, workers, policy.Routing{})
+	// A slash command both connected agents advertise is ambiguous — the
+	// only remaining source of a routeAsk now that keyword-based "ask
+	// when ambiguous" auto-routing has been removed entirely.
+	m.commands = map[string][]acp.AvailableCommand{
+		"claude":   {{Name: "plan"}},
+		"opencode": {{Name: "plan"}},
+	}
 
-	// An unmatched prompt with ask_when_ambiguous triggers a routeAsk.
-	m, _ = enterWithInput(m, "some ambiguous prompt")
+	m, _ = enterWithInput(m, "/plan some ambiguous prompt")
 	if m.pendingRoute == nil {
-		t.Fatal("pendingRoute = nil, want a pending route after an ambiguous prompt")
+		t.Fatal("pendingRoute = nil, want a pending route after an ambiguous slash command")
 	}
 	if m.mode() != modeRouteAsk {
 		t.Fatalf("mode() = %v, want modeRouteAsk", m.mode())
@@ -120,8 +128,8 @@ func TestModel_PermissionInterruptsRouteAskAndResumes(t *testing.T) {
 	}
 	select {
 	case blocks := <-workers["claude"].in:
-		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "some ambiguous prompt" {
-			t.Fatalf("claude's queued blocks = %+v, want the original ambiguous prompt text", blocks)
+		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "/plan some ambiguous prompt" {
+			t.Fatalf("claude's queued blocks = %+v, want the original slash-command line", blocks)
 		}
 	default:
 		t.Fatal("claude never received the queued prompt after the routeAsk resumed and was answered")
@@ -487,9 +495,13 @@ func TestModel_ArrowKeyUpdatesMenuInPlaceDespiteInterleavedOutput(t *testing.T) 
 
 func TestModel_ArrowKeysSelectRouteAskCandidate(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
-	m := newTestModel(t, workers, policy.Routing{AskWhenAmbiguous: true})
+	m := newTestModel(t, workers, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{
+		"claude":   {{Name: "plan"}},
+		"opencode": {{Name: "plan"}},
+	}
 
-	m, _ = enterWithInput(m, "some ambiguous prompt")
+	m, _ = enterWithInput(m, "/plan some ambiguous prompt")
 	if m.pendingRoute == nil {
 		t.Fatal("pendingRoute = nil, want a pending route")
 	}
@@ -536,7 +548,8 @@ func TestModel_ExplicitAgentPromptIsEchoed(t *testing.T) {
 
 func TestModel_AutoRoutedPromptIsEchoed(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker()}
-	m := newTestModel(t, workers, policy.Routing{Default: "claude"})
+	m := newTestModel(t, workers, policy.Routing{})
+	m.defaultAgent = "claude"
 
 	m, _ = enterWithInput(m, "summarize the changelog")
 
@@ -544,16 +557,17 @@ func TestModel_AutoRoutedPromptIsEchoed(t *testing.T) {
 	if !strings.Contains(out, "summarize the changelog") {
 		t.Fatalf("viewport.View() = %q, want the submitted prompt echoed", out)
 	}
-	if !strings.Contains(out, "auto-routed") {
-		t.Fatalf("viewport.View() = %q, want the routing rationale still shown alongside the echo", out)
-	}
 }
 
 func TestModel_RouteAskResolvedPromptIsEchoed(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
-	m := newTestModel(t, workers, policy.Routing{AskWhenAmbiguous: true})
+	m := newTestModel(t, workers, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{
+		"claude":   {{Name: "plan"}},
+		"opencode": {{Name: "plan"}},
+	}
 
-	m, _ = enterWithInput(m, "do the thing")
+	m, _ = enterWithInput(m, "/plan do the thing")
 	if m.pendingRoute == nil {
 		t.Fatal("pendingRoute = nil, want a pending route")
 	}
@@ -919,5 +933,414 @@ func TestModel_FormatBusyStatus(t *testing.T) {
 	}
 	if !strings.Contains(got, "5s") {
 		t.Fatalf("formatBusyStatus() = %q, want it to show roughly the elapsed time", got)
+	}
+}
+
+// --- auto-compaction (chorus-spec.md §0's 2026-08-25 entry) -------------
+
+func usageUpdateMsg(agent string, used, size int) outputMsg {
+	return outputMsg{u: bus.Update{
+		Agent: agent,
+		Notification: acp.SessionNotification{
+			SessionId: "main-session",
+			Update:    acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Used: used, Size: size}},
+		},
+	}}
+}
+
+func compactionEnabled(threshold int) policy.Compaction {
+	on := true
+	return policy.Compaction{Enabled: &on, ThresholdPercent: threshold}
+}
+
+func TestModel_Compaction_NoFireBelowThreshold(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.compaction = compactionEnabled(60)
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "compact"}}}
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 50, 100)) // 50%
+	m = updated.(Model)
+
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("compaction fired below threshold")
+	default:
+	}
+}
+
+func TestModel_Compaction_FiresImmediatelyWhenIdle(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.compaction = compactionEnabled(60)
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "compact"}}}
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 70, 100)) // 70% >= 60%
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["claude"].in:
+		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "/compact" {
+			t.Fatalf("queued blocks = %+v, want a single \"/compact\" text block", blocks)
+		}
+	default:
+		t.Fatal("compaction never fired at/above threshold while the worker was idle")
+	}
+	if !m.compactTriggered["claude"] {
+		t.Fatal("compactTriggered[claude] = false after firing, want true")
+	}
+}
+
+func TestModel_Compaction_DefersUntilIdleWhenBusy(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.compaction = compactionEnabled(60)
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "compact"}}}
+	workers["claude"].busy.Store(true)
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 70, 100))
+	m = updated.(Model)
+
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("compaction fired immediately while the worker was busy, want it deferred")
+	default:
+	}
+	if !m.compactPending["claude"] {
+		t.Fatal("compactPending[claude] = false, want true while deferred")
+	}
+
+	// The turn finishes (worker goes idle) — promptDoneMsg's success path
+	// must fire the deferred compaction.
+	workers["claude"].busy.Store(false)
+	updated, _ = m.Update(promptDoneMsg{PromptDoneMsg{Agent: "claude", Duration: time.Second}})
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["claude"].in:
+		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "/compact" {
+			t.Fatalf("queued blocks = %+v, want a single \"/compact\" text block", blocks)
+		}
+	default:
+		t.Fatal("deferred compaction never fired once the worker went idle")
+	}
+	if m.compactPending["claude"] {
+		t.Fatal("compactPending[claude] = true after firing, want cleared")
+	}
+}
+
+func TestModel_Compaction_OneShotUntilUsageDrops(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.compaction = compactionEnabled(60)
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "compact"}}}
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 70, 100))
+	m = updated.(Model)
+	select {
+	case <-workers["claude"].in:
+	default:
+		t.Fatal("expected the first crossing to fire")
+	}
+
+	// A second update still above threshold must NOT re-fire.
+	updated, _ = m.Update(usageUpdateMsg("claude", 75, 100))
+	m = updated.(Model)
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("compaction re-fired on a second above-threshold update, want one-shot suppression")
+	default:
+	}
+
+	// Usage drops back below threshold, then crosses again — must re-arm.
+	updated, _ = m.Update(usageUpdateMsg("claude", 20, 100))
+	m = updated.(Model)
+	if m.compactTriggered["claude"] {
+		t.Fatal("compactTriggered[claude] = true after dropping below threshold, want cleared")
+	}
+	updated, _ = m.Update(usageUpdateMsg("claude", 65, 100))
+	m = updated.(Model)
+	select {
+	case <-workers["claude"].in:
+	default:
+		t.Fatal("compaction never re-fired after usage dropped and crossed threshold again")
+	}
+}
+
+func TestModel_Compaction_NoCommandDiscoveredSaysSoInsteadOfGuessing(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.compaction = compactionEnabled(60)
+	// No commands registered at all for claude.
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 70, 100))
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["claude"].in:
+		t.Fatalf("queued blocks = %+v, want nothing sent when no compaction command was discovered", blocks)
+	default:
+	}
+	if !strings.Contains(m.viewport.View(), "no compaction-like command was discovered") {
+		t.Fatalf("viewport.View() = %q, want a message explaining nothing was sent", m.viewport.View())
+	}
+}
+
+func TestModel_Compaction_DisabledByDefault(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{}) // compaction left zero-valued
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "compact"}}}
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 99, 100))
+	m = updated.(Model)
+
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("compaction fired despite EnabledOrDefault() being false")
+	default:
+	}
+}
+
+// --- LLM-based routing + context handoff (chorus-spec.md §0's
+// 2026-08-25 entry) ------------------------------------------------------
+
+func TestModel_AppendActivity_MergesConsecutiveSameKeyEntries(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendActivity("agent:claude", "hello ")
+	m.appendActivity("agent:claude", "world")
+	m.appendActivity("user:opencode", "next prompt")
+
+	if len(m.activity) != 2 {
+		t.Fatalf("len(activity) = %d, want 2 (two chunks from the same key merged into one entry)", len(m.activity))
+	}
+	if m.activity[0].text != "hello world" {
+		t.Fatalf("activity[0].text = %q, want merged \"hello world\"", m.activity[0].text)
+	}
+	if m.activity[1].key != "user:opencode" || m.activity[1].text != "next prompt" {
+		t.Fatalf("activity[1] = %+v, want a new entry for the different key", m.activity[1])
+	}
+}
+
+func TestModel_ActivityContext_Tiers(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	for i := 0; i < activityDigestN+3; i++ {
+		m.appendActivity(fmt.Sprintf("user:claude:%d", i), fmt.Sprintf("entry %d", i))
+	}
+
+	if got := m.activityContext("prompt"); got != "" {
+		t.Fatalf("activityContext(\"prompt\") = %q, want empty", got)
+	}
+	digest := m.activityContext("digest")
+	if strings.Contains(digest, "entry 0") {
+		t.Fatalf("activityContext(\"digest\") = %q, want only the most recent %d entries, not the oldest", digest, activityDigestN)
+	}
+	if !strings.Contains(digest, fmt.Sprintf("entry %d", activityDigestN+2)) {
+		t.Fatalf("activityContext(\"digest\") = %q, want the most recent entry present", digest)
+	}
+	full := m.activityContext("full")
+	if !strings.Contains(full, "entry 0") {
+		t.Fatalf("activityContext(\"full\") = %q, want the oldest entry still present (within cap)", full)
+	}
+}
+
+func TestModel_StartRouteDecision_FallsBackSynchronouslyWhenDecisionAgentNotConnected(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "claude"})
+	m.defaultAgent = "opencode"
+	// m.conns has no "claude" entry — decision_agent isn't connected.
+
+	updated, cmd := m.startRouteDecision("do something")
+	m = updated.(Model)
+	if cmd != nil {
+		t.Fatal("startRouteDecision() cmd != nil, want a synchronous fallback (nil cmd) when the decision agent isn't connected")
+	}
+	select {
+	case blocks := <-workers["opencode"].in:
+		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "do something" {
+			t.Fatalf("opencode's queued blocks = %+v, want the original prompt sent directly", blocks)
+		}
+	default:
+		t.Fatal("opencode never received the prompt via the synchronous fallback")
+	}
+	if !strings.Contains(m.viewport.View(), "isn't connected") {
+		t.Fatalf("viewport.View() = %q, want an explanation of the fallback", m.viewport.View())
+	}
+}
+
+func TestModel_StartRouteDecision_KicksOffAsyncCallWhenDecisionAgentConnected(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "opencode"})
+	m.conns = map[string]*session.Connection{"opencode": {}}
+
+	updated, cmd := m.startRouteDecision("do something")
+	m = updated.(Model)
+	if cmd == nil {
+		t.Fatal("startRouteDecision() cmd = nil, want a tea.Cmd kicked off when the decision agent is connected")
+	}
+	if !strings.Contains(m.viewport.View(), "asking opencode to decide") {
+		t.Fatalf("viewport.View() = %q, want an in-progress indicator", m.viewport.View())
+	}
+	select {
+	case <-workers["opencode"].in:
+		t.Fatal("nothing should be queued directly — the actual prompt is sent once routeDecisionMsg comes back")
+	default:
+	}
+}
+
+func TestModel_HandleRouteDecision_ErrorFallsBackToDefaultAgent(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.defaultAgent = "opencode"
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "do something", err: errFixture("parse failed")})
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["opencode"].in:
+		if len(blocks) != 1 || blocks[0].Text == nil || blocks[0].Text.Text != "do something" {
+			t.Fatalf("queued blocks = %+v, want the original prompt sent to the default agent", blocks)
+		}
+	default:
+		t.Fatal("default agent never received the prompt after a decision error")
+	}
+	if !strings.Contains(m.viewport.View(), "decision failed") {
+		t.Fatalf("viewport.View() = %q, want an explanation", m.viewport.View())
+	}
+}
+
+func TestModel_HandleRouteDecision_UnknownAgentFallsBackToDefaultAgent(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.defaultAgent = "opencode"
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "do something", decision: router.Decision{Agent: "gemini"}})
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["opencode"].in:
+		if blocks[0].Text.Text != "do something" {
+			t.Fatalf("queued blocks = %+v, want the fallback to the default agent", blocks)
+		}
+	default:
+		t.Fatal("default agent never received the prompt after an unknown-agent decision")
+	}
+}
+
+func TestModel_HandleRouteDecision_NoHandoffWhenSameAgentContinues(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "claude"
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "keep going", decision: router.Decision{Agent: "claude"}})
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["claude"].in:
+		if blocks[0].Text.Text != "keep going" {
+			t.Fatalf("queued text = %q, want the bare prompt with no handoff preamble when the agent didn't change", blocks[0].Text.Text)
+		}
+	default:
+		t.Fatal("claude never received the prompt")
+	}
+}
+
+func TestModel_HandleRouteDecision_HandoffPreambleOnAgentSwitch(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "opencode"
+	m.appendActivity("agent:opencode", "opencode did some earlier work")
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "continue the task", decision: router.Decision{Agent: "claude"}})
+	m = updated.(Model)
+
+	select {
+	case blocks := <-workers["claude"].in:
+		text := blocks[0].Text.Text
+		if !strings.Contains(text, "automated handoff context from chorus") {
+			t.Fatalf("queued text = %q, want the self-identifying handoff preamble", text)
+		}
+		if !strings.Contains(text, "opencode did some earlier work") {
+			t.Fatalf("queued text = %q, want the prior activity included", text)
+		}
+		if !strings.Contains(text, "continue the task") {
+			t.Fatalf("queued text = %q, want the actual prompt still present", text)
+		}
+	default:
+		t.Fatal("claude never received the handed-off prompt")
+	}
+	if m.lastRoutedAgent != "claude" {
+		t.Fatalf("lastRoutedAgent = %q, want claude after the switch", m.lastRoutedAgent)
+	}
+}
+
+func TestModel_HandleRouteDecision_ModelSwitchQueuesTwoTurnsInOrder(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "claude" // no handoff, isolate the model-switch behavior
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "model"}}}
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "do the hard part", decision: router.Decision{Agent: "claude", Model: "claude-opus-4-8"}})
+	m = updated.(Model)
+
+	first := <-workers["claude"].in
+	if first[0].Text == nil || first[0].Text.Text != "/model claude-opus-4-8" {
+		t.Fatalf("first queued turn = %+v, want the model-switch command first", first)
+	}
+	select {
+	case second := <-workers["claude"].in:
+		if second[0].Text == nil || second[0].Text.Text != "do the hard part" {
+			t.Fatalf("second queued turn = %+v, want the actual prompt second", second)
+		}
+	default:
+		t.Fatal("only one turn was queued, want the model-switch command followed by the prompt")
+	}
+}
+
+func TestModel_HandleRouteDecision_NoModelCommandDiscoveredSkipsSwitchSilently(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "claude"
+	// No commands registered — no model-switch command discoverable.
+
+	updated, _ := m.Update(routeDecisionMsg{prompt: "do it", decision: router.Decision{Agent: "claude", Model: "claude-opus-4-8"}})
+	m = updated.(Model)
+
+	blocks := <-workers["claude"].in
+	if blocks[0].Text.Text != "do it" {
+		t.Fatalf("queued text = %q, want just the prompt (no model-switch attempt when no command was discovered)", blocks[0].Text.Text)
+	}
+	select {
+	case extra := <-workers["claude"].in:
+		t.Fatalf("unexpected second queued turn = %+v", extra)
+	default:
+	}
+}
+
+func TestModel_ContextCommand_OpensMenuArrowSelectsAndSetsLevel(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{ContextLevel: "digest"})
+
+	m, _ = enterWithInput(m, "context")
+	if m.mode() != modeContextLevel {
+		t.Fatalf("mode() = %v, want modeContextLevel after the context command", m.mode())
+	}
+	if m.contextCursor != 1 { // "digest" is index 1
+		t.Fatalf("contextCursor = %d, want 1 (starting at the current level, digest)", m.contextCursor)
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.contextCursor != 2 { // "full"
+		t.Fatalf("contextCursor = %d, want 2 (full) after one Down from digest", m.contextCursor)
+	}
+
+	m, _ = enterWithInput(m, "")
+	if m.mode() != modeNormal {
+		t.Fatalf("mode() = %v, want modeNormal once the menu is answered", m.mode())
+	}
+	if m.routing.ContextLevel != "full" {
+		t.Fatalf("routing.ContextLevel = %q, want full", m.routing.ContextLevel)
+	}
+	if !strings.Contains(m.viewport.View(), `"full"`) {
+		t.Fatalf("viewport.View() = %q, want confirmation of the new level", m.viewport.View())
 	}
 }

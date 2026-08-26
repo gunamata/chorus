@@ -28,7 +28,7 @@ agents:
     spawn: ["opencode", "acp"]
     transport: acp
 `)
-	specs, err := Load(path)
+	specs, _, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -54,7 +54,7 @@ agents:
     cost_tier: metered
     notes: "general-purpose, metered usage"
 `)
-	specs, err := Load(path)
+	specs, _, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -72,7 +72,7 @@ agents:
   - name: claude
     spawn: ["claude-agent-acp"]
 `)
-	specs, err := Load(path)
+	specs, _, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -87,7 +87,7 @@ agents:
   - name: claude
     spawn: ["claude-agent-acp"]
 `)
-	specs, err := Load(path)
+	specs, _, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -103,7 +103,7 @@ agents:
     spawn: ["weird-agent"]
     transport: http
 `)
-	if _, err := Load(path); err == nil {
+	if _, _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want an error for an unsupported transport")
 	}
 }
@@ -113,7 +113,7 @@ func TestLoad_RejectsMissingName(t *testing.T) {
 agents:
   - spawn: ["some-agent"]
 `)
-	if _, err := Load(path); err == nil {
+	if _, _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want an error for a missing name")
 	}
 }
@@ -124,7 +124,7 @@ agents:
   - name: claude
     spawn: []
 `)
-	if _, err := Load(path); err == nil {
+	if _, _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want an error for an empty spawn list")
 	}
 }
@@ -137,13 +137,132 @@ agents:
   - name: claude
     spawn: ["claude-agent-acp", "--other"]
 `)
-	if _, err := Load(path); err == nil {
+	if _, _, err := Load(path); err == nil {
 		t.Fatal("Load() error = nil, want an error for a duplicate agent name")
 	}
 }
 
 func TestLoad_MissingFileErrors(t *testing.T) {
-	if _, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml")); err == nil {
-		t.Fatal("Load() error = nil, want an error for a missing agents.yaml (unlike policy.yaml, this file is required)")
+	if _, _, err := Load(filepath.Join(t.TempDir(), "does-not-exist.yaml")); err == nil {
+		t.Fatal("Load() error = nil, want an error for a missing agents.yaml (chorus falls back to its embedded default at the main.go layer, not here — this package's own Load has no such fallback)")
+	}
+}
+
+// --- fields moved in from the old policy.yaml, plus new top-level config
+// (chorus-spec.md §0: policy.yaml eliminated, everything consolidated
+// into this one file) --------------------------------------------------
+
+func TestParse_DecodesPerAgentPermissions(t *testing.T) {
+	_, cfg, err := Parse([]byte(`
+agents:
+  - name: claude
+    spawn: ["claude-agent-acp"]
+    auto_allow: [read, search, think]
+    auto_allow_tools: [mcp__chorus-delegate__]
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !cfg.Agents.AutoAllow("claude", "read") {
+		t.Error("expected claude to auto-allow \"read\"")
+	}
+	if cfg.Agents.AutoAllow("claude", "edit") {
+		t.Error("expected claude NOT to auto-allow \"edit\"")
+	}
+	if !cfg.Agents.AutoAllowTool("claude", "mcp__chorus-delegate__delegate") {
+		t.Error("expected claude to auto-allow the delegate tool by title prefix")
+	}
+	if cfg.Agents.AutoAllow("opencode", "read") {
+		t.Error("expected opencode to have no auto_allow entries configured")
+	}
+}
+
+func TestParse_DecodesDefaultAgentDelegationCompactionRouting(t *testing.T) {
+	_, cfg, err := Parse([]byte(`
+default_agent: opencode
+delegation:
+  enabled: true
+  prefer: [execute, edit]
+  nudge_threshold: 2
+compaction:
+  enabled: true
+  threshold_percent: 60
+routing:
+  mode: llm
+  decision_agent: opencode
+  context_level: digest
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.DefaultAgent != "opencode" {
+		t.Errorf("DefaultAgent = %q, want opencode", cfg.DefaultAgent)
+	}
+	if !cfg.Delegation.EnabledOrDefault() {
+		t.Error("Delegation.EnabledOrDefault() = false, want true")
+	}
+	if !cfg.Delegation.PreferKind("execute") {
+		t.Error("expected Delegation.Prefer to include execute")
+	}
+	if !cfg.Compaction.EnabledOrDefault() || cfg.Compaction.Threshold() != 60 {
+		t.Errorf("Compaction = %+v, want enabled at 60%%", cfg.Compaction)
+	}
+	if string(cfg.Routing.ModeOrDefault()) != "llm" {
+		t.Errorf("Routing.Mode = %q, want llm", cfg.Routing.Mode)
+	}
+	if cfg.Routing.DecisionAgent != "opencode" {
+		t.Errorf("Routing.DecisionAgent = %q, want opencode", cfg.Routing.DecisionAgent)
+	}
+}
+
+func TestParse_DecodesPerAgentModels(t *testing.T) {
+	_, cfg, err := Parse([]byte(`
+agents:
+  - name: claude
+    spawn: ["claude-agent-acp"]
+    models:
+      - id: claude-opus-4-8
+        label: Opus
+        capabilities: "highest reasoning quality"
+        when_to_use: "hard problems"
+      - id: claude-haiku-4-5-20251001
+        label: Haiku
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	_ = cfg
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: claude
+    spawn: ["claude-agent-acp"]
+    models:
+      - id: claude-opus-4-8
+        label: Opus
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(specs[0].Models) != 1 || specs[0].Models[0].ID != "claude-opus-4-8" {
+		t.Fatalf("specs[0].Models = %+v, want one entry claude-opus-4-8", specs[0].Models)
+	}
+}
+
+func TestParse_ModelsOptional(t *testing.T) {
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(specs[0].Models) != 0 {
+		t.Errorf("specs[0].Models = %+v, want empty when omitted", specs[0].Models)
 	}
 }

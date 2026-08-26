@@ -63,6 +63,9 @@ func run(fresh bool) error {
 	if err != nil {
 		return err
 	}
+	if err := validateRoutingConfig(agentSpecs, cfg.Routing); err != nil {
+		return err
+	}
 
 	store, err := sessionstore.Load(filepath.Join(cwd, ".chorus", "sessions.json"))
 	if err != nil {
@@ -137,7 +140,15 @@ func run(fresh bool) error {
 	}
 	defer hub.Close()
 	hub.SetConnections(conns)
-	attachDelegate := len(conns) > 1
+	// Delegation is now opt-in (agents.yaml's delegation.enabled, default
+	// false — chorus-spec.md §0): the `delegate` MCP tool's schema costs
+	// ~500-1400+ tokens on EVERY turn of EVERY agent it's attached to,
+	// whether ever used or not, and live use showed agents rarely call it
+	// on their own. attachDelegate stays the single all-or-nothing gate
+	// for the whole run (mcpServers is a one-time NewSession/LoadSession
+	// construction param, not mutable later) — it now also requires the
+	// config opt-in, not just "2+ agents connected."
+	attachDelegate := len(conns) > 1 && cfg.Delegation.EnabledOrDefault()
 
 	// Phase 3: create (or resume) each connection's main interactive
 	// session, with the delegate tool attached if there's more than one
@@ -203,26 +214,34 @@ func run(fresh bool) error {
 		workers[spec.Name] = tui.StartWorker(ctx, s, errCh, doneCh)
 		workersMu.Unlock()
 		// Wire up the delegation-nudge callbacks now that this agent's
-		// worker exists (CLAUDE.md's delegation-maximization plan item 2).
-		// Both closures capture the `workers` map by reference, not by
-		// value — later iterations of this loop still populate entries
-		// these closures will see correctly whenever they're actually
-		// invoked (well after startup, from a connection's own read-loop
-		// goroutine), even though not every agent's worker exists yet at
-		// the moment the closures are created. Guarded by workersMu since
-		// these run concurrently with this loop's own writes — see its
-		// declaration above.
-		conn.SetIdleChecker(func(name string) bool {
-			workersMu.Lock()
-			w, ok := workers[name]
-			workersMu.Unlock()
-			return ok && w.Idle()
-		})
-		conn.SetNudgeFunc(func(agent, text string) {
-			workersMu.Lock()
-			defer workersMu.Unlock()
-			tui.QueuePrompt(agent, text, workers)
-		})
+		// worker exists (CLAUDE.md's delegation-maximization plan item 2)
+		// — ONLY when delegation is actually attached. Found during this
+		// same change's own review: this used to be unconditional, so a
+		// project that set delegation.enabled: false but left `prefer`
+		// populated would still nudge a metered agent to "use your
+		// delegate tool" — a tool that, under the new gating, was never
+		// attached to its session at all. Both closures capture the
+		// `workers` map by reference, not by value — later iterations of
+		// this loop still populate entries these closures will see
+		// correctly whenever they're actually invoked (well after
+		// startup, from a connection's own read-loop goroutine), even
+		// though not every agent's worker exists yet at the moment the
+		// closures are created. Guarded by workersMu since these run
+		// concurrently with this loop's own writes — see its declaration
+		// above.
+		if attachDelegate {
+			conn.SetIdleChecker(func(name string) bool {
+				workersMu.Lock()
+				w, ok := workers[name]
+				workersMu.Unlock()
+				return ok && w.Idle()
+			})
+			conn.SetNudgeFunc(func(agent, text string) {
+				workersMu.Lock()
+				defer workersMu.Unlock()
+				tui.QueuePrompt(agent, text, workers)
+			})
+		}
 		if resumed {
 			fmt.Printf("%s resumed (session %s)\n", spec.Name, s.SessionID)
 		} else {
@@ -248,7 +267,7 @@ func run(fresh bool) error {
 		// "briefed" as its own fact fixes that: it now fires on the very
 		// next run where attachDelegate is true, for any session that
 		// hasn't seen it yet, resumed or not.
-		if attachDelegate && !store.Briefed(spec.Name) && cfg.BriefingEnabled() {
+		if attachDelegate && !store.Briefed(spec.Name) && cfg.Delegation.BriefingEnabled() {
 			roster := delegate.BuildRoster(agentSpecs, conns, spec.Name)
 			tui.QueuePrompt(spec.Name, buildBriefingText(roster), workers)
 			if err := store.MarkBriefed(spec.Name); err != nil {
@@ -312,7 +331,10 @@ func run(fresh bool) error {
 		Renderer:      r,
 		Collectors:    coll,
 		Workers:       workers,
+		DefaultAgent:  cfg.DefaultAgent,
 		Routing:       cfg.Routing,
+		Compaction:    cfg.Compaction,
+		Cwd:           cwd,
 		AgentSpecs:    agentSpecs,
 		Conns:         conns,
 		OutputCh:      outputCh,
@@ -350,54 +372,31 @@ func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *se
 	return s, false
 }
 
-// embeddedAgentsYAML/embeddedPolicyYAML are this repo's own agents.yaml/
-// policy.yaml, baked into the binary at build time — chorus's reference
-// config (claude/gemini/opencode, the policy tuned for them in
-// CLAUDE.md's delegation-maximization plan) doubles as the shipped
-// default, rather than maintaining a second, separate "default" pair
+// embeddedAgentsYAML is this repo's own agents.yaml, baked into the
+// binary at build time — chorus's reference config (claude/gemini/
+// opencode, permissions/delegation/compaction/routing tuned for them,
+// per CLAUDE.md's delegation-maximization plan) doubles as the shipped
+// default, rather than maintaining a second, separate "default" file
 // that could drift from what's actually tested. loadAgentConfig falls
-// back to these only when no local file exists in cwd.
+// back to this only when no local agents.yaml exists in cwd.
+//
+// policy.yaml no longer exists (chorus-spec.md §0) — permission settings
+// (auto_allow/auto_allow_tools) moved into each agent's own entry in this
+// one file, so there's exactly one config file to resolve, not two, and
+// the earlier "local agents.yaml requires local policy.yaml" guard is
+// gone along with the second file it existed to protect.
 //
 //go:embed agents.yaml
 var embeddedAgentsYAML []byte
 
-//go:embed policy.yaml
-var embeddedPolicyYAML []byte
-
-// loadAgentConfig resolves agents.yaml and policy.yaml for this run. A
-// local file in cwd always takes precedence over the embedded default,
-// checked independently for each of the two files — EXCEPT that a local
-// agents.yaml requires a local policy.yaml too, rather than silently
-// pairing a custom agent set with the embedded default policy:
-// policy.yaml's auto_allow/routing/delegation settings are keyed to
-// specific agent names (claude/gemini/opencode in the embedded default),
-// so applying it to a different agent set could silently under- or
-// over-permission agents it was never written for, or route to agent
-// names that don't even exist in the custom set. Requiring an explicit
-// local policy.yaml forces that to be a conscious choice, not a silent
-// mismatch. The reverse (a local policy.yaml with no local agents.yaml,
-// pairing it with the embedded default agent set) has no such hazard —
-// nothing about policy.yaml's shape depends on where the agent processes
-// come from — so it's allowed.
+// loadAgentConfig resolves agents.yaml for this run. A local file in cwd
+// always takes precedence over the embedded default.
 func loadAgentConfig(cwd string) ([]session.Spec, policy.Config, error) {
 	agentsPath := filepath.Join(cwd, "agents.yaml")
-	policyPath := filepath.Join(cwd, "policy.yaml")
 
 	localAgents, err := fileExists(agentsPath)
 	if err != nil {
 		return nil, policy.Config{}, fmt.Errorf("check %s: %w", agentsPath, err)
-	}
-	localPolicy, err := fileExists(policyPath)
-	if err != nil {
-		return nil, policy.Config{}, fmt.Errorf("check %s: %w", policyPath, err)
-	}
-	if localAgents && !localPolicy {
-		return nil, policy.Config{}, fmt.Errorf(
-			"found a local agents.yaml in %s but no local policy.yaml — "+
-				"providing your own agents.yaml requires providing a matching policy.yaml too "+
-				"(its auto_allow/routing/delegation settings are keyed to specific agent names, "+
-				"so chorus won't silently pair a custom agent set with its built-in default policy)",
-			cwd)
 	}
 
 	agentsYAML := embeddedAgentsYAML
@@ -408,25 +407,35 @@ func loadAgentConfig(cwd string) ([]session.Spec, policy.Config, error) {
 		}
 		agentsYAML = b
 	}
-	agentSpecs, err := registry.Parse(agentsYAML)
+	agentSpecs, cfg, err := registry.Parse(agentsYAML)
 	if err != nil {
 		return nil, policy.Config{}, fmt.Errorf("load agents.yaml: %w", err)
 	}
 
-	policyYAML := embeddedPolicyYAML
-	if localPolicy {
-		b, err := os.ReadFile(policyPath)
-		if err != nil {
-			return nil, policy.Config{}, fmt.Errorf("read %s: %w", policyPath, err)
-		}
-		policyYAML = b
-	}
-	cfg, err := policy.Parse(policyYAML)
-	if err != nil {
-		return nil, policy.Config{}, fmt.Errorf("load policy.yaml: %w", err)
-	}
-
 	return agentSpecs, cfg, nil
+}
+
+// validateRoutingConfig catches a routing.decision_agent misconfiguration
+// before spending any time connecting agent subprocesses, rather than
+// letting it surface later as a router.Decide fallback path buried in the
+// TUI. Only checked when routing.mode is actually "llm" — an unset or
+// unknown decision_agent under "off" mode is simply never read. A
+// metered decision_agent isn't rejected outright (it's still a valid,
+// working configuration), just warned about: routing to a metered agent
+// to decide routing for OTHER agents defeats a good chunk of the point.
+func validateRoutingConfig(specs []session.Spec, routing policy.Routing) error {
+	if routing.ModeOrDefault() != policy.RoutingLLM {
+		return nil
+	}
+	for _, s := range specs {
+		if s.Name == routing.DecisionAgent {
+			if s.CostTier == "metered" {
+				fmt.Fprintf(os.Stderr, "warning: routing.decision_agent %q is cost_tier \"metered\" — LLM-based routing is meant to use a non-metered agent to decide, or it partly defeats its own purpose\n", routing.DecisionAgent)
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("routing.mode is \"llm\" but decision_agent %q doesn't match any agent in agents.yaml", routing.DecisionAgent)
 }
 
 // fileExists distinguishes "doesn't exist" (fine, fall back to the

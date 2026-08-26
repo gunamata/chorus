@@ -204,14 +204,19 @@ type pendingRoute struct {
 // syntax defines it:
 //
 //  1. An explicit "<agent>: text" prefix (§9: "explicit override, always
-//     wins") queues directly.
+//     wins") queues directly — this always bypasses auto-routing
+//     entirely, at every routing mode, including the LLM-based one.
 //  2. A bare "/name ..." matching a command any connected agent
 //     advertised via available_commands_update routes straight to
 //     whichever agent(s) declare it. Ambiguous (2+ agents declare the
 //     same name) returns a pendingRoute restricted to just those agents.
 //  3. Anything else — including a colon that isn't actually an agent
-//     prefix, e.g. a colon appearing naturally inside free text —
-//     auto-routes via router.Choose.
+//     prefix, e.g. a colon appearing naturally inside free text — goes to
+//     defaultAgent. (Keyword-based auto-routing was removed entirely —
+//     chorus-spec.md §0 — in favor of either "off" (always defaultAgent,
+//     this case) or an LLM-based routing decision; see the `context`
+//     command / internal/router for the latter, layered on top of this
+//     function from its caller, not inside it.)
 //
 // Returns the agent that actually received a prompt (empty if none did —
 // on failure, or when ask is non-nil and nothing's been sent yet) and the
@@ -220,30 +225,32 @@ type pendingRoute struct {
 // what was actually asked via render.FormatUserPrompt, since ACP has no
 // mechanism for that to come back from the agent itself on a live turn.
 // Also returns any informational text to display (may be "") and, if
-// routing was ambiguous, a non-nil pendingRoute the caller should prompt
-// for and later resolve via queuePrompt once the user answers.
+// a slash command was ambiguous, a non-nil pendingRoute the caller should
+// prompt for and later resolve via queuePrompt once the user answers.
 //
 // Unlike the line-based REPL this was ported from, dispatch never prints
 // directly — bubbletea owns the terminal, so every informational message
 // is returned as text for Update() to append as a block instead.
-func dispatch(line string, workers map[string]*AgentWorker, routing policy.Routing, commands map[string][]acp.AvailableCommand) (agent, sentText, msg string, ask *pendingRoute) {
+func dispatch(line string, workers map[string]*AgentWorker, defaultAgent string, routing policy.Routing, commands map[string][]acp.AvailableCommand) (agent, sentText, msg string, ask *pendingRoute, decisionReq *decisionRequest) {
 	if a, rest, ok := strings.Cut(line, ":"); ok {
 		a = strings.TrimSpace(a)
 		rest = strings.TrimSpace(rest)
 		// Only treat this as a prefix attempt if the part before ":" has
 		// no spaces — "please fix this: it's broken" isn't someone typing
 		// an agent name, so let it fall through to auto-routing instead.
+		// This ALWAYS bypasses routing entirely, at every routing.Mode,
+		// including "llm" — an explicit ask always wins.
 		if a != "" && !strings.ContainsAny(a, " \t") {
 			if rest == "" {
-				return "", "", fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
+				return "", "", fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
 			}
 			if !knownAgent(a, workers) {
-				return "", "", fmt.Sprintf("unknown agent %q (agents: %s)", a, strings.Join(agentNames(workers), ", ")), nil
+				return "", "", fmt.Sprintf("unknown agent %q (agents: %s)", a, strings.Join(agentNames(workers), ", ")), nil, nil
 			}
 			if errMsg := queuePrompt(a, rest, workers); errMsg != "" {
-				return "", "", errMsg, nil
+				return "", "", errMsg, nil, nil
 			}
-			return a, rest, "", nil
+			return a, rest, "", nil, nil
 		}
 	}
 
@@ -251,49 +258,121 @@ func dispatch(line string, workers map[string]*AgentWorker, routing policy.Routi
 		if owners := commandOwners(commands, line); len(owners) > 0 {
 			if len(owners) == 1 {
 				if errMsg := queuePrompt(owners[0], line, workers); errMsg != "" {
-					return "", "", errMsg, nil
+					return "", "", errMsg, nil, nil
 				}
-				return owners[0], line, fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), nil
+				return owners[0], line, fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), nil, nil
 			}
-			return "", "", "", &pendingRoute{text: line, candidates: owners}
+			return "", "", "", &pendingRoute{text: line, candidates: owners}, nil
 		}
 		// No agent has advertised this command (yet, or at all) — fall
 		// through to ordinary routing below rather than erroring; it
 		// might just be prose that happens to start with "/".
 	}
 
-	decision := router.Choose(routing, line)
-	if !decision.Matched && routing.AskWhenAmbiguous {
-		return "", "", "", &pendingRoute{text: line}
+	if routing.ModeOrDefault() == policy.RoutingLLM {
+		// Resolved asynchronously by the caller (Model.startRouteDecision)
+		// — an LLM decision requires a real agent turn, which must never
+		// block Model.Update (concurrency invariant #1).
+		return "", "", "", nil, &decisionRequest{text: line}
 	}
 
-	target := decision.Agent
-	fellBack := false
-	if target == "" || !knownAgent(target, workers) {
-		// Only fall back when a RULE matched an agent that isn't
-		// currently connected — routing.Default already came back as
-		// decision.Agent when nothing matched (decision.Matched ==
-		// false), so falling back to it here would just be falling back
-		// to itself and failing the same way again. Deliberately scoped
-		// to auto-routing only: an explicit "<agent>: text" override or
-		// a slash command still fails outright if that agent isn't
-		// connected, never silently rerouted — you asked for that agent
-		// specifically, chorus doesn't get to override an explicit ask.
-		if decision.Matched && routing.Default != "" && knownAgent(routing.Default, workers) {
-			target = routing.Default
-			fellBack = true
-		} else {
-			return "", "", fmt.Sprintf("no route for this prompt — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil
+	if defaultAgent == "" || !knownAgent(defaultAgent, workers) {
+		return "", "", fmt.Sprintf("no default agent configured or connected — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
+	}
+	if errMsg := queuePrompt(defaultAgent, line, workers); errMsg != "" {
+		return "", "", errMsg, nil, nil
+	}
+	return defaultAgent, line, "", nil, nil
+}
+
+// decisionRequest signals that dispatch couldn't resolve a prompt
+// synchronously — routing.Mode is "llm" and no explicit prefix/slash
+// command already handled it — and the caller must kick off an async LLM
+// routing decision instead (see Model.startRouteDecision/runRouteDecision).
+type decisionRequest struct {
+	text string
+}
+
+// decisionAgentInfos builds router.DecisionAgentInfo for every CONNECTED
+// agent (has a worker — some registry entries may have failed to start or
+// get a session) in registry order, for BuildDecisionPrompt.
+func decisionAgentInfos(specs []session.Spec, workers map[string]*AgentWorker) []router.DecisionAgentInfo {
+	out := make([]router.DecisionAgentInfo, 0, len(specs))
+	for _, s := range specs {
+		if _, ok := workers[s.Name]; !ok {
+			continue
 		}
+		out = append(out, router.DecisionAgentInfo{Name: s.Name, CostTier: s.CostTier, Notes: s.Notes, Models: s.Models})
 	}
+	return out
+}
 
-	if errMsg := queuePrompt(target, line, workers); errMsg != "" {
-		return "", "", errMsg, nil
+// runRouteDecision runs one LLM routing decision as a hidden sub-session
+// on the decision agent's EXISTING connection — the identical shape
+// internal/delegate.Hub.doDelegate already uses for delegation sub-
+// sessions (fresh session, mcpServers nil, Collectors captures the reply
+// so it never renders inline), reused here rather than inventing a
+// second "hidden sub-session" mechanism. Runs as a tea.Cmd (bubbletea's
+// own async pattern) since a real agent turn can never block
+// Model.Update (concurrency invariant #1).
+//
+// timeout is caller-supplied (policy.Routing.DecisionTimeout(), configurable
+// per project) rather than a fixed constant — found live (chorus-spec.md
+// §0) that a free/shared-capacity decision agent's own upstream provider
+// can be intermittently slow or need an internal retry, and a too-tight
+// timeout here cuts that off, surfacing as a generic decision-failed
+// error indistinguishable from a real problem: a stuck or tool-using
+// decision call (the decision agent still has its own built-in tools
+// available even with chorus's MCP servers detached; see
+// BuildDecisionPrompt's explicit "do not use tools" instruction, which
+// mitigates but can't structurally prevent this) must still never hang
+// the router indefinitely — the timeout is just another failure path
+// that falls back to the default agent, same as a parse failure; it just
+// needs to be generous enough not to fire on ordinary slowness.
+func runRouteDecision(ctx context.Context, conn *session.Connection, coll *delegate.Collectors, cwd string, agents []router.DecisionAgentInfo, defaultAgent, contextText, userPrompt string, reqID int, timeout time.Duration) tea.Cmd {
+	return func() tea.Msg {
+		cctx, cancel := context.WithTimeout(ctx, timeout)
+		defer cancel()
+
+		// Errors below are labeled by stage ("opening decision sub-
+		// session" vs "decision sub-session prompt") since a bare ACP/
+		// JSON-RPC error code (e.g. "-32603 Internal error") alone doesn't
+		// say which call the target agent's ACP server actually failed —
+		// found live to matter: check this project's own per-agent
+		// .chorus/logs/<agent>.stderr.log first, since a generic -32603
+		// almost always means the AGENT's own process hit an unhandled
+		// error internally, not that chorus sent it something malformed.
+		sub, err := conn.NewSession(cctx, cwd, nil)
+		if err != nil {
+			return routeDecisionMsg{reqID: reqID, prompt: userPrompt, err: fmt.Errorf("opening decision sub-session: %w", err)}
+		}
+		coll.Register(sub.SessionID)
+		promptText := router.BuildDecisionPrompt(agents, defaultAgent, contextText, userPrompt)
+		promptErr := sub.Prompt(cctx, promptText)
+		reply := coll.Collect(sub.SessionID)
+		if promptErr != nil {
+			return routeDecisionMsg{reqID: reqID, prompt: userPrompt, err: fmt.Errorf("decision sub-session prompt: %w", promptErr)}
+		}
+		decision, err := router.ParseDecision(reply, agents)
+		return routeDecisionMsg{reqID: reqID, prompt: userPrompt, decision: decision, err: err}
 	}
-	if fellBack {
-		return target, line, fmt.Sprintf("(matched %s, but it's not connected — falling back to default: %s)", decision.Agent, target), nil
-	}
-	return target, line, fmt.Sprintf("(auto-routed to %s)", target), nil
+}
+
+// buildHandoffPreamble is prepended to the routed prompt when an LLM
+// routing decision switches to a different agent than lastRoutedAgent —
+// self-identification framing matches buildBriefingText/buildNudgeText
+// (main.go/internal/acpclient), proven necessary live (chorus-spec.md
+// §0: an agent otherwise suspects a plain instruction message is a
+// prompt-injection attempt).
+func buildHandoffPreamble(fromAgent, activity string) string {
+	var b strings.Builder
+	b.WriteString("This is automated handoff context from chorus itself, the multi-agent CLI harness you're " +
+		"running under — not a message from the user. The user's task is continuing, but the previous turn(s) " +
+		"were handled by a different agent (" + fromAgent + "), whose work you have no memory of. Here is what " +
+		"happened so far, for context:\n\n")
+	b.WriteString(activity)
+	b.WriteString("\n\nThe user's actual next message follows.")
+	return b.String()
 }
 
 // commandName extracts the command name from a "/name ..." line, without
@@ -322,6 +401,28 @@ func commandOwners(commands map[string][]acp.AvailableCommand, line string) []st
 	}
 	sort.Strings(owners)
 	return owners
+}
+
+// findCommandByAlias reports the first of agent's advertised commands
+// whose name contains one of aliases, case-insensitively — used to
+// discover a compaction-style command (Model.fireCompaction) or a
+// model-switch command without ever hardcoding a literal name like
+// "/compact" or "/model": different agents may name the same concept
+// differently, or not support it at all, and chorus only finds out by
+// asking (available_commands_update), never by guessing. Deliberately a
+// substring match, more permissive than AutoAllowTool's prefix rule —
+// this is read-only capability discovery, not a permission bypass, so
+// there's no spoofing risk to guard against.
+func findCommandByAlias(cmds []acp.AvailableCommand, aliases []string) (acp.AvailableCommand, bool) {
+	for _, c := range cmds {
+		lower := strings.ToLower(c.Name)
+		for _, alias := range aliases {
+			if alias != "" && strings.Contains(lower, strings.ToLower(alias)) {
+				return c, true
+			}
+		}
+	}
+	return acp.AvailableCommand{}, false
 }
 
 // formatCommands lists every agent's currently known slash commands, for

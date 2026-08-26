@@ -1,28 +1,32 @@
-// Package policy implements the §5 permission allow-list: tool calls whose
-// ACP ToolKind is in an agent's auto_allow list are answered immediately
-// without interrupting the user; everything else (including unlisted
-// kinds) falls through to the permission queue. It also holds §9's
-// routing config, since the spec's §5 and §9 mockups are both labeled
-// "# policy.yaml" — one merged file, two concerns.
+// Package policy holds the typed shape of agents.yaml's non-registry
+// settings: the §5 permission allow-list (tool calls whose ACP
+// ToolCallUpdate.Kind is in an agent's auto_allow list are answered
+// immediately without interrupting the user; everything else falls
+// through to the permission queue), delegation config, compaction config,
+// and routing config. All of it is decoded by internal/registry.Parse —
+// this package no longer reads or parses agents.yaml itself (that
+// responsibility moved to registry once policy.yaml was eliminated and
+// everything consolidated into one file) — it only defines the types and
+// the small amount of behavior (AutoAllow/AutoAllowTool matching,
+// Delegation/Compaction default-handling) that's independent of where the
+// data came from.
 //
-// Deviation from the spec's policy.yaml mockup, noted deliberately per §0's
-// priority order (correctness of the ACP integration > matching the spec
-// exactly): the mockup keyed auto_allow/ask on tool *names* like "Read" or
-// "Bash", which are internal to each agent and not exposed over ACP. What
-// ACP actually gives every agent, uniformly, is ToolCallUpdate.Kind (read,
-// edit, delete, move, search, execute, think, fetch, switch_mode, other) —
-// so policy.yaml matches on that instead.
+// Deviation from the original spec's policy.yaml mockup, kept even after
+// consolidating into agents.yaml: the mockup keyed auto_allow/ask on tool
+// *names* like "Read" or "Bash", which are internal to each agent and not
+// exposed over ACP. What ACP actually gives every agent, uniformly, is
+// ToolCallUpdate.Kind (read, edit, delete, move, search, execute, think,
+// fetch, switch_mode, other) — so this matches on that instead.
 package policy
 
 import (
-	"fmt"
-	"os"
 	"strings"
-
-	"gopkg.in/yaml.v3"
+	"time"
 )
 
-// AgentPolicy is one agent's section of policy.yaml.
+// AgentPolicy is one agent's permission settings (agents.yaml's
+// auto_allow/auto_allow_tools fields, moved here from the old
+// policy.yaml).
 type AgentPolicy struct {
 	AutoAllow []string `yaml:"auto_allow"`
 	// AutoAllowTools matches a tool call's human-readable Title (case-
@@ -35,68 +39,130 @@ type AgentPolicy struct {
 	AutoAllowTools []string `yaml:"auto_allow_tools"`
 }
 
-// Policy maps agent name -> its policy.
+// Policy maps agent name -> its permission settings.
 type Policy map[string]AgentPolicy
 
-// Rule is one §9 routing rule: if any of Match's keywords (case-insensitive
-// substring match) appears in the prompt text, Agent handles it.
-type Rule struct {
-	Match []string `yaml:"match"`
-	Agent string   `yaml:"agent"`
-}
+// RoutingMode selects how an unprefixed (no "<agent>: " override) prompt
+// picks which agent handles it.
+type RoutingMode string
 
-// Routing is §9's auto-routing config. v1's router is deliberately
-// rule-based, not model-based — a classifier call would itself burn
-// tokens on a metered agent, defeating the point.
+const (
+	// RoutingOff always sends an unprefixed prompt straight to
+	// DefaultAgent — no keyword matching (removed entirely, see
+	// chorus-spec.md §0) and no LLM call.
+	RoutingOff RoutingMode = "off"
+	// RoutingLLM asks DecisionAgent to pick both an agent and (optionally)
+	// a model tier for each unprefixed prompt — see internal/router.
+	RoutingLLM RoutingMode = "llm"
+)
+
+// Routing is the auto-routing config for unprefixed prompts. An explicit
+// "<agent>: text" prefix always bypasses this entirely, at every mode —
+// that invariant predates this type and this type doesn't change it.
 type Routing struct {
-	Default          string `yaml:"default"`
-	AskWhenAmbiguous bool   `yaml:"ask_when_ambiguous"`
-	Rules            []Rule `yaml:"rules"`
+	Mode string `yaml:"mode"`
+	// DecisionAgent is which connected agent's session makes the
+	// agent+model choice, only consulted when Mode is RoutingLLM. Should
+	// be a non-metered agent (chorus warns, doesn't refuse, if it isn't —
+	// see main.go's startup validation).
+	DecisionAgent string `yaml:"decision_agent"`
+	// ContextLevel is how much recent activity is sent to DecisionAgent
+	// alongside each prompt: "prompt" (just the new prompt), "digest" (a
+	// bounded rolling summary — the default), or "full" (the whole capped
+	// activity log). Mutable live via the `context` REPL command — this
+	// field is what that command's menu changes, not a config file value
+	// re-read from disk.
+	ContextLevel string `yaml:"context_level"`
+	// DecisionTimeoutSeconds bounds how long chorus waits for the decision
+	// agent's hidden sub-session to reply before giving up and falling
+	// back to DefaultAgent. Defaults to 60s when unset or non-positive —
+	// found live (chorus-spec.md §0) that a free/shared-capacity decision
+	// agent's own upstream provider can be intermittently slow or need an
+	// internal retry, and the original 25s default cut those off,
+	// surfacing as a generic decision-failed error indistinguishable from
+	// a real problem. A fast, reliable decision agent can set this lower
+	// to fail faster instead.
+	DecisionTimeoutSeconds int `yaml:"decision_timeout_seconds"`
 }
 
-// Delegation is optional top-level policy.yaml config for the seeded
-// first-turn delegation briefing (main.go, chorus-spec.md §11) and the
-// permission-gate delegation nudge (CLAUDE.md's delegation-maximization
-// plan, item 2). Missing entirely, or with Briefing omitted, defaults to
-// enabled — opt-out, not opt-in, since the whole point of the briefing is
-// that delegation shouldn't depend on the user remembering to ask for it
-// every time. Prefer and NudgeThreshold default to "off" instead (empty
-// Prefer disables the nudge entirely) — unlike the briefing, this is a
-// judgment call about an agent's ongoing behavior, not a one-time
-// explanation, so it stays opt-in until a project deliberately configures
-// which tool kinds are worth nudging about.
+// defaultDecisionTimeoutSeconds is used when DecisionTimeoutSeconds is
+// unset or non-positive.
+const defaultDecisionTimeoutSeconds = 60
+
+// DecisionTimeout reports how long to wait for a routing decision before
+// timing out and falling back to DefaultAgent.
+func (r Routing) DecisionTimeout() time.Duration {
+	if r.DecisionTimeoutSeconds <= 0 {
+		return defaultDecisionTimeoutSeconds * time.Second
+	}
+	return time.Duration(r.DecisionTimeoutSeconds) * time.Second
+}
+
+// ModeOrDefault reports the effective RoutingMode — RoutingOff when Mode
+// is empty or unrecognized, so a missing/malformed `routing:` block never
+// accidentally enables a paid LLM call on every prompt.
+func (r Routing) ModeOrDefault() RoutingMode {
+	if RoutingMode(r.Mode) == RoutingLLM {
+		return RoutingLLM
+	}
+	return RoutingOff
+}
+
+// ContextLevelOrDefault reports the effective context tier — "digest"
+// (the cheap, mechanical default — see internal/router) when unset or
+// unrecognized.
+func (r Routing) ContextLevelOrDefault() string {
+	switch r.ContextLevel {
+	case "prompt", "full":
+		return r.ContextLevel
+	default:
+		return "digest"
+	}
+}
+
+// Delegation is optional agents.yaml config (top-level `delegation:`
+// block) for whether the `delegate` MCP tool is attached at all, the
+// seeded first-turn delegation briefing, and the permission-gate
+// delegation nudge (CLAUDE.md's delegation-maximization plan, item 2).
 type Delegation struct {
-	Briefing *bool `yaml:"briefing"`
-	// Prefer lists ACP ToolKinds (the same vocabulary as AgentPolicy's
-	// AutoAllow) for which a metered agent should be nudged toward
-	// delegating instead of executing directly, when a non-metered agent
-	// is connected and idle. Empty (the default) disables the nudge
-	// mechanism entirely — see acpclient.Client.trackDelegationPreference.
-	Prefer []string `yaml:"prefer"`
-	// NudgeThreshold is how many direct Prefer-kind tool calls a metered
-	// agent can make in a row (since its last delegate call) before
-	// chorus prepends a suggestion to its next queued prompt. Defaults to
-	// 3 when unset or non-positive — see Threshold.
-	NudgeThreshold *int `yaml:"nudge_threshold"`
+	// Enabled is the master switch — defaults to FALSE when unset. This
+	// used to be implicit (delegation was always attached once 2+ agents
+	// connected); made explicit and opt-in after live use showed it
+	// rarely fires and the `delegate` MCP tool's schema costs ~500-1400+
+	// tokens on EVERY turn of EVERY agent it's attached to, whether used
+	// or not (see chorus-spec.md §0) — that cost is worth paying only when
+	// a project has deliberately opted in. Mechanics (briefing/nudge) are
+	// fully preserved for revisiting later, just inert while this is
+	// false: main.go only attaches the delegate MCP server, wires the
+	// nudge idle-checker, and seeds the briefing when EnabledOrDefault()
+	// is true.
+	Enabled *bool `yaml:"enabled"`
+	// Briefing/Prefer/NudgeThreshold are unchanged in meaning from before
+	// consolidation — see BriefingEnabled/Threshold/PreferKind. All three
+	// are only ever consulted when Enabled is true.
+	Briefing       *bool    `yaml:"briefing"`
+	Prefer         []string `yaml:"prefer"`
+	NudgeThreshold *int     `yaml:"nudge_threshold"`
 }
 
-// Config is policy.yaml's fully parsed content.
-type Config struct {
-	Agents     Policy
-	Routing    Routing
-	Delegation Delegation
+// EnabledOrDefault reports whether delegation (the MCP tool attachment,
+// briefing, and nudge) is on at all. Defaults to false when unset.
+func (d Delegation) EnabledOrDefault() bool {
+	return d.Enabled != nil && *d.Enabled
 }
 
 // BriefingEnabled reports whether the seeded first-turn delegation
-// briefing should fire. Defaults to true when unset.
-func (c Config) BriefingEnabled() bool {
-	return c.Delegation.Briefing == nil || *c.Delegation.Briefing
+// briefing should fire, GIVEN delegation is already enabled — callers
+// must check EnabledOrDefault() first (main.go's attachDelegate already
+// gates on both). Defaults to true when unset — opt-out, not opt-in,
+// since the whole point of the briefing is that an agent shouldn't need
+// the user to remember to ask for delegation every time once it's on.
+func (d Delegation) BriefingEnabled() bool {
+	return d.Briefing == nil || *d.Briefing
 }
 
 // defaultNudgeThreshold is used when nudge_threshold is unset or
-// non-positive — picked as "a small handful," not derived from data (no
-// real usage numbers exist yet; see CLAUDE.md's item 4, the planned
-// `stats` command, for tuning this against reality later).
+// non-positive — picked as "a small handful," not derived from data.
 const defaultNudgeThreshold = 3
 
 // Threshold reports how many direct Prefer-kind tool calls trigger a
@@ -124,61 +190,63 @@ func (d Delegation) PreferKind(kind string) bool {
 	return false
 }
 
-// Load reads policy.yaml at path. A missing file is not an error — it
-// yields an empty Config: every tool call falls through to the permission
-// queue (safe default) and routing has no rules or default, so dispatch
-// falls back to requiring an explicit agent prefix. Thin wrapper around
-// Parse for the actual decode logic — see its doc comment.
-func Load(path string) (Config, error) {
-	b, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return Config{Agents: Policy{}}, nil
-	}
-	if err != nil {
-		return Config{}, err
-	}
-	return Parse(b)
+// Compaction is optional agents.yaml config (top-level `compaction:`
+// block) for proactively triggering a compaction-style command once an
+// agent's context usage crosses a threshold, instead of waiting for
+// (or never getting) the agent's own late/automatic compaction.
+type Compaction struct {
+	Enabled          *bool    `yaml:"enabled"`
+	ThresholdPercent int      `yaml:"threshold_percent"`
+	Aliases          []string `yaml:"aliases"`
 }
 
-// Parse decodes policy.yaml content already read into memory — shared by
-// Load (a real file) and main.go's embedded-default fallback (compiled-in
-// bytes, no file on disk at all).
-//
-// The file's top-level keys are a mix of per-agent policy blocks and one
-// "routing" block. yaml.v3 can't decode that directly into one typed
-// struct (a fixed field for "routing" plus an open-ended map for
-// "everything else" isn't expressible), so this decodes to
-// map[string]yaml.Node first and dispatches each key's node to the right
-// type.
-func Parse(b []byte) (Config, error) {
-	cfg := Config{Agents: Policy{}}
+// EnabledOrDefault defaults to false when unset.
+func (c Compaction) EnabledOrDefault() bool {
+	return c.Enabled != nil && *c.Enabled
+}
 
-	var raw map[string]yaml.Node
-	if err := yaml.Unmarshal(b, &raw); err != nil {
-		return Config{}, fmt.Errorf("policy.yaml: %w", err)
-	}
+// defaultCompactionThreshold: research into real-world Claude Code usage
+// (chorus-spec.md §0) found compacting deliberately around 60% usage
+// produces much better, cheaper summaries than waiting for an agent's own
+// late auto-compaction (which can trigger multiple times per long session
+// at 100K+ tokens each) — used as the default when unset or invalid.
+const defaultCompactionThreshold = 60
 
-	for key, node := range raw {
-		node := node
-		if key == "routing" {
-			if err := node.Decode(&cfg.Routing); err != nil {
-				return Config{}, fmt.Errorf("policy.yaml: routing: %w", err)
-			}
-			continue
-		}
-		if key == "delegation" {
-			if err := node.Decode(&cfg.Delegation); err != nil {
-				return Config{}, fmt.Errorf("policy.yaml: delegation: %w", err)
-			}
-			continue
-		}
-		var ap AgentPolicy
-		if err := node.Decode(&ap); err != nil {
-			return Config{}, fmt.Errorf("policy.yaml: %s: %w", key, err)
-		}
-		cfg.Agents[key] = ap
+// Threshold reports the context-usage percentage (0-100) that triggers
+// compaction. Defaults to defaultCompactionThreshold when unset or
+// outside (0,100].
+func (c Compaction) Threshold() int {
+	if c.ThresholdPercent <= 0 || c.ThresholdPercent > 100 {
+		return defaultCompactionThreshold
 	}
-	return cfg, nil
+	return c.ThresholdPercent
+}
+
+// defaultCompactionAliases is used when Aliases is empty — matched
+// case-insensitively as a substring against each agent's OWN advertised
+// command names (never hardcoded as a literal "/compact" sent blind —
+// see internal/tui's findCommandByAlias).
+var defaultCompactionAliases = []string{"compact", "summarize", "condense"}
+
+// AliasesOrDefault reports the effective alias list.
+func (c Compaction) AliasesOrDefault() []string {
+	if len(c.Aliases) == 0 {
+		return defaultCompactionAliases
+	}
+	return c.Aliases
+}
+
+// Config is agents.yaml's fully parsed non-registry content — decoded by
+// internal/registry.Parse (the single decode point for the whole file)
+// alongside the []session.Spec list.
+type Config struct {
+	Agents     Policy
+	Delegation Delegation
+	Compaction Compaction
+	Routing    Routing
+	// DefaultAgent is used whenever routing is off, or an LLM routing
+	// decision fails to resolve to a known agent+model.
+	DefaultAgent string
 }
 
 // AutoAllow reports whether toolKind should be auto-approved for agent
