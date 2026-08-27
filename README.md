@@ -599,11 +599,16 @@ these are chorus's own substitution, not OS/shell environment expansion:
 
 Ready-to-build sandbox images live under [`sandbox/`](sandbox/) — one
 per agent, each following whichever mechanism is most official for that
-agent rather than one uniform wrapper (Claude: adapted directly from
-Anthropic's own official devcontainer; Gemini: the CLI's own built-in
-`GEMINI_SANDBOX=docker` sandboxing, no image needed here at all;
-opencode: a custom image, since no official one exists). See
-[`sandbox/README.md`](sandbox/README.md) for the full picture, and each
+agent rather than one uniform wrapper: Claude adapts Anthropic's own
+official devcontainer directly; opencode is a custom image, since no
+official one exists; Gemini was originally meant to use the CLI's own
+built-in `GEMINI_SANDBOX=docker` sandboxing with no chorus-owned image
+at all, but that's confirmed incompatible with `--acp` mode (its
+relaunch logic deadlocks against `--acp`'s required persistent stdin
+pipe — see `sandbox/README.md`), so `sandbox/gemini/` instead builds on
+Google's own real sandbox image directly, the same adapted-official
+pattern as Claude. See [`sandbox/README.md`](sandbox/README.md) for the
+full picture, and each
 subdirectory's own README for auth options (direct API key, AWS
 Bedrock, Google Vertex AI, or a private endpoint) and the firewall's
 `CHORUS_SANDBOX_ALLOW_HOSTS` extension mechanism — none of these are
@@ -795,21 +800,28 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   entry and `CLAUDE.md`'s Known open issues before assuming this is
   fully verified.
 - **Sandboxing (2026-08-26): the core containment mechanism is
-  live-verified; the full agent round-trip isn't yet.** The Go-side
-  mechanism (`workdir`/`{{CWD}}`) is unit-tested, and both
-  `sandbox/claude/` and `sandbox/opencode/` have been built and run for
-  real (not just designed): a host file was confirmed readable through
-  the workspace mount with nothing else on the host reachable, the
-  default-deny firewall was confirmed actually blocking an unrelated
-  host while allowing the built-in allowlist, and
-  `CHORUS_SANDBOX_ALLOW_HOSTS` was confirmed to actually extend it. What
-  hasn't been verified: the real Claude/opencode ACP adapter completing
-  a real prompt inside these images (needs real Vertex AI credentials,
-  unavailable when this was tested), Gemini's `--acp` mode through its
-  own built-in `GEMINI_SANDBOX=docker` sandbox at all, and opencode's
-  actual VPN-bound Ollama endpoint reachability from inside the
-  container (a live, per-machine question — see
+  live-verified for all three agents; the full agent round-trip isn't
+  yet.** The Go-side mechanism (`workdir`/`{{CWD}}`/`{{ENV:NAME}}`) is
+  unit-tested, and `sandbox/claude/`, `sandbox/opencode/`, and
+  `sandbox/gemini/` have all been built and run for real (not just
+  designed): a host file was confirmed readable through the workspace
+  mount with nothing else on the host reachable, the default-deny
+  firewall was confirmed actually blocking an unrelated host while
+  allowing each image's own allowlist, and `CHORUS_SANDBOX_ALLOW_HOSTS`
+  was confirmed to actually extend it. **Gemini's built-in
+  `GEMINI_SANDBOX=docker` sandboxing was tried first and found
+  genuinely incompatible with `--acp` mode** (live-diagnosed deadlock,
+  not a config issue — see `sandbox/README.md`), so `sandbox/gemini/`
+  instead wraps Google's own real sandbox image directly, the same
+  pattern as Claude. What still hasn't been verified: the real
+  Claude/opencode/Gemini ACP adapter completing a real prompt inside
+  these images (needs real credentials, unavailable when this was
+  tested), and opencode's actual VPN-bound Ollama endpoint reachability
+  from inside the container (a live, per-machine question — see
   `sandbox/opencode/README.md`). See `chorus-spec.md` §0's 2026-08-26
-  entries for the full account, including a real bug found and fixed
-  along the way (the Claude image's base `node:20` no longer satisfies
-  `@anthropic-ai/claude-code`'s own `engines.node >= 22` requirement).
+  entries for the full account, including two real bugs found and fixed
+  along the way: the Claude image's base `node:20` not satisfying
+  `@anthropic-ai/claude-code`'s own `engines.node >= 22` requirement, and
+  a stdout-corrupting firewall-script output bug that would have broken
+  every sandboxed agent's ACP handshake unconditionally (fixed in all
+  three images).

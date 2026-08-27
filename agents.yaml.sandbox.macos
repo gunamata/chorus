@@ -177,23 +177,37 @@ agents:
         capabilities: "fast, cheap, less deep reasoning"
         when_to_use: "mechanical, well-specified, low-ambiguity tasks"
 
-  # Sandboxed via Gemini CLI's OWN built-in Docker sandboxing (2026-08-26
-  # — see sandbox/README.md) rather than chorus wrapping it in `docker
-  # run` itself — no image lives under sandbox/ for Gemini, and `spawn`
-  # below is deliberately unchanged. Set these in the shell you run
-  # chorus.exe from instead:
-  #   GEMINI_SANDBOX=docker
-  #   GOOGLE_GENAI_USE_VERTEXAI=true
-  #   GOOGLE_CLOUD_PROJECT=<project>
-  #   GOOGLE_CLOUD_LOCATION=<region>
-  # plus `gcloud auth application-default login` on the host (same ADC
-  # Claude's Vertex path uses above). UNVERIFIED whether --acp's stdio
-  # framing survives being proxied through Gemini's own nested sandbox
-  # container cleanly (chorus-spec.md §0) — this is the first thing to
-  # check once these env vars are set: does `gemini ready` still appear
-  # normally, or does startup hang/error.
+  # Sandboxed (2026-08-26, sandbox/gemini/) — chorus wraps Gemini in its
+  # own `docker run` directly, built on Google's real sandbox image
+  # (`us-docker.pkg.dev/gemini-code-dev/gemini-cli/sandbox:<version>`),
+  # NOT Gemini CLI's own `GEMINI_SANDBOX=docker` env var. That built-in
+  # mechanism is CONFIRMED INCOMPATIBLE with --acp mode (live-diagnosed,
+  # chorus-spec.md §0): its relaunch-into-sandbox logic does a blocking
+  # read against stdin before attempting the relaunch, and --acp mode
+  # needs a persistent, never-EOF stdin pipe — the two deadlock. This
+  # entry bypasses that entirely: chorus owns the docker run and stdio
+  # piping itself, the same working pattern as Claude/opencode above.
+  # Build first (tag must match your installed `gemini --version`):
+  #   docker build --build-arg GEMINI_CLI_VERSION=0.57.0 -t chorus-gemini-sandbox sandbox/gemini/
+  # Auth is Gemini CLI's own "Sign in with Google" OAuth + Code Assist
+  # (NOT Vertex AI) — needs a bound GCP project:
+  #   GOOGLE_CLOUD_PROJECT=<project>   (bare -e below, set in your shell)
+  # Run `gemini` interactively once, outside any container, to complete
+  # the OAuth browser flow if you haven't already, then mount the
+  # resulting credentials read-only. KNOWN LIMITATION: if your OAuth
+  # creds are stored in macOS Keychain rather than the plain
+  # ~/.gemini/oauth_creds.json file — genuinely possible/likely on
+  # macOS, unlike headless Linux — this mount alone won't carry the
+  # actual secret in (see sandbox/gemini/README.md); not yet resolved.
   - name: gemini
-    spawn: ["gemini", "--acp"]
+    spawn: ["docker", "run", "--rm", "-i",
+            "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
+            "-v", "{{CWD}}:/workspace",
+            "-v", "{{ENV:HOME}}/.gemini:/home/node/.gemini:ro",
+            "-e", "GOOGLE_CLOUD_PROJECT",
+            "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
+            "matamagu/chorus-gemini-sandbox", "--acp"]
+    workdir: /workspace
     cost_tier: seat
     notes: "seat/subscription usage; strong at summarize/explain/review/analyze-style work"
     transport: acp

@@ -18,22 +18,29 @@ official for each, rather than inventing one uniform wrapper:
   devcontainer (`anthropics/claude-code/.devcontainer/`): a default-deny
   iptables firewall inside the container, `docker run`-invoked instead
   of via VS Code's devcontainer lifecycle.
-- **Gemini CLI has this built into the CLI itself** — no image lives in
-  this directory for it. Set `GEMINI_SANDBOX=docker` (Gemini's own env
-  var, using its official `ghcr.io/google/gemini-cli:latest` image) in
-  the environment chorus is launched from; `agents.yaml`'s `spawn`
-  stays `["gemini", "--acp"]`, unmodified — the sandboxing and cwd
-  mounting happen entirely inside Gemini's own CLI, invisible to chorus.
-  **Unconfirmed by research whether `--acp`'s stdio JSON-RPC framing
-  passes through this cleanly** (the mechanism is designed around normal
-  interactive/scripted CLI usage) — verify live before relying on it; if
-  it doesn't work, fall back to wrapping Gemini the same way as Claude/
-  opencode below, still using Google's own official image directly.
+- **`sandbox/gemini/`** — Gemini CLI has its own built-in
+  `GEMINI_SANDBOX=docker` sandboxing, which was the original plan here,
+  but it's **confirmed incompatible with `--acp` mode** (2026-08-26,
+  live-diagnosed on the user's own machine, full trail in
+  chorus-spec.md §0): its relaunch-into-sandbox logic does a blocking
+  read against stdin before attempting the relaunch, and `--acp` mode
+  needs a persistent, never-EOF stdin pipe (exactly what chorus
+  provides) — the two deadlock. Standalone `gemini --acp` with a real
+  open pipe hung indefinitely with no container ever created;
+  `gemini --acp < /dev/null` (immediate EOF) DID spawn a container, one
+  that exited instantly since there was no real protocol traffic. So
+  `sandbox/gemini/` instead builds directly on top of Google's real
+  sandbox image (confirmed live by pulling and inspecting it:
+  `us-docker.pkg.dev/gemini-code-dev/gemini-cli/sandbox:<cli-version>`,
+  NOT `ghcr.io/google/gemini-cli`, an earlier wrong guess) with our own
+  firewall layered on — the same pattern as `sandbox/claude/`. chorus
+  invokes `docker run` directly and owns the stdio piping itself, same
+  as Claude/opencode below — there's no relaunch step left to deadlock.
 - **`sandbox/opencode/`** — no official image exists for opencode, so
   this is a custom image following the same firewall pattern as
   Claude's adapted one, since there's nothing official to adopt instead.
 
-## The one thing all three (or two, for Gemini's normal path) share
+## The one thing all three share
 
 Auth and the firewall's egress allowlist are **run-time configuration,
 never baked into an image or branched on in an entrypoint script** —
