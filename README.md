@@ -799,29 +799,29 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   terminal restoration on quit) — see `chorus-spec.md` §0's most recent
   entry and `CLAUDE.md`'s Known open issues before assuming this is
   fully verified.
-- **Sandboxing (2026-08-26): the core containment mechanism is
-  live-verified for all three agents; the full agent round-trip isn't
-  yet.** The Go-side mechanism (`workdir`/`{{CWD}}`/`{{ENV:NAME}}`) is
-  unit-tested, and `sandbox/claude/`, `sandbox/opencode/`, and
-  `sandbox/gemini/` have all been built and run for real (not just
-  designed): a host file was confirmed readable through the workspace
-  mount with nothing else on the host reachable, the default-deny
-  firewall was confirmed actually blocking an unrelated host while
-  allowing each image's own allowlist, and `CHORUS_SANDBOX_ALLOW_HOSTS`
-  was confirmed to actually extend it. **Gemini's built-in
-  `GEMINI_SANDBOX=docker` sandboxing was tried first and found
-  genuinely incompatible with `--acp` mode** (live-diagnosed deadlock,
-  not a config issue — see `sandbox/README.md`), so `sandbox/gemini/`
-  instead wraps Google's own real sandbox image directly, the same
-  pattern as Claude. What still hasn't been verified: the real
-  Claude/opencode/Gemini ACP adapter completing a real prompt inside
-  these images (needs real credentials, unavailable when this was
-  tested), and opencode's actual VPN-bound Ollama endpoint reachability
-  from inside the container (a live, per-machine question — see
-  `sandbox/opencode/README.md`). See `chorus-spec.md` §0's 2026-08-26
-  entries for the full account, including two real bugs found and fixed
-  along the way: the Claude image's base `node:20` not satisfying
-  `@anthropic-ai/claude-code`'s own `engines.node >= 22` requirement, and
-  a stdout-corrupting firewall-script output bug that would have broken
-  every sandboxed agent's ACP handshake unconditionally (fixed in all
-  three images).
+- **Sandboxing (2026-08-26/27): confirmed working end-to-end for
+  Claude, Gemini, and opencode's free-tier backend, on a real machine,
+  with real ACP handshakes — not just the underlying mechanism.** A live
+  run of `./chorus --agents=agents.yaml.sandbox.<os>` completed real
+  `initialize` handshakes for all three sandboxed agents (`commands`
+  showed each one's actual advertised slash-command list) and a real
+  prompt against sandboxed opencode completed successfully. Getting here
+  found and fixed four real bugs along the way (none guessed — each
+  root-caused with live evidence first): a Claude base-image Node
+  version mismatch; a stdout-corrupting firewall-script bug that would
+  have broken every sandboxed agent's handshake unconditionally; Gemini
+  CLI's own `GEMINI_SANDBOX=docker` sandboxing being fundamentally
+  incompatible with `--acp` mode (fixed by wrapping Google's real
+  sandbox image directly instead); and an `EROFS` crash from mounting
+  Gemini's OAuth credential directory read-only (fixed by mounting it
+  read-write instead — a deliberate, documented tradeoff). opencode's
+  free-tier backend needed one more fix: its firewall shipped with no
+  LLM backend domain baked in until the real one
+  (`opencode.ai`) was confirmed live and added. See `chorus-spec.md`
+  §0's 2026-08-26/27 entries for the full diagnostic trail. **Still
+  open**: opencode's actual VPN-bound Ollama endpoint reachability (a
+  different, harder deployment than the free-tier case just verified) —
+  the `CHORUS_SANDBOX_ALLOW_HOSTS` extension mechanism itself is proven
+  working, but whether Rancher Desktop's backend VM can route to a
+  specific corporate VPN is still an untested, per-machine question (see
+  `sandbox/opencode/README.md`).

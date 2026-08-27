@@ -50,11 +50,22 @@ shell you launch chorus from)
 
 **Credentials**: run `gemini` interactively once, outside any
 container, to complete the OAuth browser flow if you haven't already.
-Mount the resulting credential directory read-only into the container:
+Mount the resulting credential directory — **NOT read-only**:
 
 ```sh
--v {{ENV:HOME}}/.gemini:/home/node/.gemini:ro
+-v {{ENV:HOME}}/.gemini:/home/node/.gemini
 ```
+
+**Read-only was tried first and confirmed broken (2026-08-27, live)**:
+gemini's `OAuth2Client` tries to write back to `oauth_creds.json` after
+loading it (`cacheCredentials` in `@google/gemini-cli-core`), and a
+`:ro` mount makes that write fail with `EROFS` — an unhandled promise
+rejection visible in gemini's own debug output
+(`DEBUG=true`). Switching to a read-write mount was the fix that
+actually unblocked the ACP handshake. This is a real, deliberate
+tradeoff: a sandboxed Gemini can now modify your real host OAuth
+credential file — not a pure filesystem sandbox for this one path, but
+the alternative is Gemini never completing authentication at all.
 
 **Known limitation, not yet resolved**: if your OAuth credentials are
 stored in your OS's keychain/keyring service rather than the plain
@@ -77,7 +88,7 @@ chorus IS the sandbox invocation now, not Gemini's own internal one.
 - name: gemini
   spawn: ["docker", "run", "--rm", "-i", "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
           "-v", "{{CWD}}:/workspace",
-          "-v", "{{ENV:HOME}}/.gemini:/home/node/.gemini:ro",
+          "-v", "{{ENV:HOME}}/.gemini:/home/node/.gemini",
           "-e", "GOOGLE_CLOUD_PROJECT",
           "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
           "chorus-gemini-sandbox", "--acp"]
@@ -102,6 +113,15 @@ Same checklist as `sandbox/claude/README.md`: workspace mount works,
 nothing outside it is reachable, `curl https://example.com` (or any
 unrelated host) is blocked, and — the thing this whole image exists to
 fix — a real ACP `initialize` handshake through chorus actually
-completes instead of hanging. That last part is the one genuinely new
-thing to confirm here versus Claude/opencode's images, since it's the
-specific failure this image was built to route around.
+completes instead of hanging.
+
+**All of the above CONFIRMED LIVE end-to-end (2026-08-27)**: with the
+read-write `.gemini` mount, `./chorus --agents=agents.yaml.sandbox.linux`
+completed real ACP handshakes for all three sandboxed agents (Claude,
+Gemini, opencode) — `commands` showed each agent's real advertised
+slash-command list, confirming Gemini's `initialize` genuinely
+completed, not just that a container started. This was the last unknown
+in the whole sandboxing feature; see `chorus-spec.md` §0's 2026-08-27
+entries for the full diagnostic trail (blocking-stdin-read deadlock in
+Gemini's own relaunch mechanism, the EROFS credential-write bug, and how
+each was actually found and fixed, not guessed).

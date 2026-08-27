@@ -194,16 +194,25 @@ agents:
   #   GOOGLE_CLOUD_PROJECT=<project>   (bare -e below, set in your shell)
   # Run `gemini` interactively once, outside any container, to complete
   # the OAuth browser flow if you haven't already, then mount the
-  # resulting credentials read-only. KNOWN LIMITATION: if your OAuth
-  # creds are stored in an OS keychain/keyring rather than the plain
-  # ~/.gemini/oauth_creds.json file, this mount alone won't carry the
-  # actual secret in — most likely to work as-is on a Linux machine with
-  # no desktop keyring daemon running (see sandbox/gemini/README.md).
+  # resulting credentials — NOT read-only (see below). KNOWN LIMITATION:
+  # if your OAuth creds are stored in an OS keychain/keyring rather than
+  # the plain ~/.gemini/oauth_creds.json file, this mount alone won't
+  # carry the actual secret in — most likely to work as-is on a Linux
+  # machine with no desktop keyring daemon running (see
+  # sandbox/gemini/README.md).
+  #
+  # Mounted READ-WRITE, not :ro (2026-08-27, confirmed live — see
+  # chorus-spec.md §0): gemini's OAuth2Client tries to write back to
+  # oauth_creds.json after loading it (cacheCredentials in
+  # @google/gemini-cli-core), and a :ro mount makes that write fail with
+  # EROFS — an unhandled promise rejection in gemini's own code. A
+  # sandboxed gemini can therefore modify your real host OAuth credential
+  # file; this is a real, deliberate tradeoff, not an oversight.
   - name: gemini
     spawn: ["docker", "run", "--rm", "-i",
             "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
             "-v", "{{CWD}}:/workspace",
-            "-v", "{{ENV:HOME}}/.gemini:/home/node/.gemini:ro",
+            "-v", "{{ENV:HOME}}/.gemini:/home/node/.gemini",
             "-e", "GOOGLE_CLOUD_PROJECT",
             "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
             "matamagu/chorus-gemini-sandbox", "--acp"]
@@ -220,17 +229,17 @@ agents:
   # Sandboxed (2026-08-26, sandbox/opencode/ — no official image exists,
   # so this is fully custom): runs inside chorus-opencode-sandbox. Build
   # first: docker build -t chorus-opencode-sandbox sandbox/opencode/
-  # This deployment points opencode at a self-run Ollama endpoint
-  # reachable only over the company VPN — set CHORUS_SANDBOX_ALLOW_HOSTS
-  # (bare `-e NAME`, pulled from chorus's own process environment, e.g.
-  # "ollama.internal.company.com:11434") in the shell you run chorus.exe
-  # from. Read sandbox/opencode/README.md before assuming this "just
-  # works": the allowlist only controls what the CONTAINER may reach —
-  # whether the Docker host can route to the VPN at all is a separate,
-  # live, per-machine question. Verify without VPN first (point
-  # CHORUS_SANDBOX_ALLOW_HOSTS at something publicly reachable) to
-  # isolate "does the sandbox mechanism work" from "can it reach the
-  # VPN-bound endpoint."
+  # opencode.ai (its free-tier "Zen" backend) is baked into the base
+  # firewall allowlist (confirmed live 2026-08-27 — a real sandboxed
+  # prompt against it worked end-to-end through chorus) — no
+  # CHORUS_SANDBOX_ALLOW_HOSTS needed for the default free-tier case.
+  # If you instead point opencode at a private endpoint (e.g. a self-run
+  # Ollama server reachable only over a VPN), set CHORUS_SANDBOX_ALLOW_HOSTS
+  # (bare `-e NAME`, pulled from chorus's own process environment) in the
+  # shell you run chorus.exe from — read sandbox/opencode/README.md
+  # first: the allowlist only controls what the CONTAINER may reach,
+  # whether the Docker host can route to a VPN at all is a separate,
+  # live, per-machine question.
   - name: opencode
     spawn: ["docker", "run", "--rm", "-i",
             "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",

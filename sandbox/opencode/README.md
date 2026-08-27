@@ -13,15 +13,16 @@ the ACP process is exec'd.
 docker build -t chorus-opencode-sandbox sandbox/opencode/
 ```
 
-## Auth / backend — this deployment's real setup is harder than the default
+## Auth / backend
 
-This project has previously used opencode's zero-config free-tier
-fallback (`providerID=opencode`, `model=big-pickle`) — no
-`CHORUS_SANDBOX_ALLOW_HOSTS` needed beyond the built-in GitHub/npm base
-for that case, though the exact backend domain(s) aren't confirmed by
-research and should be discovered from real blocked-traffic output the
-first time this runs (the firewall script logs what it resolves; check
-`docker logs` if a prompt fails to reach a model).
+opencode's zero-config free-tier fallback (`providerID=opencode`,
+`model=big-pickle` and friends — "OpenCode Zen") works out of the box:
+`opencode.ai` is baked into the base firewall allowlist (confirmed live
+2026-08-27 — opencode's own docs put the API at
+`https://opencode.ai/zen/v1/...`, not a separate `api.opencode.ai`
+subdomain as originally guessed; a real sandboxed prompt against it was
+verified working end-to-end through chorus). No
+`CHORUS_SANDBOX_ALLOW_HOSTS` needed for this case at all.
 
 **This deployment instead points opencode at a self-run Ollama endpoint,
 reachable only over the company VPN** — set:
@@ -76,12 +77,13 @@ Recommended order, given the VPN dependency above — isolate "does the
 sandbox mechanism work at all" from "can it reach the VPN-bound
 endpoint" as two separate questions:
 
-1. **First, without VPN**: point `CHORUS_SANDBOX_ALLOW_HOSTS` at
-   opencode's ordinary free-tier backend (or leave it unset and see what
-   the firewall log says it needed), confirm the base mechanism —
-   read/write inside `/workspace` works, nothing outside it is
-   reachable, an unrelated host (`curl https://example.com`) is blocked,
-   a real prompt completes.
+1. **First, without VPN**: run against opencode's free-tier backend
+   with `CHORUS_SANDBOX_ALLOW_HOSTS` unset (it's baked into the base
+   allowlist now), confirm the base mechanism — read/write inside
+   `/workspace` works, nothing outside it is reachable, an unrelated
+   host (`curl https://example.com`) is blocked, a real prompt completes
+   (all confirmed live 2026-08-27, including a real prompt through
+   chorus itself).
 2. **Then, connected to VPN**: switch to the real Ollama endpoint and
    confirm a real prompt completes against it. If it doesn't, work
    through the three checks above before assuming the image itself is

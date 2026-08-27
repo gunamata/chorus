@@ -2,15 +2,18 @@
 # Default-deny egress firewall — same mechanism as sandbox/claude/'s
 # (adapted from Anthropic's own reference), tailored for opencode.
 #
-# Base allowlist covers only GitHub (git/gh operations) and npm's
-# registry (installing a project's own dependencies) — deliberately NOT
-# including any LLM backend domain, since unlike Claude/Gemini there's
-# no single confirmed default here: this deployment points opencode at a
-# self-run Ollama endpoint reachable only over the company VPN, a
-# different setup than opencode's public free-tier backend used
-# elsewhere in this project. Set CHORUS_SANDBOX_ALLOW_HOSTS to whichever
-# applies (comma-separated; an optional ":port" suffix is accepted and
-# ignored — this firewall allowlists by destination IP, not port).
+# Base allowlist covers GitHub (git/gh operations), npm's registry
+# (installing a project's own dependencies), and opencode.ai — opencode's
+# own "Zen" free-tier backend (confirmed live 2026-08-27, correcting an
+# earlier "we don't know the exact domain" placeholder: opencode's own
+# docs put the API at https://opencode.ai/zen/v1/..., not a separate
+# api.opencode.ai subdomain as originally guessed). This covers the
+# common case (opencode's public free tier, zero configured credentials)
+# out of the box. A deployment pointing opencode at something else
+# instead — this project's own self-run Ollama endpoint, reachable only
+# over the company VPN — still needs CHORUS_SANDBOX_ALLOW_HOSTS set
+# (comma-separated; an optional ":port" suffix is accepted and ignored —
+# this firewall allowlists by destination IP, not port).
 #
 # Note: this only controls what the CONTAINER is allowed to reach. If
 # the backend is VPN-bound, Rancher Desktop's own backend VM (WSL2 on
@@ -85,11 +88,12 @@ add_domain() {
     done < <(echo "$ips")
 }
 
-add_domain "registry.npmjs.org"
+for domain in "registry.npmjs.org" "opencode.ai"; do
+    add_domain "$domain"
+done
 
-# Deployment-specific: the self-run Ollama endpoint (or opencode's own
-# free-tier backend, for a deployment not using a private endpoint) —
-# never baked into the image itself.
+# Deployment-specific: a self-run Ollama endpoint (or any other
+# non-default backend) — never baked into the image itself.
 if [ -n "${CHORUS_SANDBOX_ALLOW_HOSTS:-}" ]; then
     IFS=',' read -ra extra_hosts <<< "$CHORUS_SANDBOX_ALLOW_HOSTS"
     for host in "${extra_hosts[@]}"; do
@@ -98,8 +102,6 @@ if [ -n "${CHORUS_SANDBOX_ALLOW_HOSTS:-}" ]; then
         [ -z "$host" ] && continue
         add_domain "$host"
     done
-else
-    echo "WARNING: CHORUS_SANDBOX_ALLOW_HOSTS is unset — opencode will only be able to reach GitHub and npm. Set it to your Ollama endpoint (or opencode's free-tier backend) or every prompt will fail to reach a model."
 fi
 
 HOST_IP=$(ip route | grep default | cut -d" " -f3)
