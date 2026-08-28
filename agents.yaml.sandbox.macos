@@ -232,17 +232,24 @@ agents:
   # firewall allowlist (confirmed live 2026-08-27 — a real sandboxed
   # prompt against it worked end-to-end through chorus) — no
   # CHORUS_SANDBOX_ALLOW_HOSTS needed for the default free-tier case.
-  # If you instead point opencode at a private endpoint (e.g. a self-run
-  # Ollama server reachable only over a VPN), set CHORUS_SANDBOX_ALLOW_HOSTS
-  # (bare `-e NAME`, pulled from chorus's own process environment) in the
-  # shell you run chorus.exe from — read sandbox/opencode/README.md
-  # first: the allowlist only controls what the CONTAINER may reach,
-  # whether Rancher Desktop's backend VM (Lima, on macOS) can route to a
-  # VPN at all is a separate, live, per-machine question.
+  # This deployment instead points opencode at a self-run Ollama endpoint
+  # over the company VPN, configured via a GLOBAL opencode config
+  # (~/.config/opencode/...), not a project-local one — that means it's
+  # NOT covered by the {{CWD}} workspace mount below and needs its own
+  # mount (confirmed live 2026-08-27), read-only since no auth/write-back
+  # is needed for a config-only file (unlike Gemini's OAuth credential
+  # file, which does need write access — see that entry's comment).
+  # Also set CHORUS_SANDBOX_ALLOW_HOSTS to the endpoint's hostname (bare
+  # `-e NAME`, pulled from chorus's own process environment) in the shell
+  # you run chorus.exe from. Read sandbox/opencode/README.md first: the
+  # allowlist only controls what the CONTAINER may reach — whether
+  # Rancher Desktop's backend VM (Lima, on macOS) can route to a VPN at
+  # all is a separate, live, per-machine question.
   - name: opencode
     spawn: ["docker", "run", "--rm", "-i",
             "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
             "-v", "{{CWD}}:/workspace",
+            "-v", "{{ENV:HOME}}/.config/opencode:/home/node/.config/opencode:ro",
             "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
             "matamagu/chorus-opencode-sandbox"]
     workdir: /workspace
