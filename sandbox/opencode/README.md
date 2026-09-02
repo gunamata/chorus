@@ -31,9 +31,18 @@ reachable only over the company VPN** — set:
 -e CHORUS_SANDBOX_ALLOW_HOSTS=ollama.internal.company.com:11434
 ```
 
-(the `:11434` is accepted but ignored — this firewall allowlists by
+ (the `:11434` is accepted but ignored — this firewall allowlists by
 destination IP, not port; only the hostname is actually resolved and
 added).
+
+**If the VPN isn't connected at container start, the host is skipped
+with a warning (not a crash).** `init-firewall.sh` resolves each
+`CHORUS_SANDBOX_ALLOW_HOSTS` entry; an entry that fails to resolve — a
+VPN-only endpoint while the VPN is down — logs a `WARNING` and the
+container still boots. The entry is simply absent from the egress
+allowlist until it resolves, so opencode can't reach that backend until
+the VPN (and thus the name) is available again. To use the endpoint,
+connect the VPN and restart the container so the IP gets added.
 
 **This is the hardest, least-guaranteed part of the whole sandboxing
 feature — read before assuming it will just work.** The firewall

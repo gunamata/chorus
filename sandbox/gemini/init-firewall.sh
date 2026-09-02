@@ -65,27 +65,87 @@ while read -r cidr; do
     ipset add allowed-domains "$cidr"
 done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
+# add_domain DOMAIN [STRICT]
+# Resolves DOMAIN and adds its A records to the allowlist. STRICT (base
+# allowlist): any failure aborts. Non-strict (user-supplied hosts): a host
+# that fails to resolve — e.g. a VPN-only endpoint while the VPN isn't
+# connected — is a warning, and the container keeps starting.
+# Google serves its API endpoints (aiplatform / oauth2 / accounts /
+# cloudcode-pa .googleapis.com, ...) from a large, per-query-rotating
+# frontend IP pool, so the one-shot A-record snapshot add_domain takes
+# below routinely misses the IP the agent resolves at request time — an
+# intermittent default-deny drop that surfaces as "API Error: Unable to
+# connect". add_google_ranges adds Google's own published netblocks
+# (goog.json) instead, the same approach already used for GitHub above,
+# covering the whole pool. Fetched at most once, lazily, the first time any
+# Google host is added (a no-op for deployments that never touch Google,
+# e.g. opencode). Purely additive and best-effort: a fetch failure warns
+# and leaves the per-host snapshot in place rather than aborting the
+# container (same "don't crash on a transient" spirit as the non-strict
+# host path) — never worse than not having this at all.
+GOOGLE_RANGES_ADDED=""
+add_google_ranges() {
+    [ -n "$GOOGLE_RANGES_ADDED" ] && return 0
+    GOOGLE_RANGES_ADDED=1
+    echo "Fetching Google IP ranges (goog.json)..."
+    local goog
+    goog=$(curl -s https://www.gstatic.com/ipranges/goog.json || true)
+    if [ -z "$goog" ] || ! echo "$goog" | jq -e '.prefixes' >/dev/null 2>&1; then
+        echo "WARNING: Failed to fetch Google IP ranges — falling back to per-host DNS snapshot only"
+        return 0
+    fi
+    echo "Processing Google IPs..."
+    while read -r cidr; do
+        [[ "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]] || continue
+        ipset add allowed-domains "$cidr" 2>/dev/null || true
+    done < <(echo "$goog" | jq -r '.prefixes[].ipv4Prefix // empty' | aggregate -q)
+    echo "Google IP ranges added"
+}
+
 add_domain() {
     local domain="$1"
-    echo "Resolving $domain..."
+    local strict="${2:-}"
     local ips
+    # A Google-backed host (Vertex, OAuth, Code Assist) needs Google's full
+    # published ranges, not just this one snapshot — see add_google_ranges.
+    case "$domain" in
+        *.googleapis.com|*.google.com|googleapis.com|google.com)
+            add_google_ranges ;;
+    esac
+    echo "Resolving $domain..."
     ips=$(dig +noall +answer A "$domain" | awk '$4 == "A" {print $5}')
     if [ -z "$ips" ]; then
-        echo "ERROR: Failed to resolve $domain"
-        exit 1
+        if [ "$strict" = "strict" ]; then
+            echo "ERROR: Failed to resolve $domain"
+            exit 1
+        fi
+        echo "WARNING: Failed to resolve $domain — skipping (it will become allowed once it resolves, e.g. once the VPN is up)"
+        return 0
     fi
+    local bad_ips=""
     while read -r ip; do
         if [[ ! "$ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
-            echo "ERROR: Invalid IP from DNS for $domain: $ip"
-            exit 1
+            if [ "$strict" = "strict" ]; then
+                echo "ERROR: Invalid IP from DNS for $domain: $ip"
+                exit 1
+            fi
+            bad_ips="$bad_ips $ip"
+            continue
         fi
         echo "Adding $ip for $domain"
         ipset add allowed-domains "$ip" 2>/dev/null || true
     done < <(echo "$ips")
+    if [ -n "$bad_ips" ]; then
+        if [ "$strict" = "strict" ]; then
+            echo "ERROR: Invalid IP from DNS for $domain:$bad_ips"
+            exit 1
+        fi
+        echo "WARNING: Skipping invalid IP for $domain:$bad_ips"
+    fi
 }
 
 for domain in "registry.npmjs.org" "oauth2.googleapis.com" "accounts.google.com" "cloudcode-pa.googleapis.com"; do
-    add_domain "$domain"
+    add_domain "$domain" strict
 done
 
 # Deployment-specific additions (e.g. Vertex AI's regional endpoint, if
