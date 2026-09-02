@@ -136,10 +136,22 @@ type Connection struct {
 	// rather than just tolerated or rejected. Populated by Connect.
 	SupportsImagePrompts bool
 
+	cwd    string
 	cmd    *exec.Cmd
 	conn   *acp.ClientSideConnection
 	client *acpclient.Client
 }
+
+// Cwd is the cwd every session opened on this connection should use — the
+// spec's EffectiveCwd computed once at Connect time (spec.WorkDir for a
+// sandboxed agent, i.e. the in-container mount point like "/workspace";
+// the real host cwd otherwise). Any code opening a sub-session on this
+// connection (the LLM router's decision sub-session, the delegate hub)
+// MUST use this rather than the raw host cwd: a sandboxed agent's ACP
+// server accepts a nonexistent host cwd at session/new but then fails the
+// first session/prompt with a generic "-32603 Internal error" (found
+// live), silently breaking that whole feature for any containerized agent.
+func (c *Connection) Cwd() string { return c.cwd }
 
 // Connect starts the agent subprocess and performs the ACP initialize
 // handshake. It does not create a session yet — call NewSession or
@@ -204,6 +216,7 @@ func Connect(ctx context.Context, spec Spec, cwd string, outputCh chan<- bus.Upd
 		Name:                 spec.Name,
 		SupportsLoadSession:  initResp.AgentCapabilities.LoadSession,
 		SupportsImagePrompts: initResp.AgentCapabilities.PromptCapabilities.Image,
+		cwd:                  spec.EffectiveCwd(cwd),
 		cmd:                  cmd,
 		conn:                 conn,
 		client:               client,

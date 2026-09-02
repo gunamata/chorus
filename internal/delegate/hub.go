@@ -81,7 +81,6 @@ type Hub struct {
 	token    string
 	listener net.Listener
 	server   *http.Server
-	cwd      string
 	coll     *Collectors
 	logCh    chan<- LogEntry
 	conns    map[string]*session.Connection
@@ -93,7 +92,7 @@ type Hub struct {
 // before agent sessions are created, but agent sessions must exist before
 // they're useful delegation targets, so construction and wiring are two
 // steps.
-func NewHub(cwd string, coll *Collectors, logCh chan<- LogEntry) (*Hub, error) {
+func NewHub(coll *Collectors, logCh chan<- LogEntry) (*Hub, error) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, fmt.Errorf("delegate hub: listen: %w", err)
@@ -106,7 +105,6 @@ func NewHub(cwd string, coll *Collectors, logCh chan<- LogEntry) (*Hub, error) {
 	h := &Hub{
 		token:    tok,
 		listener: l,
-		cwd:      cwd,
 		coll:     coll,
 		logCh:    logCh,
 		conns:    make(map[string]*session.Connection),
@@ -239,7 +237,10 @@ func (h *Hub) doDelegate(ctx context.Context, req delegateRequest) (string, erro
 	if !ok {
 		return "", fmt.Errorf("unknown agent %q", req.Agent)
 	}
-	sub, err := conn.NewSession(ctx, h.cwd, nil)
+	// conn.Cwd(), not a hub-wide host cwd: a sandboxed target agent needs
+	// its own in-container mount point (e.g. "/workspace"), or session/prompt
+	// fails "-32603" — see Connection.Cwd's doc comment.
+	sub, err := conn.NewSession(ctx, conn.Cwd(), nil)
 	if err != nil {
 		return "", err
 	}

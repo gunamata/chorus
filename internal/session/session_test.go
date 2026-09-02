@@ -23,6 +23,18 @@ func TestSpec_EffectiveCwd_UsesWorkDirWhenSet(t *testing.T) {
 	}
 }
 
+// Cwd() is the value sub-session creators (the LLM router's decision
+// sub-session, the delegate hub) must use instead of the raw host cwd, so
+// a sandboxed agent gets its in-container mount point — Connect wires it
+// from spec.EffectiveCwd(cwd). The wiring in Connect itself needs a live
+// subprocess (see above); the accessor contract is pure logic.
+func TestConnection_Cwd_ReturnsEffectiveCwd(t *testing.T) {
+	c := &Connection{cwd: "/workspace"}
+	if got := c.Cwd(); got != "/workspace" {
+		t.Errorf("Cwd() = %q, want /workspace", got)
+	}
+}
+
 func TestSubstituteTokens_ReplacesCwdToken(t *testing.T) {
 	got := substituteTokens([]string{"run", "-v", "{{CWD}}:/workspace", "image"}, `C:\chorus`)
 	want := []string{"run", "-v", `C:\chorus:/workspace`, "image"}

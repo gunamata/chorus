@@ -135,7 +135,7 @@ func run(fresh bool, agentsOverride string) error {
 	// agents; with exactly one, no mcpServers are attached anywhere and
 	// the hub simply never receives a call.
 	coll := delegate.NewCollectors()
-	hub, err := delegate.NewHub(cwd, coll, delegateLogCh)
+	hub, err := delegate.NewHub(coll, delegateLogCh)
 	if err != nil {
 		return fmt.Errorf("start delegate hub: %w", err)
 	}

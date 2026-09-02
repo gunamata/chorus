@@ -1070,7 +1070,13 @@ func (m Model) startRouteDecision(text string) (tea.Model, tea.Cmd) {
 	contextText := m.activityContext(m.routing.ContextLevelOrDefault())
 	m.appendLine(fmt.Sprintf("[routing] asking %s to decide...\n", m.routing.DecisionAgent))
 	m.syncViewport()
-	return m, runRouteDecision(m.ctx, conn, m.coll, m.cwd, agents, m.defaultAgent, contextText, text, reqID, m.routing.DecisionTimeout())
+	// The decision sub-session must be opened with the decision agent's OWN
+	// effective cwd (conn.Cwd() — the in-container mount point like
+	// "/workspace" for a sandboxed agent), NOT the raw host cwd. See
+	// Connection.Cwd's doc comment: passing m.cwd silently broke every
+	// routing decision to a containerized decision agent (session/new
+	// accepts the bad cwd, then session/prompt fails "-32603").
+	return m, runRouteDecision(m.ctx, conn, m.coll, conn.Cwd(), agents, m.defaultAgent, contextText, text, reqID, m.routing.DecisionTimeout())
 }
 
 // handleRouteDecision resolves a routeDecisionMsg: picks the target agent
