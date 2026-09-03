@@ -162,15 +162,21 @@ type Model struct {
 	commands     map[string][]acp.AvailableCommand
 	stats        agentStats
 
-	// activity is a bounded, merged-by-turn log of what's happened in the
-	// interactive session — the mechanical (no extra LLM call) backing for
-	// all three routing.ContextLevel tiers (chorus-spec.md §0's 2026-08-25
-	// entry): "prompt" skips it, "digest" takes the last few entries,
-	// "full" takes the whole (still capped) thing. Also what a cross-agent
-	// handoff preamble is built from. lastRoutedAgent is which agent most
-	// recently received a prompt, by ANY dispatch path (explicit prefix,
-	// slash command, or LLM routing decision) — used to detect an actual
-	// agent switch worth a handoff, regardless of how the switch happened.
+	// activity is a merged-by-turn log of what's happened in the interactive
+	// session — the mechanical (no extra LLM call) backing for all three
+	// routing.ContextLevel tiers (chorus-spec.md §0's 2026-08-25 entry):
+	// "prompt" skips it, "digest" takes the last few entries (truncated,
+	// cheap), "full" takes the whole thing within a char budget. Entries are
+	// stored near-verbatim (activityEntryCap is high, only a memory
+	// backstop); truncation is applied at RENDER, per tier — so the two jobs
+	// this log serves stay decoupled: the router's decision prompt stays
+	// small (digest), while a cross-agent handoff, which is built from the
+	// "full" tier, carries the real prior work. Found live: at the old flat
+	// 1000-char/entry cap a handoff dropped everything past ~Phase 1 of a
+	// plan the previous agent had written. lastRoutedAgent is which agent
+	// most recently received a prompt, by ANY dispatch path (explicit
+	// prefix, slash command, or LLM routing decision) — used to detect an
+	// actual agent switch worth a handoff, regardless of how it happened.
 	activity        []activityEntry
 	lastRoutedAgent string
 	// nextDecisionID tags each async routing-decision call so its
@@ -1186,15 +1192,32 @@ func (m *Model) recordDispatch(agent, text string) {
 	m.lastRoutedAgent = agent
 }
 
-// activityLogCap/activityDigestN/activityEntryCap bound Model.activity —
-// see its doc comment. Entry count (not chunk count, thanks to
-// appendActivity's merge-by-key behavior) is bounded so "full" context
-// still can't grow unboundedly on a very long session, which would
-// undercut the whole reason a cheaper "digest" tier exists.
+// These bound Model.activity and how each tier renders it. The design
+// separates two jobs the log serves with opposite needs (learned live —
+// see Model.activity's doc comment): storing turns faithfully (so a handoff
+// can carry real work), vs. keeping the router's per-turn decision prompt
+// cheap. Storage is near-verbatim; truncation moved to RENDER, per tier.
+//
+//   - activityLogCap:        max entries retained (merged-by-turn, so this
+//     is turns, not streamed chunks); oldest dropped past it.
+//   - activityEntryCap:      per-entry STORAGE cap — high, only to bound a
+//     single pathological turn's memory, not to shrink real content (this
+//     is what used to be 1000 and silently ate multi-phase plans on
+//     handoff — "only Phase 1 survived").
+//   - activityDigestN:       entries the cheap "digest" tier renders.
+//   - activityDigestEntryCap: per-entry cap applied when RENDERING the
+//     digest tier — keeps the router's decision prompt small even though
+//     entries are now stored near-verbatim.
+//   - activityHandoffBudget: total char budget the "full" tier (what a
+//     cross-agent handoff is built from) renders within, oldest entries
+//     dropped first — complete enough to continue the work, bounded enough
+//     not to blow the receiving agent's context window.
 const (
-	activityLogCap   = 60
-	activityDigestN  = 8
-	activityEntryCap = 1000
+	activityLogCap         = 60
+	activityDigestN        = 8
+	activityEntryCap       = 16000
+	activityDigestEntryCap = 500
+	activityHandoffBudget  = 48000
 )
 
 // appendActivity records one turn's worth of activity, merging into the
@@ -1220,32 +1243,69 @@ func (m *Model) appendActivity(key, text string) {
 	}
 }
 
-func formatActivity(entries []activityEntry) string {
+// formatActivity renders entries as "[key] text" lines. perEntryCap > 0
+// truncates each entry's text at render time (the cheap digest tier uses
+// this to keep the router's decision prompt small even though entries are
+// now stored near-verbatim); totalBudget > 0 keeps only the most recent
+// entries whose combined rendered size fits the budget, oldest dropped
+// first (the handoff transcript stays complete for recent work without
+// risking the receiving agent's context window). 0 disables either cap.
+func formatActivity(entries []activityEntry, perEntryCap, totalBudget int) string {
+	if totalBudget > 0 {
+		entries = trimToBudget(entries, totalBudget)
+	}
 	var b strings.Builder
 	for _, e := range entries {
-		fmt.Fprintf(&b, "[%s] %s\n", e.key, e.text)
+		text := e.text
+		if perEntryCap > 0 && len(text) > perEntryCap {
+			text = text[:perEntryCap] + "..."
+		}
+		fmt.Fprintf(&b, "[%s] %s\n", e.key, text)
 	}
 	return b.String()
 }
 
+// trimToBudget returns the longest suffix of entries whose combined
+// rendered cost fits budget, dropping oldest first. The most recent entry
+// is always included even if it alone exceeds the budget — sending a single
+// oversized latest turn beats sending nothing on a handoff. The +4 per
+// entry approximates the "[] \n" framing formatActivity adds.
+func trimToBudget(entries []activityEntry, budget int) []activityEntry {
+	if len(entries) == 0 {
+		return entries
+	}
+	total := 0
+	start := len(entries)
+	for i := len(entries) - 1; i >= 0; i-- {
+		cost := len(entries[i].key) + len(entries[i].text) + 4
+		if i < len(entries)-1 && total+cost > budget {
+			break
+		}
+		total += cost
+		start = i
+	}
+	return entries[start:]
+}
+
 // activityContext renders Model.activity at the given tier — "prompt"
-// (nothing), "digest" (the last activityDigestN entries — the cheap,
-// mechanical default: no extra LLM call, so the router doesn't undercut
-// its own cost-saving purpose by default), or "full" (everything still
-// retained, capped by activityLogCap). Unrecognized levels fall back to
-// "digest".
+// (nothing), "digest" (the last activityDigestN entries, each truncated to
+// activityDigestEntryCap: the cheap, mechanical default that keeps the
+// router's per-turn decision prompt small), or "full" (every retained entry
+// untruncated, within activityHandoffBudget — what a cross-agent handoff is
+// built from, so a switch carries real prior work, not a 1000-char stub).
+// Unrecognized levels fall back to "digest".
 func (m Model) activityContext(level string) string {
 	switch level {
 	case "prompt":
 		return ""
 	case "full":
-		return formatActivity(m.activity)
+		return formatActivity(m.activity, 0, activityHandoffBudget)
 	default:
 		n := activityDigestN
 		if n > len(m.activity) {
 			n = len(m.activity)
 		}
-		return formatActivity(m.activity[len(m.activity)-n:])
+		return formatActivity(m.activity[len(m.activity)-n:], activityDigestEntryCap, 0)
 	}
 }
 

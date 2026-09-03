@@ -1143,6 +1143,64 @@ func TestModel_ActivityContext_Tiers(t *testing.T) {
 	}
 }
 
+// A long prior turn (a multi-phase plan) must survive a handoff intact —
+// the exact regression that motivated storing near-verbatim and budgeting
+// at render, instead of the old flat 1000-char/entry cap that dropped
+// everything past "Phase 1" the moment another agent picked the work up.
+func TestModel_ActivityContext_FullTierCarriesLongPriorTurn(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	plan := "Phase 1: scaffold. " + strings.Repeat("Phase N: more detail. ", 300) + "Phase Final: ship it."
+	if len(plan) <= 1000 {
+		t.Fatalf("test plan is only %d chars — it must exceed the old 1000-char cap to be meaningful", len(plan))
+	}
+	m.appendActivity("agent:gemini", plan)
+
+	full := m.activityContext("full")
+	if !strings.Contains(full, "Phase Final: ship it.") {
+		t.Fatal("activityContext(\"full\") dropped the end of a long prior turn — a handoff would lose everything past the start")
+	}
+}
+
+// The digest tier (what the router reads to decide) truncates each entry at
+// render so a long stored turn doesn't inflate every routing decision — the
+// "keep the router cheap" half of decoupling storage fidelity from render.
+func TestModel_ActivityContext_DigestTruncatesLongEntryToStayCheap(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendActivity("agent:gemini", strings.Repeat("x", 5000))
+
+	digest := m.activityContext("digest")
+	if len(digest) > activityDigestEntryCap+200 {
+		t.Fatalf("digest render = %d chars, want it truncated near activityDigestEntryCap (%d) so routing stays cheap", len(digest), activityDigestEntryCap)
+	}
+	if !strings.Contains(digest, "...") {
+		t.Fatal("digest render of a long entry has no truncation marker — it wasn't capped")
+	}
+}
+
+// The full tier holds its render within activityHandoffBudget, dropping the
+// oldest entries first while always keeping the most recent — so a very long
+// session's handoff can't blow the receiving agent's context window, yet
+// still carries the freshest work.
+func TestModel_ActivityContext_FullTierBudgetDropsOldestKeepsNewest(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	big := strings.Repeat("y", 5000)
+	n := activityHandoffBudget/5000 + 5 // enough entries to overflow the budget
+	for i := 0; i < n; i++ {
+		m.appendActivity(fmt.Sprintf("agent:claude:%d", i), fmt.Sprintf("START-%d-%s", i, big))
+	}
+
+	full := m.activityContext("full")
+	if len(full) > activityHandoffBudget+6000 {
+		t.Fatalf("full render = %d chars, want it held within activityHandoffBudget (%d)", len(full), activityHandoffBudget)
+	}
+	if !strings.Contains(full, fmt.Sprintf("START-%d-", n-1)) {
+		t.Fatal("full render dropped the most recent entry — budget trimming must keep newest")
+	}
+	if strings.Contains(full, "START-0-") {
+		t.Fatal("full render still contains the oldest entry — budget trimming should drop oldest first")
+	}
+}
+
 func TestModel_StartRouteDecision_FallsBackSynchronouslyWhenDecisionAgentNotConnected(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
 	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "claude"})
