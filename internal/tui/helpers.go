@@ -218,20 +218,25 @@ type pendingRoute struct {
 //     command / internal/router for the latter, layered on top of this
 //     function from its caller, not inside it.)
 //
-// Returns the agent that actually received a prompt (empty if none did —
-// on failure, or when ask is non-nil and nothing's been sent yet) and the
-// exact text sent to it (which for the "<agent>: text" form is the part
-// after the colon, not the raw line) — the caller uses these to echo
-// what was actually asked via render.FormatUserPrompt, since ACP has no
-// mechanism for that to come back from the agent itself on a live turn.
-// Also returns any informational text to display (may be "") and, if
-// a slash command was ambiguous, a non-nil pendingRoute the caller should
-// prompt for and later resolve via queuePrompt once the user answers.
+// Returns the agent that should receive the prompt (empty if none should —
+// on a usage/lookup error, or when ask/decisionReq is non-nil and the turn
+// isn't resolved yet) and the exact text to send it (which for the
+// "<agent>: text" form is the part after the colon, not the raw line) — the
+// caller queues it (via Model.dispatchUserTurn) and echoes what was asked
+// via render.FormatUserPrompt, since ACP has no mechanism for that to come
+// back from the agent itself on a live turn. isPrompt distinguishes a
+// free-text turn (true — eligible for a handoff preamble when it switches
+// agents) from a slash command (false — a control command, never
+// preamble-wrapped). Also returns any informational text to display (may be
+// "") and, if a slash command was ambiguous, a non-nil pendingRoute the
+// caller should prompt for and later resolve once the user answers.
 //
-// Unlike the line-based REPL this was ported from, dispatch never prints
-// directly — bubbletea owns the terminal, so every informational message
-// is returned as text for Update() to append as a block instead.
-func dispatch(line string, workers map[string]*AgentWorker, defaultAgent string, routing policy.Routing, commands map[string][]acp.AvailableCommand) (agent, sentText, msg string, ask *pendingRoute, decisionReq *decisionRequest) {
+// dispatch itself never queues or prints: bubbletea owns the terminal, and
+// the handoff preamble needs Model state (lastRoutedAgent, the activity
+// log) this free function doesn't have — so the single queue/echo/record
+// choke point lives on the Model (dispatchUserTurn), and dispatch only
+// resolves the destination.
+func dispatch(line string, workers map[string]*AgentWorker, defaultAgent string, routing policy.Routing, commands map[string][]acp.AvailableCommand) (agent, sentText string, isPrompt bool, msg string, ask *pendingRoute, decisionReq *decisionRequest) {
 	if a, rest, ok := strings.Cut(line, ":"); ok {
 		a = strings.TrimSpace(a)
 		rest = strings.TrimSpace(rest)
@@ -242,27 +247,21 @@ func dispatch(line string, workers map[string]*AgentWorker, defaultAgent string,
 		// including "llm" — an explicit ask always wins.
 		if a != "" && !strings.ContainsAny(a, " \t") {
 			if rest == "" {
-				return "", "", fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
+				return "", "", false, fmt.Sprintf("usage: <agent>: <text>  (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
 			}
 			if !knownAgent(a, workers) {
-				return "", "", fmt.Sprintf("unknown agent %q (agents: %s)", a, strings.Join(agentNames(workers), ", ")), nil, nil
+				return "", "", false, fmt.Sprintf("unknown agent %q (agents: %s)", a, strings.Join(agentNames(workers), ", ")), nil, nil
 			}
-			if errMsg := queuePrompt(a, rest, workers); errMsg != "" {
-				return "", "", errMsg, nil, nil
-			}
-			return a, rest, "", nil, nil
+			return a, rest, true, "", nil, nil
 		}
 	}
 
 	if strings.HasPrefix(line, "/") {
 		if owners := commandOwners(commands, line); len(owners) > 0 {
 			if len(owners) == 1 {
-				if errMsg := queuePrompt(owners[0], line, workers); errMsg != "" {
-					return "", "", errMsg, nil, nil
-				}
-				return owners[0], line, fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), nil, nil
+				return owners[0], line, false, fmt.Sprintf("(/%s -> %s)", commandName(line), owners[0]), nil, nil
 			}
-			return "", "", "", &pendingRoute{text: line, candidates: owners}, nil
+			return "", "", false, "", &pendingRoute{text: line, candidates: owners}, nil
 		}
 		// No agent has advertised this command (yet, or at all) — fall
 		// through to ordinary routing below rather than erroring; it
@@ -273,16 +272,13 @@ func dispatch(line string, workers map[string]*AgentWorker, defaultAgent string,
 		// Resolved asynchronously by the caller (Model.startRouteDecision)
 		// — an LLM decision requires a real agent turn, which must never
 		// block Model.Update (concurrency invariant #1).
-		return "", "", "", nil, &decisionRequest{text: line}
+		return "", "", false, "", nil, &decisionRequest{text: line}
 	}
 
 	if defaultAgent == "" || !knownAgent(defaultAgent, workers) {
-		return "", "", fmt.Sprintf("no default agent configured or connected — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
+		return "", "", false, fmt.Sprintf("no default agent configured or connected — use \"<agent>: text\" (agents: %s)", strings.Join(agentNames(workers), ", ")), nil, nil
 	}
-	if errMsg := queuePrompt(defaultAgent, line, workers); errMsg != "" {
-		return "", "", errMsg, nil, nil
-	}
-	return defaultAgent, line, "", nil, nil
+	return defaultAgent, line, true, "", nil, nil
 }
 
 // decisionRequest signals that dispatch couldn't resolve a prompt

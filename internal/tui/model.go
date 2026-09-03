@@ -938,12 +938,9 @@ func (m Model) handleRouteAnswer(line string) (tea.Model, tea.Cmd) {
 		m.syncViewport()
 		return m, nil
 	}
-	if msg := queuePrompt(agent, m.pendingRoute.text, m.workers); msg != "" {
-		m.appendLine(msg + "\n")
-	} else {
-		m.appendLine(m.renderer.FormatUserPrompt(agent, m.pendingRoute.text))
-		m.recordDispatch(agent, m.pendingRoute.text)
-	}
+	// A slash command (isPrompt=false) — never handoff-wrapped, but still
+	// funneled through the shared choke point for consistent echo/record.
+	m.dispatchUserTurn(agent, m.pendingRoute.text, false)
 	m.pendingRoute = nil
 	m.routeMenuIndex = -1
 	m.syncViewport()
@@ -1016,17 +1013,12 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	agent, sentText, msg, ask, decisionReq := dispatch(line, m.workers, m.defaultAgent, m.routing, m.commands)
+	agent, sentText, isPrompt, msg, ask, decisionReq := dispatch(line, m.workers, m.defaultAgent, m.routing, m.commands)
 	if msg != "" {
 		m.appendLine(msg + "\n")
 	}
 	if agent != "" {
-		// Echo what was actually asked — ACP never sends this back on a
-		// live turn (only on session/load history replay), so without
-		// this the only thing that ever appeared was the reply, with no
-		// way to tell which reply answered which question. Found live.
-		m.appendLine(m.renderer.FormatUserPrompt(agent, sentText))
-		m.recordDispatch(agent, sentText)
+		m.dispatchUserTurn(agent, sentText, isPrompt)
 	}
 	if ask != nil {
 		m.pendingRoute = ask
@@ -1054,12 +1046,7 @@ func (m Model) startRouteDecision(text string) (tea.Model, tea.Cmd) {
 		// connected) — don't cost a timeout on a call that can't succeed;
 		// fall back to defaultAgent synchronously, same as routing "off".
 		m.appendLine(fmt.Sprintf("routing.decision_agent %q isn't connected — falling back to %s\n", m.routing.DecisionAgent, m.defaultAgent))
-		if errMsg := queuePrompt(m.defaultAgent, text, m.workers); errMsg != "" {
-			m.appendLine(errMsg + "\n")
-		} else {
-			m.appendLine(m.renderer.FormatUserPrompt(m.defaultAgent, text))
-			m.recordDispatch(m.defaultAgent, text)
-		}
+		m.dispatchUserTurn(m.defaultAgent, text, true)
 		m.syncViewport()
 		return m, nil
 	}
@@ -1115,16 +1102,7 @@ func (m Model) handleRouteDecision(msg routeDecisionMsg) (tea.Model, tea.Cmd) {
 		// at all, believed to be the common case, not the exception).
 	}
 
-	promptText := msg.prompt
-	if m.lastRoutedAgent != "" && m.lastRoutedAgent != target {
-		promptText = buildHandoffPreamble(m.lastRoutedAgent, m.activityContext("full")) + "\n\n" + msg.prompt
-	}
-	if errMsg := queuePrompt(target, promptText, m.workers); errMsg != "" {
-		m.appendLine(errMsg + "\n")
-	} else {
-		m.appendLine(m.renderer.FormatUserPrompt(target, msg.prompt))
-		m.recordDispatch(target, msg.prompt)
-	}
+	m.dispatchUserTurn(target, msg.prompt, true)
 	m.syncViewport()
 	return m, nil
 }
@@ -1161,6 +1139,41 @@ func formatContextLevelMenu(cursor int) string {
 	}
 	b.WriteString("↑/↓ + enter, or type a number/name\n")
 	return b.String()
+}
+
+// dispatchUserTurn queues one resolved user turn to target, echoing it and
+// recording it in the activity log exactly like every successful dispatch
+// path does. When isPrompt is true (free text, not a slash command) and
+// this turn switches away from the agent that handled the previous one, it
+// prepends a one-time handoff preamble so the newly-selected agent — which
+// runs on its own isolated ACP session with no memory of the prior turns —
+// still gets the conversation so far as context. This is the single choke
+// point every switch-capable path funnels through (explicit "<agent>:"
+// prefix and routing "off" via handleNormalLine, the LLM router via
+// handleRouteDecision, its fallback via startRouteDecision), so the preamble
+// behaves identically no matter how the switch was triggered. Slash
+// commands (isPrompt false) are control commands, never preamble-wrapped —
+// prepending conversational context to a "/compact" or "/model" would only
+// confuse the command.
+//
+// The echo and activity record always use the raw text, never the
+// preamble-wrapped prompt — the preamble is scaffolding for the agent, not
+// something to show the user or replay as prior context on the next switch.
+func (m *Model) dispatchUserTurn(target, text string, isPrompt bool) {
+	promptText := text
+	if isPrompt && m.lastRoutedAgent != "" && m.lastRoutedAgent != target {
+		promptText = buildHandoffPreamble(m.lastRoutedAgent, m.activityContext("full")) + "\n\n" + text
+	}
+	if errMsg := queuePrompt(target, promptText, m.workers); errMsg != "" {
+		m.appendLine(errMsg + "\n")
+		return
+	}
+	// Echo what was actually asked — ACP never sends this back on a live
+	// turn (only on session/load history replay), so without this the only
+	// thing that ever appeared was the reply, with no way to tell which
+	// reply answered which question. Found live.
+	m.appendLine(m.renderer.FormatUserPrompt(target, text))
+	m.recordDispatch(target, text)
 }
 
 // recordDispatch appends the just-sent prompt to the activity log and

@@ -1273,6 +1273,85 @@ func TestModel_HandleRouteDecision_HandoffPreambleOnAgentSwitch(t *testing.T) {
 	}
 }
 
+// An explicit "<agent>: text" switch gets the same handoff preamble the LLM
+// router's switches do — the newly-selected agent has its own isolated ACP
+// session and no memory of the prior turns regardless of HOW it was
+// selected, so the context has to travel either way.
+func TestModel_ExplicitSwitch_HandoffPreambleOnAgentSwitch(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "opencode"
+	m.appendActivity("agent:opencode", "opencode did some earlier work")
+
+	m, _ = enterWithInput(m, "claude: continue the task")
+
+	select {
+	case blocks := <-workers["claude"].in:
+		text := blocks[0].Text.Text
+		if !strings.Contains(text, "automated handoff context from chorus") {
+			t.Fatalf("queued text = %q, want the self-identifying handoff preamble", text)
+		}
+		if !strings.Contains(text, "opencode did some earlier work") {
+			t.Fatalf("queued text = %q, want the prior activity included", text)
+		}
+		if !strings.Contains(text, "continue the task") {
+			t.Fatalf("queued text = %q, want the actual prompt still present", text)
+		}
+	default:
+		t.Fatal("claude never received the handed-off prompt")
+	}
+	if m.lastRoutedAgent != "claude" {
+		t.Fatalf("lastRoutedAgent = %q, want claude after the switch", m.lastRoutedAgent)
+	}
+	// The echo shows the user their bare prompt, not the preamble scaffolding.
+	if strings.Contains(m.viewport.View(), "automated handoff context from chorus") {
+		t.Fatal("viewport shows the handoff preamble — it should only go to the agent, not be echoed to the user")
+	}
+}
+
+func TestModel_ExplicitSwitch_NoHandoffWhenSameAgentContinues(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "claude"
+
+	m, _ = enterWithInput(m, "claude: keep going")
+
+	select {
+	case blocks := <-workers["claude"].in:
+		if blocks[0].Text.Text != "keep going" {
+			t.Fatalf("queued text = %q, want the bare prompt with no handoff preamble when the agent didn't change", blocks[0].Text.Text)
+		}
+	default:
+		t.Fatal("claude never received the prompt")
+	}
+}
+
+// A slash command routed to a different agent is a control command, not a
+// conversational turn — it must NOT be wrapped in a handoff preamble (that
+// would corrupt the command the agent parses).
+func TestModel_SlashCommandSwitch_NoHandoffPreamble(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.lastRoutedAgent = "opencode"
+	m.appendActivity("agent:opencode", "opencode did some earlier work")
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+
+	m, _ = enterWithInput(m, "/plan the migration")
+
+	select {
+	case blocks := <-workers["claude"].in:
+		text := blocks[0].Text.Text
+		if strings.Contains(text, "automated handoff context from chorus") {
+			t.Fatalf("queued text = %q, want the bare slash command with no handoff preamble", text)
+		}
+		if text != "/plan the migration" {
+			t.Fatalf("queued text = %q, want the slash command sent verbatim", text)
+		}
+	default:
+		t.Fatal("claude never received the slash command")
+	}
+}
+
 func TestModel_HandleRouteDecision_ModelSwitchQueuesTwoTurnsInOrder(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker()}
 	m := newTestModel(t, workers, policy.Routing{})

@@ -314,7 +314,7 @@ func containsPath(s, substr string) bool {
 
 func TestDispatch_UnprefixedPromptGoesToDefaultAgent(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
-	agent, sentText, msg, ask, decisionReq := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
+	agent, sentText, isPrompt, msg, ask, decisionReq := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
 	if ask != nil {
 		t.Fatal("ask != nil, want a direct dispatch, not a routeAsk prompt")
 	}
@@ -327,22 +327,24 @@ func TestDispatch_UnprefixedPromptGoesToDefaultAgent(t *testing.T) {
 	if sentText != "list all the markdown files" {
 		t.Fatalf("sentText = %q, want the original prompt text", sentText)
 	}
+	if !isPrompt {
+		t.Fatal("isPrompt = false, want true — an unprefixed free-text turn is preamble-eligible")
+	}
 	if msg != "" {
 		t.Fatalf("msg = %q, want no informational message on the ordinary path", msg)
 	}
+	// dispatch resolves the destination but no longer queues — the Model
+	// (dispatchUserTurn) owns queuing so it can apply the handoff preamble.
 	select {
 	case blocks := <-workers["opencode"].in:
-		if len(blocks) != 1 || blocks[0].Text == nil {
-			t.Fatalf("opencode's queued blocks = %+v, unexpected shape", blocks)
-		}
+		t.Fatalf("opencode received %+v — dispatch must not queue anything itself", blocks)
 	default:
-		t.Fatal("opencode never received the prompt")
 	}
 }
 
 func TestDispatch_ErrorsWhenDefaultAgentNotConnected(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker()} // opencode not connected
-	agent, _, msg, ask, _ := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
+	agent, _, _, msg, ask, _ := dispatch("list all the markdown files", workers, "opencode", policy.Routing{}, nil)
 	if agent != "" {
 		t.Fatalf("agent = %q, want empty — default agent isn't connected", agent)
 	}
@@ -356,7 +358,7 @@ func TestDispatch_ErrorsWhenDefaultAgentNotConnected(t *testing.T) {
 
 func TestDispatch_ErrorsWhenDefaultAgentUnconfigured(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
-	agent, _, msg, ask, _ := dispatch("anything", workers, "", policy.Routing{}, nil)
+	agent, _, _, msg, ask, _ := dispatch("anything", workers, "", policy.Routing{}, nil)
 	if agent != "" {
 		t.Fatalf("agent = %q, want empty — no default_agent configured at all", agent)
 	}
@@ -373,7 +375,7 @@ func TestDispatch_ExplicitAgentOverrideIsNeverSilentlyRerouted(t *testing.T) {
 	// explicit "<agent>: text" override must still fail outright, never
 	// silently reroute to a different agent than the one asked for.
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
-	agent, _, msg, ask, _ := dispatch("gemini: do something", workers, "opencode", policy.Routing{}, nil)
+	agent, _, _, msg, ask, _ := dispatch("gemini: do something", workers, "opencode", policy.Routing{}, nil)
 	if agent != "" {
 		t.Fatalf("agent = %q, want empty — an explicit override to an unconnected agent must fail, not silently reroute", agent)
 	}
@@ -394,7 +396,7 @@ func TestDispatch_LLMRoutingModeReturnsDecisionRequestInstead(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
 	routing := policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "opencode"}
 
-	agent, _, msg, ask, decisionReq := dispatch("do something", workers, "opencode", routing, nil)
+	agent, _, _, msg, ask, decisionReq := dispatch("do something", workers, "opencode", routing, nil)
 	if agent != "" {
 		t.Fatalf("agent = %q, want empty — an LLM routing decision resolves asynchronously, not inside dispatch", agent)
 	}
@@ -420,7 +422,7 @@ func TestDispatch_ExplicitPrefixBypassesLLMRoutingMode(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker()}
 	routing := policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "claude"}
 
-	agent, sentText, _, _, decisionReq := dispatch("claude: fix this", workers, "claude", routing, nil)
+	agent, sentText, _, _, _, decisionReq := dispatch("claude: fix this", workers, "claude", routing, nil)
 	if decisionReq != nil {
 		t.Fatal("decisionReq != nil, want nil — an explicit prefix must bypass the LLM router entirely")
 	}
