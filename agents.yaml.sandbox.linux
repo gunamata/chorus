@@ -152,6 +152,7 @@ agents:
             "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
             "-v", "{{CWD}}:/workspace",
             "-v", "{{ENV:HOME}}/.config/gcloud:/home/node/.config/gcloud:ro",
+            "-v", "{{ENV:HOME}}/.claude:/home/node/.claude",
             "-e", "CLAUDE_CODE_USE_VERTEX=1",
             "-e", "CLOUD_ML_REGION",
             "-e", "ANTHROPIC_VERTEX_PROJECT_ID",
