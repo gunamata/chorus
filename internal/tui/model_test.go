@@ -1481,3 +1481,216 @@ func TestModel_ContextCommand_OpensMenuArrowSelectsAndSetsLevel(t *testing.T) {
 		t.Fatalf("viewport.View() = %q, want confirmation of the new level", m.viewport.View())
 	}
 }
+
+// --- Esc-to-interrupt (selectInterruptTargets / busyAgentNames) ---------
+
+func TestSelectInterruptTargets_PrefersLastRoutedWhenBusy(t *testing.T) {
+	got := selectInterruptTargets([]string{"claude", "opencode"}, "opencode")
+	if len(got) != 1 || got[0] != "opencode" {
+		t.Fatalf("selectInterruptTargets = %v, want [opencode] (the busy last-routed agent alone)", got)
+	}
+}
+
+func TestSelectInterruptTargets_FallsBackToAllBusyWhenLastRoutedIdleOrUnset(t *testing.T) {
+	got := selectInterruptTargets([]string{"claude", "opencode"}, "gemini")
+	if len(got) != 2 || got[0] != "claude" || got[1] != "opencode" {
+		t.Fatalf("selectInterruptTargets = %v, want [claude opencode] since lastRouted (gemini) isn't among the busy agents", got)
+	}
+
+	got = selectInterruptTargets([]string{"claude"}, "")
+	if len(got) != 1 || got[0] != "claude" {
+		t.Fatalf("selectInterruptTargets = %v, want [claude] when lastRouted is unset", got)
+	}
+}
+
+func TestSelectInterruptTargets_EmptyBusyReturnsEmpty(t *testing.T) {
+	if got := selectInterruptTargets(nil, "claude"); len(got) != 0 {
+		t.Fatalf("selectInterruptTargets = %v, want empty when nothing is busy", got)
+	}
+}
+
+func TestModel_BusyAgentNames_ReturnsOnlyBusyOnesInRegistryOrder(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker(), "opencode": newWorker(), "gemini": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}, {Name: "opencode"}, {Name: "gemini"}}
+
+	if got := m.busyAgentNames(); len(got) != 0 {
+		t.Fatalf("busyAgentNames() = %v, want empty when no worker is busy", got)
+	}
+
+	workers["gemini"].busy.Store(true)
+	workers["claude"].busy.Store(true)
+	got := m.busyAgentNames()
+	if len(got) != 2 || got[0] != "claude" || got[1] != "gemini" {
+		t.Fatalf("busyAgentNames() = %v, want [claude gemini] in registry order, not busy-call order", got)
+	}
+}
+
+func TestModel_InterruptBusyAgents_NoOpWhenNothingIsBusy(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+
+	// Must not panic even though the test worker has no real session.AgentSession
+	// backing it (newWorker() leaves sess nil) — interruptBusyAgents should
+	// never reach AgentWorker.Cancel when busyAgentNames() is empty.
+	updated := m.interruptBusyAgents()
+	if len(updated.blocks) != len(m.blocks) {
+		t.Fatalf("interruptBusyAgents() on an idle model changed the document (%d -> %d blocks), want no-op", len(m.blocks), len(updated.blocks))
+	}
+}
+
+func TestModel_EscKeyInterruptsOnlyInNormalMode(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+
+	// modeNormal, nothing busy: Esc must be handled (not fall through to the
+	// textarea, which would insert nothing anyway, but confirms the KeyEsc
+	// case is actually wired up) and must not panic.
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+	if m.mode() != modeNormal {
+		t.Fatalf("mode() = %v after Esc with nothing pending, want modeNormal", m.mode())
+	}
+}
+
+// --- click-drag selection + copy-on-select (extractSelection / handleMouse) ---
+
+func TestExtractSelection_SingleLine(t *testing.T) {
+	doc := "alpha\nbeta\ngamma"
+	text, n, ok := extractSelection(doc, 1, 1)
+	if !ok || n != 1 || text != "beta" {
+		t.Fatalf("extractSelection(doc,1,1) = (%q,%d,%v), want (\"beta\",1,true)", text, n, ok)
+	}
+}
+
+func TestExtractSelection_RangeIsOrderIndependent(t *testing.T) {
+	doc := "alpha\nbeta\ngamma\ndelta"
+	forward, nf, okf := extractSelection(doc, 1, 2)
+	backward, nb, okb := extractSelection(doc, 2, 1)
+	if !okf || !okb || forward != backward || nf != nb {
+		t.Fatalf("extractSelection forward=(%q,%d,%v) backward=(%q,%d,%v), want equal regardless of drag direction", forward, nf, okf, backward, nb, okb)
+	}
+	if forward != "beta\ngamma" {
+		t.Fatalf("extractSelection(doc,1,2) = %q, want \"beta\\ngamma\"", forward)
+	}
+}
+
+func TestExtractSelection_ClampsOutOfRangeIndices(t *testing.T) {
+	doc := "alpha\nbeta"
+	text, n, ok := extractSelection(doc, -5, 50)
+	if !ok || n != 2 || text != "alpha\nbeta" {
+		t.Fatalf("extractSelection(doc,-5,50) = (%q,%d,%v), want the whole clamped doc", text, n, ok)
+	}
+}
+
+func TestExtractSelection_StripsANSI(t *testing.T) {
+	doc := "\x1b[31mred\x1b[0m line"
+	text, n, ok := extractSelection(doc, 0, 0)
+	if !ok || n != 1 || text != "red line" {
+		t.Fatalf("extractSelection with ANSI codes = (%q,%d,%v), want (\"red line\",1,true) — copied text must be plain", text, n, ok)
+	}
+}
+
+// stubClipboard replaces writeClipboard for the duration of a test so
+// copy-on-select tests never touch the real OS clipboard (see
+// writeClipboard's doc comment) — captures the last text written, or
+// returns a configured error.
+func stubClipboard(t *testing.T, err error) *string {
+	t.Helper()
+	orig := writeClipboard
+	var got string
+	writeClipboard = func(text string) error {
+		got = text
+		return err
+	}
+	t.Cleanup(func() { writeClipboard = orig })
+	return &got
+}
+
+func TestModel_HandleMouse_PressDragReleaseCopiesSelection(t *testing.T) {
+	got := stubClipboard(t, nil)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendLine("one\n")
+	m.appendLine("two\n")
+	m.appendLine("three\n")
+	m.syncViewport()
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Y: 0, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	if !m.selecting {
+		t.Fatal("selecting = false after a left-button press inside the viewport, want true")
+	}
+
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion})
+	m = updated.(Model)
+	if m.selectCurLine != m.selectAnchorLine+1 {
+		t.Fatalf("selectCurLine = %d, want anchor+1 (%d) after dragging down one row", m.selectCurLine, m.selectAnchorLine+1)
+	}
+
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease})
+	m = updated.(Model)
+	if m.selecting {
+		t.Fatal("selecting = true after release, want false")
+	}
+	if *got != "one\ntwo" {
+		t.Fatalf("clipboard received %q, want \"one\\ntwo\"", *got)
+	}
+	if m.lastCopyStatus != "2 lines copied" {
+		t.Fatalf("lastCopyStatus = %q, want \"2 lines copied\"", m.lastCopyStatus)
+	}
+}
+
+func TestModel_HandleMouse_PressOutsideViewportDoesNotSelect(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Y: m.viewport.Height + 5, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	if m.selecting {
+		t.Fatal("selecting = true after a press below the viewport (in the status/input area), want false")
+	}
+}
+
+func TestModel_HandleMouse_WheelEventsStillReachViewport(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	for i := 0; i < 30; i++ {
+		m.appendLine(fmt.Sprintf("line %d\n", i))
+	}
+	m.syncViewport()
+	m.viewport.GotoTop()
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Button: tea.MouseButtonWheelDown, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	if m.viewport.YOffset == 0 {
+		t.Fatal("YOffset unchanged after a wheel-down event, want it forwarded to viewport.Update and to scroll")
+	}
+	if m.selecting {
+		t.Fatal("selecting = true after a wheel event, want false (only left-button drags select)")
+	}
+}
+
+func TestModel_CopySelection_ClipboardErrorSetsStatusInsteadOfPanicking(t *testing.T) {
+	stubClipboard(t, fmt.Errorf("no clipboard utility found"))
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendLine("one\n")
+	m.syncViewport()
+	m.selectAnchorLine, m.selectCurLine = 0, 0
+
+	m = m.copySelection()
+	if !strings.Contains(m.lastCopyStatus, "copy failed") {
+		t.Fatalf("lastCopyStatus = %q, want it to report the clipboard error", m.lastCopyStatus)
+	}
+}
+
+func TestClampInt(t *testing.T) {
+	if got := clampInt(5, 0, 10); got != 5 {
+		t.Fatalf("clampInt(5,0,10) = %d, want 5", got)
+	}
+	if got := clampInt(-1, 0, 10); got != 0 {
+		t.Fatalf("clampInt(-1,0,10) = %d, want 0", got)
+	}
+	if got := clampInt(20, 0, 10); got != 10 {
+		t.Fatalf("clampInt(20,0,10) = %d, want 10", got)
+	}
+}

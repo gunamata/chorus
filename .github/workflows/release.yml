@@ -1,0 +1,177 @@
+name: Release
+
+# Two triggers:
+#   - push a tag matching v*.*.* (e.g. `git tag v0.1.0 && git push origin v0.1.0`)
+#     -> builds everything and publishes automatically, no other step needed.
+#   - workflow_dispatch, for re-running a release (e.g. Docker Hub creds were
+#     wrong the first time) without needing to delete/re-push the tag. The
+#     `tag` input must match an existing tag; `push_docker` defaults true but
+#     can be set false to dry-run just the binary/release side.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re-)release, e.g. v0.1.0"
+        required: true
+      push_docker:
+        description: "Also build & push sandbox Docker images"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolves the tag/version once so every other job agrees on it, instead of
+  # each job re-deriving `github.event.inputs.tag || github.ref_name`
+  # independently and risking drift.
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ver.outputs.tag }}
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - id: ver
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  # Cross-compiled from a single Linux runner for every target — chorus and
+  # everything it depends on (bubbletea/lipgloss/glamour/atotto-clipboard/...)
+  # is pure Go with no cgo, confirmed by grepping for `import "C"` across the
+  # module graph before relying on this, so CGO_ENABLED=0 cross-compilation
+  # is safe rather than assumed.
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: 0
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          OUT=chorus
+          if [ "${{ matrix.goos }}" = "windows" ]; then OUT=chorus.exe; fi
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${{ needs.prepare.outputs.version }} -X main.commit=${{ github.sha }} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "dist/$OUT" .
+
+      - name: Package
+        run: |
+          set -euo pipefail
+          NAME="chorus_${{ needs.prepare.outputs.version }}_${{ matrix.goos }}_${{ matrix.goarch }}"
+          cd dist
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            zip "../$NAME.zip" chorus.exe
+          else
+            tar -czf "../$NAME.tar.gz" chorus
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: chorus_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: |
+            chorus_*.tar.gz
+            chorus_*.zip
+          if-no-files-found: error
+
+  # Creates (or updates, on a workflow_dispatch re-run) the GitHub Release
+  # for this tag and attaches every platform archive plus a checksums file —
+  # this is the "downloadable assets" step install.sh/install.ps1 pull from.
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum chorus_* > checksums.txt
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
+
+  # Builds and pushes the three sandbox images (see sandbox/*/README.md) to
+  # Docker Hub under the matamagu namespace — the same
+  # matamagu/chorus-<agent>-sandbox naming agents.yaml.sandbox.* already
+  # reference. Requires DOCKERHUB_USERNAME/DOCKERHUB_TOKEN repo secrets
+  # (Settings -> Secrets and variables -> Actions); a Docker Hub *access
+  # token* (Account Settings -> Security -> New Access Token), not your
+  # account password.
+  #
+  # Gemini's image is linux/amd64 only, deliberately not matched to
+  # claude/opencode's linux/amd64+arm64: it's FROM Google's own
+  # us-docker.pkg.dev/gemini-code-dev/gemini-cli/sandbox image, and whether
+  # that base even publishes an arm64 manifest has never been confirmed —
+  # building it under qemu emulation against an unconfirmed base would risk
+  # silently shipping a broken arm64 tag rather than fail loudly. Revisit
+  # once that's checked.
+  docker:
+    needs: prepare
+    if: github.event_name == 'push' || github.event.inputs.push_docker == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - agent: claude
+            platforms: linux/amd64,linux/arm64
+          - agent: opencode
+            platforms: linux/amd64,linux/arm64
+          - agent: gemini
+            platforms: linux/amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: sandbox/${{ matrix.agent }}
+          platforms: ${{ matrix.platforms }}
+          push: true
+          tags: |
+            matamagu/chorus-${{ matrix.agent }}-sandbox:latest
+            matamagu/chorus-${{ matrix.agent }}-sandbox:${{ needs.prepare.outputs.version }}

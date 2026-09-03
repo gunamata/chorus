@@ -58,6 +58,34 @@ Windows Smart App Control is blocking it (Settings > Windows Security
 silently reject unsigned local binaries. See chorus-spec.md §0 for
 what this looks like when it happens.
 
+## Install
+
+Prebuilt binaries are published to
+[GitHub Releases](https://github.com/gunamata/chorus/releases) for
+macOS, Linux, and Windows (amd64 + arm64) on every tagged release — see
+[Releases & publishing](#releases--publishing) for how those get built.
+
+macOS / Linux:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gunamata/chorus/main/install.sh | sh
+```
+
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/gunamata/chorus/main/install.ps1 | iex
+```
+
+Both scripts detect your OS/arch, download the matching release archive,
+verify its checksum, and install `chorus`/`chorus.exe` onto your PATH
+(`$HOME/.local/bin` or `/usr/local/bin` on macOS/Linux,
+`%LOCALAPPDATA%\chorus\bin` on Windows — override with
+`CHORUS_INSTALL_DIR`). Pass `CHORUS_VERSION=vX.Y.Z` (env var on macOS/
+Linux, `$env:CHORUS_VERSION` on Windows) to install a specific version
+instead of the latest release. Run `chorus --version` afterward to
+confirm.
+
 ## Build
 
 ```sh
@@ -118,12 +146,22 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   down) if you've scrolled up to read something while agents keep
   streaming (except a permission/routeAsk menu, which always forces the
   view back down to itself — it needs an answer before anything else can
-  proceed, so it isn't allowed to scroll out of sight). Mouse wheel
-  support means chorus captures plain click-drag too — to select/copy
-  text natively, hold your terminal's override modifier while dragging
-  (**Shift+drag** on Windows Terminal; check your terminal's docs if
-  that doesn't work for yours, since not every terminal supports the
-  same override).
+  proceed, so it isn't allowed to scroll out of sight).
+- **Click-drag to select and copy text.** Mouse wheel support means
+  chorus, not your terminal, owns plain click-drag — so instead of
+  leaving that dead, chorus implements copy-on-select itself, the same
+  approach Claude Code CLI's own fullscreen UI takes: dragging over one
+  or more lines and releasing copies the selected lines (whole lines,
+  not partial — a deliberate line-level tradeoff) straight to your
+  system clipboard, with a brief "N lines copied" confirmation. If you'd
+  rather have your terminal's own native selection instead (e.g. for
+  exact character/column ranges), set `CHORUS_DISABLE_MOUSE=1` before
+  starting chorus — this gives up mouse-wheel scrolling (PgUp/PgDn/
+  ctrl+u/ctrl+d keep working) in exchange for the terminal handling
+  click-drag itself again. Without that env var, your terminal's own
+  override modifier (commonly **Shift+drag**, e.g. on Windows Terminal)
+  may still reach past chorus's mouse capture too, depending on the
+  terminal.
 - **The input box is multi-line** and wraps long text instead of
   scrolling sideways forever. Press **ctrl+j** for a new line within the
   same prompt (Enter always submits). `Home`/`End` (and, for the same
@@ -144,9 +182,17 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   `cancel` — both work interchangeably, even in the same prompt. The
   routeAsk agent-choice menu (ambiguous auto-routing, or an ambiguous
   slash command) works the same way.
+- **`Esc` interrupts the current turn** without ending the session —
+  sends ACP's own `session/cancel` for whichever agent you're most
+  likely watching (the one most recently dispatched, if it's still
+  busy; otherwise every currently-busy agent), so a wrong or overly
+  long request doesn't force you to kill the whole program the way
+  `ctrl+c` does. The busy-status line above the input box shows
+  "(esc to interrupt)" whenever it's actually actionable.
 - `quit` / `exit` / `ctrl+c` cleanly end every session, kill the
   subprocesses, and restore your terminal (leaves the alt-screen,
-  cursor visible).
+  cursor visible). Unlike `Esc`, this ends every agent's session at once
+  — reach for `Esc` first if you only want to stop one running turn.
 - Full reasoning/thinking text is **hidden by default** — while an agent
   is thinking you see a brief `[agent] ⠋ Pondering…`-style indicator (a
   random word from a small set, spinner-animated, the same idea as
@@ -631,6 +677,46 @@ comment on which env vars to set), loaded via
 registry](#agent-registry-agentsyaml)) instead of the default
 `./chorus.exe`.
 
+## Releases & publishing
+
+`.github/workflows/release.yml` builds and publishes everything on a
+tag push matching `v*.*.*` (e.g. `git tag v0.2.0 && git push origin
+v0.2.0`):
+
+- **Binaries** for `linux`/`darwin`/`windows` × `amd64`/`arm64` (6
+  archives total — cross-compiled from a single Linux runner, since
+  chorus and its dependencies are pure Go with no cgo), packaged as
+  `.tar.gz` (macOS/Linux) or `.zip` (Windows), plus a `checksums.txt` —
+  all attached as downloadable assets on a GitHub Release the workflow
+  creates automatically for the tag. This is what [Install](#install)'s
+  `install.sh`/`install.ps1` download from.
+- **Sandbox Docker images** (see [Sandboxing](#sandboxing-containers)),
+  built and pushed to Docker Hub as `matamagu/chorus-claude-sandbox`,
+  `matamagu/chorus-gemini-sandbox`, and `matamagu/chorus-opencode-sandbox`,
+  each tagged both `latest` and the release version. Claude/opencode
+  publish for `linux/amd64` + `linux/arm64`; Gemini's image is
+  `linux/amd64` only, since it's built on Google's own sandbox base image
+  and whether that base publishes an `arm64` manifest has never been
+  confirmed.
+
+**One-time setup before the Docker push half will work**: add
+`DOCKERHUB_USERNAME` and `DOCKERHUB_TOKEN` as repo secrets (Settings ->
+Secrets and variables -> Actions). `DOCKERHUB_TOKEN` should be a Docker
+Hub *access token* (Docker Hub -> Account Settings -> Security -> New
+Access Token), not your account password. The binary/release half of
+the workflow needs no extra setup — it only uses the default
+`GITHUB_TOKEN`.
+
+To re-run a release (e.g. Docker Hub credentials were wrong the first
+time) without re-pushing the tag, use the workflow's `workflow_dispatch`
+trigger from the Actions tab with the existing tag name — it has a
+`push_docker` toggle to skip the Docker half if you only need to fix the
+binary assets.
+
+`chorus --version` prints the version/commit/build-date stamped in by
+`-ldflags` at release build time (`dev`/`none`/`unknown` for a plain
+`go build .` from source).
+
 ## Session persistence
 
 Quit chorus and come back later — `claude:`/`opencode:` prompts pick up
@@ -799,6 +885,23 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   terminal restoration on quit) — see `chorus-spec.md` §0's most recent
   entry and `CLAUDE.md`'s Known open issues before assuming this is
   fully verified.
+- **Esc-to-interrupt and click-drag copy-on-select (2026-09) are unit-
+  tested only, not yet watched live** — same PTY-less tool-invocation-
+  environment caveat as the rest of the bubbletea TUI above. Worth
+  specifically confirming on a real terminal: `Esc` actually stops a
+  real in-flight agent turn rather than just sending the notification
+  and having the agent ignore it (`session/cancel` behavior is entirely
+  up to the agent — ACP doesn't guarantee an early stop, just that the
+  request was sent), and that a click-drag selection lines up with what
+  you'd visually expect to have highlighted, including across a
+  scrolled/streaming viewport.
+- **No checkpointing/rewind** (Claude Code CLI's `/rewind`, double-Esc,
+  restore code/conversation/both) — deliberately out of scope for this
+  pass, not an oversight. It's a materially larger feature (durable
+  per-turn snapshots, a restore UI, deciding what "restore" even means
+  across N independently-running agent sessions rather than one) than
+  the other gaps closed alongside it; worth a dedicated design pass of
+  its own if it turns out to matter to real usage.
 - **Sandboxing (2026-08-26/27): confirmed working end-to-end for
   Claude, Gemini, and opencode's free-tier backend, on a real machine,
   with real ACP handshakes — not just the underlying mechanism.** A live
@@ -818,10 +921,10 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   free-tier backend needed one more fix: its firewall shipped with no
   LLM backend domain baked in until the real one
   (`opencode.ai`) was confirmed live and added. See `chorus-spec.md`
-  §0's 2026-08-26/27 entries for the full diagnostic trail. **Still
-  open**: opencode's actual VPN-bound Ollama endpoint reachability (a
-  different, harder deployment than the free-tier case just verified) —
-  the `CHORUS_SANDBOX_ALLOW_HOSTS` extension mechanism itself is proven
-  working, but whether Rancher Desktop's backend VM can route to a
-  specific corporate VPN is still an untested, per-machine question (see
-  `sandbox/opencode/README.md`).
+  §0's 2026-08-26/27 entries for the full diagnostic trail. **Resolved
+  (2026-09)**: opencode's VPN-bound Ollama endpoint reachability — the
+  actual fix was making `init-firewall.sh`'s DNS resolution non-strict
+  for `CHORUS_SANDBOX_ALLOW_HOSTS` entries, since the earlier hard
+  failure on an unresolved host was a startup-timing race against the
+  VPN coming up, not a routing problem — see `sandbox/opencode/README.md`
+  and `chorus-spec.md` §0's 2026-09-02 entry.

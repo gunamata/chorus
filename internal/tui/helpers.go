@@ -61,6 +61,24 @@ func (w *AgentWorker) Idle() bool {
 	return !w.busy.Load()
 }
 
+// Cancel requests the agent stop its current in-flight prompt, if any —
+// backs Esc's interrupt-one-turn behavior (Model.interruptBusyAgents),
+// chorus's answer to the single biggest gap found against Claude Code
+// CLI's own Esc-to-interrupt: previously the only way to stop a running
+// turn was Ctrl+C, which kills every connected agent's subprocess at
+// once. Sends ACP's session/cancel notification and returns immediately —
+// it does not itself wait for the in-flight PromptContent call to return;
+// StartWorker's goroutine still owns that, and reports the (typically
+// early-terminated, not erroring) result via doneCh/errCh exactly as for
+// any other completed prompt. Safe to call on an idle worker (the
+// notification is fire-and-forget; an agent with nothing in flight is
+// expected to just ignore it) — callers should still prefer checking
+// Idle() first so "interrupted" isn't printed for an agent that wasn't
+// doing anything.
+func (w *AgentWorker) Cancel(ctx context.Context) error {
+	return w.sess.Cancel(ctx)
+}
+
 // StartedAt reports when w's current in-flight prompt began, if it's busy
 // right now. The second return is false while idle — callers must check
 // Idle() (or this) before trusting the time, since startedAt isn't cleared

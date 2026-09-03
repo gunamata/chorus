@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -214,6 +215,33 @@ type Model struct {
 
 	viewport viewport.Model
 	input    textarea.Model
+
+	// selecting/selectAnchorLine/selectCurLine back click-drag text
+	// selection + copy-on-select — see handleMouse's doc comment for why
+	// chorus needs to implement this itself rather than relying on the
+	// terminal: tea.WithMouseCellMotion() (main.go) already takes over
+	// plain click-drag for scrolling, so a left-button drag inside the
+	// viewport never reaches the terminal's own selection at all unless
+	// a user holds a modifier key. Deliberately line-level, not
+	// character-column: both endpoints are absolute line indices into
+	// the current word-wrapped document (m.viewport.YOffset + the
+	// clicked row), not column offsets — selecting always copies whole
+	// lines. This avoids tracking exact rune/column positions through
+	// wordwrap's reflow and glamour's ANSI styling (materially more
+	// complex, and Claude Code CLI's own line-oriented feel from a
+	// scrolling terminal buffer is what users actually expect here) at
+	// the cost of not supporting a mid-line-to-mid-line selection — a
+	// deliberate, documented trade-off, not an oversight.
+	selecting        bool
+	selectAnchorLine int
+	selectCurLine    int
+	// lastCopyStatus is a one-shot confirmation ("3 lines copied" / a
+	// clipboard error) shown on the mode-status line in View() right
+	// after a selection completes, then cleared on the next keypress or
+	// selection — copy-on-select has no other feedback channel, since it
+	// doesn't append to the document (that would itself change what's
+	// on screen, undermining the very selection the user just made).
+	lastCopyStatus string
 
 	// promptHistory records every non-empty line submitted via
 	// handleNormalLine (agent prompts, native "!" commands, meta commands
@@ -554,9 +582,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.handleKey(msg)
 
 	case tea.MouseMsg:
-		var cmd tea.Cmd
-		m.viewport, cmd = m.viewport.Update(msg)
-		return m, cmd
+		return m.handleMouse(msg)
 	}
 
 	return m, nil
@@ -580,6 +606,12 @@ func (m Model) View() string {
 		modeStatus = "awaiting agent choice (↑/↓ + enter, number, or name)"
 	case modeContextLevel:
 		modeStatus = "choosing routing context level (↑/↓ + enter, number, or name)"
+	}
+	// lastCopyStatus only ever shows on this line when nothing else claims
+	// it — a pending permission/routeAsk/contextLevel prompt always wins,
+	// since answering that is the more urgent thing on screen.
+	if modeStatus == "" && m.lastCopyStatus != "" {
+		modeStatus = m.lastCopyStatus
 	}
 	status := statusStyle.Render(modeStatus) + "\n" + statusStyle.Render(m.formatBusyStatus()) + "\n"
 	return m.viewport.View() + "\n" + status + inputBoxStyle.Width(m.width).Render(m.input.View())
@@ -610,7 +642,229 @@ func (m Model) formatBusyStatus() string {
 	if len(parts) == 0 {
 		return ""
 	}
-	return strings.Join(parts, "  ·  ")
+	// "esc to interrupt" only makes sense to show here, not as a permanent
+	// hint elsewhere, since it's only actually actionable while something
+	// is busy — surfacing Esc's new job (interruptBusyAgents) right where
+	// the user is already watching a turn run, rather than leaving them to
+	// discover it only by reading docs or by accident.
+	return strings.Join(parts, "  ·  ") + "   (esc to interrupt)"
+}
+
+// handleMouse implements click-drag text selection + copy-on-select —
+// closing the second-biggest gap (after Esc-to-interrupt) found against
+// Claude Code CLI's own UI: tea.WithMouseCellMotion() (main.go) puts
+// chorus, not the terminal, in charge of mouse events, which means a plain
+// click-drag never reaches the terminal's native selection at all unless a
+// user knows to hold a modifier key (Shift on most terminals) — something
+// CHORUS_DISABLE_MOUSE documents as the escape hatch, but shouldn't be the
+// ONLY way to select and copy text, since a user migrating from Claude Code
+// CLI (which solves this the same way: owning mouse capture, then writing
+// the selection to the system clipboard itself) would otherwise lose a
+// basic, expected capability by switching to chorus.
+//
+// Only left-button events participate; wheel events fall through to
+// viewport.Update unchanged (its own MouseWheelEnabled path, untouched by
+// any of this). A press outside the viewport's rows (the status lines or
+// the input box) doesn't start a selection — the input box already owns
+// its own click/cursor behavior via bubbles/textarea, and there is nothing
+// selectable in an empty status line.
+func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Button == tea.MouseButtonLeft {
+		switch msg.Action {
+		case tea.MouseActionPress:
+			if msg.Y >= 0 && msg.Y < m.viewport.Height {
+				m.selecting = true
+				m.lastCopyStatus = ""
+				line := m.viewport.YOffset + msg.Y
+				m.selectAnchorLine = line
+				m.selectCurLine = line
+			} else {
+				m.selecting = false
+			}
+			return m, nil
+
+		case tea.MouseActionMotion:
+			if m.selecting {
+				m.selectCurLine = m.viewport.YOffset + clampInt(msg.Y, 0, m.viewport.Height-1)
+			}
+			return m, nil
+
+		case tea.MouseActionRelease:
+			if m.selecting {
+				m.selecting = false
+				return m.copySelection(), nil
+			}
+			return m, nil
+		}
+	}
+
+	var cmd tea.Cmd
+	m.viewport, cmd = m.viewport.Update(msg)
+	return m, cmd
+}
+
+// copySelection extracts the lines between selectAnchorLine and
+// selectCurLine (inclusive, order-independent) from the current document,
+// strips ANSI styling (a terminal clipboard should receive plain text, not
+// chorus's own color codes), and writes the result to the system clipboard
+// via github.com/atotto/clipboard — which already implements the same
+// per-platform mechanisms Claude Code CLI's own copy-on-select relies on
+// (pbcopy on macOS, wl-copy/xclip/xsel on Linux depending on the session
+// type, the native Win32 clipboard API on Windows with no external process
+// needed). Recomputes the document fresh (renderDocument is a pure,
+// cheap function of m.blocks/m.viewport.Width) rather than reading from a
+// cache, so a selection made while output is actively streaming in still
+// reflects exactly what was on screen at release time.
+//
+// Deliberately does not fall back to OSC 52 (a terminal escape sequence
+// that also updates the clipboard, notably useful over SSH where none of
+// the local utilities above could reach the user's own machine): writing
+// it would mean putting raw bytes on os.Stdout outside of bubbletea's own
+// render cycle, which is exactly what concurrency invariant #3 (CLAUDE.md)
+// exists to prevent — a corrupted frame is a worse failure mode than "copy
+// silently didn't work over this SSH session," which lastCopyStatus's error
+// message at least surfaces honestly instead of pretending to succeed.
+func (m Model) copySelection() Model {
+	text, n, ok := extractSelection(m.renderDocument(), m.selectAnchorLine, m.selectCurLine)
+	if !ok {
+		return m
+	}
+	if err := writeClipboard(text); err != nil {
+		m.lastCopyStatus = fmt.Sprintf("copy failed: %v", err)
+		return m
+	}
+	if n == 1 {
+		m.lastCopyStatus = "1 line copied"
+	} else {
+		m.lastCopyStatus = fmt.Sprintf("%d lines copied", n)
+	}
+	return m
+}
+
+// extractSelection returns the ANSI-stripped, newline-joined text of doc's
+// lines between anchor and cur (inclusive, order-independent — a drag can
+// go either direction), plus how many lines that was. Pulled out of
+// copySelection as its own pure function specifically so the actual line-
+// range/ANSI-stripping logic is unit-testable without touching the real
+// OS clipboard (see writeClipboard). ok is false only for a degenerate
+// empty range — not reachable from a real mouse drag inside the viewport,
+// but checked rather than assumed.
+func extractSelection(doc string, anchor, cur int) (text string, lineCount int, ok bool) {
+	lo, hi := anchor, cur
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	lines := strings.Split(doc, "\n")
+	if lo < 0 {
+		lo = 0
+	}
+	if hi >= len(lines) {
+		hi = len(lines) - 1
+	}
+	if lo > hi {
+		return "", 0, false
+	}
+	selected := make([]string, 0, hi-lo+1)
+	for _, l := range lines[lo : hi+1] {
+		selected = append(selected, render.StripANSI(l))
+	}
+	return strings.Join(selected, "\n"), hi - lo + 1, true
+}
+
+// writeClipboard is a package-level function variable (not a direct call
+// to clipboard.WriteAll) specifically so tests can substitute a fake — the
+// real implementation reaches the actual OS clipboard via per-platform
+// mechanisms (pbcopy/wl-copy/xclip/xsel/the Win32 clipboard API), which
+// may not even be available in a headless test environment (e.g. Linux CI
+// with no X11/Wayland session), the same reason internal/session's live
+// subprocess-dependent code stays outside this package's unit test
+// coverage.
+var writeClipboard = clipboard.WriteAll
+
+func clampInt(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
+}
+
+// interruptBusyAgents implements Esc's "stop the current turn without
+// quitting the program" behavior — chorus's answer to Claude Code CLI's own
+// Esc-to-interrupt, and the single biggest gap found in a direct UI/UX
+// parity comparison against it (2026-09-02): previously the only way to
+// stop a running turn was Ctrl+C, which kills every connected agent's
+// subprocess at once, mid-turn, discarding whatever any OTHER agent was
+// doing too — not just the one turn the user actually wanted to stop.
+//
+// Claude Code CLI never has to decide WHICH agent Esc interrupts, since it
+// only ever runs itself — chorus does, because running several agents at
+// once is its whole point. Resolved by picking lastRoutedAgent (the most
+// recently dispatched turn — the one the user is most likely watching) if
+// it's currently busy; otherwise every currently-busy agent is interrupted,
+// so Esc is never a silent no-op just because the most recent dispatch
+// already finished while some earlier/background turn (e.g. a slow
+// delegate reply) is still running.
+//
+// Interrupting does not end the session: AgentWorker.Cancel sends ACP's own
+// session/cancel notification, and the worker's in-flight PromptContent
+// call is expected to return (successfully, just early) exactly as it does
+// for any normally-completed turn — reported via the same doneCh/errCh path,
+// with a "[agent] finished in Xs" line following shortly after, same as
+// always.
+func (m Model) interruptBusyAgents() Model {
+	targets := selectInterruptTargets(m.busyAgentNames(), m.lastRoutedAgent)
+	if len(targets) == 0 {
+		return m
+	}
+	for _, name := range targets {
+		w, ok := m.workers[name]
+		if !ok {
+			continue
+		}
+		if err := w.Cancel(m.ctx); err != nil {
+			m.appendLine(fmt.Sprintf("[%s] interrupt failed: %v\n", name, err))
+			continue
+		}
+		m.appendLine(fmt.Sprintf("[%s] interrupted\n", name))
+	}
+	m.syncViewport()
+	return m
+}
+
+// busyAgentNames returns every currently-busy agent's name, in agentSpecs
+// (registry) order for determinism — the same convention
+// formatCapabilities/formatStats/formatBusyStatus already use.
+func (m Model) busyAgentNames() []string {
+	var names []string
+	for _, spec := range m.agentSpecs {
+		if w, ok := m.workers[spec.Name]; ok && !w.Idle() {
+			names = append(names, spec.Name)
+		}
+	}
+	return names
+}
+
+// selectInterruptTargets narrows a list of busy agent names down to which
+// one(s) Esc should actually interrupt — pulled out of interruptBusyAgents
+// as its own pure function specifically so this decision is unit-testable
+// without a live ACP connection (AgentWorker.Cancel's underlying
+// session.AgentSession.Cancel needs a real *acp.ClientSideConnection, which
+// only a live subprocess provides — see CLAUDE.md on internal/session
+// remaining otherwise untested for the same reason). If lastRouted is
+// currently busy, it alone is targeted (the turn the user is most likely
+// watching); otherwise every busy agent is targeted, so Esc is never a
+// silent no-op just because the most recently dispatched turn already
+// finished while some other agent is still running.
+func selectInterruptTargets(busy []string, lastRouted string) []string {
+	for _, name := range busy {
+		if name == lastRouted {
+			return []string{name}
+		}
+	}
+	return busy
 }
 
 var (
@@ -754,10 +1008,22 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) Model {
 // (permission answer > routeAsk answer > normal dispatch), exactly the
 // original REPL's lineCh-handling order (main.go's old select loop).
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	m.lastCopyStatus = "" // one-shot — see its doc comment
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		m.quitting = true
 		return m, tea.Quit
+	case tea.KeyEsc:
+		// Only in modeNormal — a pending permission/routeAsk/contextLevel
+		// menu already has its own answer paths (type "cancel", arrow+enter,
+		// etc.), and those have real, tested invariants (concurrency
+		// invariants #4/#10/#11) not worth disturbing here. Esc's new job is
+		// strictly "stop a running turn without quitting," Claude Code CLI's
+		// single biggest interaction chorus was missing entirely — see
+		// interruptBusyAgents' doc comment.
+		if m.mode() == modeNormal {
+			return m.interruptBusyAgents(), nil
+		}
 	}
 
 	// Scroll keys are reserved for the viewport, not typed into the

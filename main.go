@@ -29,7 +29,23 @@ import (
 	"chorus/internal/tui"
 )
 
+// version/commit/date are stamped at build time via -ldflags (see
+// .github/workflows/release.yml), e.g.
+// -X main.version=1.2.3 -X main.commit=<sha> -X main.date=<RFC3339>.
+// Left as "dev"/"none"/"unknown" for a plain `go build`, so a
+// from-source build never lies about being a tagged release.
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
+	if hasFlag(os.Args[1:], "--version") || hasFlag(os.Args[1:], "-v") {
+		fmt.Printf("chorus %s (commit %s, built %s)\n", version, commit, date)
+		return
+	}
+
 	// chorus re-invokes itself as the delegate-mcp subprocess (§11) — see
 	// internal/delegate's package doc for why this has to be a separate
 	// process rather than something chorus's main loop just handles
@@ -302,7 +318,7 @@ func run(fresh bool, agentsOverride string) error {
 		r.WithImageDir(imageDir)
 	}
 
-	fmt.Println(`Type "<agent>: <text>" to prompt a specific agent, or just type a prompt to auto-route it. Type "/name ..." to run a known slash command, "commands" to list them, "capabilities" to show what each agent advertises, "stats" to show direct-vs-delegated tool activity, "thoughts" to toggle agent thinking output, quit/exit to end.`)
+	fmt.Println(`Type "<agent>: <text>" to prompt a specific agent, or just type a prompt to auto-route it. Type "/name ..." to run a known slash command, "commands" to list them, "capabilities" to show what each agent advertises, "stats" to show direct-vs-delegated tool activity, "thoughts" to toggle agent thinking output, quit/exit to end. Esc interrupts a running turn without quitting; click-drag over output copies the selected lines to your clipboard (set CHORUS_DISABLE_MOUSE to get native terminal selection instead).`)
 
 	// The rest of chorus's interactive behavior — permission Q&A, route-
 	// ambiguity prompts, slash commands, auto-routing, the scrolling
@@ -327,6 +343,18 @@ func run(fresh bool, agentsOverride string) error {
 	// unconfirmed — if selection turns out to be unrecoverable on a given
 	// terminal, that terminal's own mouse-mode override is the thing to
 	// chase, not another removal of this line.
+	//
+	// CHORUS_DISABLE_MOUSE (2026-09, closing a gap found against Claude
+	// Code CLI's own CLAUDE_CODE_DISABLE_MOUSE) is the escape hatch for a
+	// terminal where that modifier-key override doesn't apply, or a user
+	// who'd simply rather have guaranteed native selection than mouse-
+	// wheel scrolling — PageUp/PageDown/ctrl+u/ctrl+d already reach
+	// viewport.Update the same way (see handleKey), so scrolling stays
+	// fully usable from the keyboard alone with mouse capture off.
+	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	if os.Getenv("CHORUS_DISABLE_MOUSE") == "" {
+		opts = append(opts, tea.WithMouseCellMotion())
+	}
 	p := tea.NewProgram(tui.New(tui.Config{
 		Ctx:           ctx,
 		Renderer:      r,
@@ -343,7 +371,7 @@ func run(fresh bool, agentsOverride string) error {
 		ErrCh:         errCh,
 		DoneCh:        doneCh,
 		DelegateLogCh: delegateLogCh,
-	}), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	}), opts...)
 	_, err = p.Run()
 	return err
 }
