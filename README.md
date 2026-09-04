@@ -99,6 +99,31 @@ the location with `CHORUS_HOME` (must match whatever chorus itself uses
 — see [Session persistence](#session-persistence)) if you want it
 somewhere other than `~/.chorus`.
 
+Seed a **custom** config instead of the bundled default with
+`CHORUS_AGENTS=<path-or-url>` — same local-file-or-`https://`-URL
+support as chorus's own `--agents` flag (see [Agent
+registry](#agent-registry-agentsyaml)), and the same rule: `http://` is
+refused, not just discouraged, since the seeded file becomes what chorus
+execs `spawn` commands from unconditionally. Still only takes effect on
+first install — an existing `~/.chorus/agents.yaml` is never overwritten,
+`CHORUS_AGENTS` included; a failed/missing/non-https source falls back
+to the bundled default with a warning rather than leaving the install
+half-finished:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gunamata/chorus/main/install.sh \
+  | CHORUS_AGENTS=https://gist.githubusercontent.com/you/id/raw/agents.yaml sh
+```
+
+(the env var must be attached to `sh`, the process that actually runs the
+downloaded script — attaching it to `curl` instead sets it for the wrong
+command and it never reaches the install script at all)
+
+```powershell
+$env:CHORUS_AGENTS = "https://gist.githubusercontent.com/you/id/raw/agents.yaml"
+irm https://raw.githubusercontent.com/gunamata/chorus/main/install.ps1 | iex
+```
+
 ## Build
 
 ```sh

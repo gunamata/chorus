@@ -16,6 +16,11 @@
 #   $env:CHORUS_INSTALL_DIR directory to install into (default: $HOME\.chorus\bin)
 #   $env:CHORUS_HOME        directory the seeded agents.yaml goes into (default: $HOME\.chorus) --
 #                           must match what chorus itself resolves (sessionstore.HomeDir)
+#   $env:CHORUS_AGENTS      a local file path or https:// URL to seed as the central
+#                           agents.yaml instead of the release's bundled default -- same
+#                           local-file-or-remote-URL support as chorus's own --agents flag.
+#                           Only used when no central agents.yaml exists yet (see above --
+#                           never overwrites either way).
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
@@ -54,6 +59,49 @@ function Get-VerifiedFile($Url, $Dest, $Name, $ChecksumsPath, [switch]$Strict) {
         Write-Info "warning: checksum mismatch for $Name -- skipping"
         return $false
     }
+    return $true
+}
+
+# Set-CustomAgents SRC DEST CHORUSHOME WORKDIR
+# Populates DEST from SRC ($env:CHORUS_AGENTS) -- SRC may be a local file
+# path or an https:// URL, same as chorus's own --agents flag. http:// is
+# refused, not just discouraged: DEST becomes the agents.yaml chorus execs
+# `spawn` commands from unconditionally, so fetching it over plaintext
+# would let an on-path attacker rewrite what runs on every future launch
+# (same reasoning as fetchAgentsYAML in main.go, which enforces the
+# identical restriction for --agents=<url> itself). Returns $false on any
+# failure (bad path, unreachable/oversized/non-https URL) so the caller
+# falls back to the bundled default instead of leaving agents.yaml
+# unseeded entirely -- a bad CHORUS_AGENTS value shouldn't break the rest
+# of the install.
+function Set-CustomAgents($Src, $Dest, $ChorusHome, $WorkDir) {
+    if ($Src -match '^https://') {
+        $tmp = Join-Path $WorkDir "custom-agents.yaml"
+        try {
+            Invoke-WebRequest -UseBasicParsing -Uri $Src -OutFile $tmp -TimeoutSec 15
+        } catch {
+            Write-Info "warning: couldn't download CHORUS_AGENTS ($Src) -- falling back to the bundled default"
+            return $false
+        }
+        if ((Get-Item $tmp).Length -gt 1048576) {
+            Write-Info "warning: CHORUS_AGENTS response exceeds 1 MiB -- refusing to use it, falling back to the bundled default"
+            Remove-Item $tmp -ErrorAction SilentlyContinue
+            return $false
+        }
+        New-Item -ItemType Directory -Path $ChorusHome -Force | Out-Null
+        Copy-Item -Path $tmp -Destination $Dest -Force
+    } elseif ($Src -match '^http://') {
+        Write-Info "warning: CHORUS_AGENTS must use https:// (got http://) -- refusing to fetch over plaintext, falling back to the bundled default"
+        return $false
+    } else {
+        if (-not (Test-Path $Src)) {
+            Write-Info "warning: CHORUS_AGENTS ($Src) not found -- falling back to the bundled default"
+            return $false
+        }
+        New-Item -ItemType Directory -Path $ChorusHome -Force | Out-Null
+        Copy-Item -Path $Src -Destination $Dest -Force
+    }
+    Write-Info "Wrote custom config (CHORUS_AGENTS=$Src) to $Dest"
     return $true
 }
 
@@ -121,11 +169,17 @@ try {
     if (Test-Path $agentsDest) {
         Write-Info "Existing $agentsDest left untouched (never overwritten on install/upgrade)."
     } else {
-        $agentsTemp = Join-Path $workDir "agents.yaml"
-        if (Get-VerifiedFile "$baseUrl/agents.yaml" $agentsTemp "agents.yaml" $checksumsPath) {
-            New-Item -ItemType Directory -Path $chorusHome -Force | Out-Null
-            Copy-Item -Path $agentsTemp -Destination $agentsDest -Force
-            Write-Info "Wrote default config to $agentsDest"
+        $seeded = $false
+        if ($env:CHORUS_AGENTS) {
+            $seeded = Set-CustomAgents $env:CHORUS_AGENTS $agentsDest $chorusHome $workDir
+        }
+        if (-not $seeded) {
+            $agentsTemp = Join-Path $workDir "agents.yaml"
+            if (Get-VerifiedFile "$baseUrl/agents.yaml" $agentsTemp "agents.yaml" $checksumsPath) {
+                New-Item -ItemType Directory -Path $chorusHome -Force | Out-Null
+                Copy-Item -Path $agentsTemp -Destination $agentsDest -Force
+                Write-Info "Wrote default config to $agentsDest"
+            }
         }
     }
 

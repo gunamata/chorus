@@ -18,6 +18,11 @@
 #   CHORUS_INSTALL_DIR directory to install the binary into (default: ~/.chorus/bin)
 #   CHORUS_HOME        directory the seeded agents.yaml goes into (default: ~/.chorus) —
 #                      must match what chorus itself resolves (sessionstore.HomeDir)
+#   CHORUS_AGENTS      a local file path or https:// URL to seed as the central
+#                      agents.yaml instead of the release's bundled default —
+#                      same local-file-or-remote-URL support as chorus's own
+#                      --agents flag. Only used when no central agents.yaml
+#                      exists yet (see above — never overwrites either way).
 set -eu
 
 REPO="gunamata/chorus"
@@ -111,6 +116,46 @@ download_verified() {
     return 0
 }
 
+# seed_custom_agents SRC DEST
+# Populates DEST from SRC (CHORUS_AGENTS) — SRC may be a local file path
+# or an https:// URL, same as chorus's own --agents flag. http:// is
+# refused, not just discouraged: DEST becomes the agents.yaml chorus
+# execs `spawn` commands from unconditionally, so fetching it over
+# plaintext would let an on-path attacker rewrite what runs on every
+# future launch (same reasoning as fetchAgentsYAML in main.go, which
+# enforces the identical restriction for --agents=<url> itself). Returns
+# non-zero on any failure (bad path, unreachable/oversized/non-https
+# URL) so the caller falls back to the bundled default instead of
+# leaving agents.yaml unseeded entirely — a bad CHORUS_AGENTS value
+# shouldn't break the rest of the install.
+seed_custom_agents() {
+    src="$1"; dest="$2"
+    case "$src" in
+        https://*)
+            if ! curl -fsSL --max-time 15 --max-filesize 1048576 -o "$workdir/custom-agents.yaml" "$src"; then
+                log "warning: couldn't download CHORUS_AGENTS ($src) — falling back to the bundled default"
+                return 1
+            fi
+            mkdir -p "$(dirname "$dest")"
+            mv "$workdir/custom-agents.yaml" "$dest"
+            ;;
+        http://*)
+            log "warning: CHORUS_AGENTS must use https:// (got http://) — refusing to fetch over plaintext, falling back to the bundled default"
+            return 1
+            ;;
+        *)
+            if [ ! -f "$src" ]; then
+                log "warning: CHORUS_AGENTS ($src) not found — falling back to the bundled default"
+                return 1
+            fi
+            mkdir -p "$(dirname "$dest")"
+            cp "$src" "$dest"
+            ;;
+    esac
+    log "Wrote custom config (CHORUS_AGENTS=$src) to $dest"
+    return 0
+}
+
 log "Downloading $archive..."
 download_verified "$base_url/$archive" "$workdir/$archive" "$archive" strict
 
@@ -138,6 +183,8 @@ chorus_home="${CHORUS_HOME:-$HOME/.chorus}"
 agents_dest="$chorus_home/agents.yaml"
 if [ -f "$agents_dest" ]; then
     log "Existing $agents_dest left untouched (never overwritten on install/upgrade)."
+elif [ -n "${CHORUS_AGENTS:-}" ] && seed_custom_agents "$CHORUS_AGENTS" "$agents_dest"; then
+    : # seeded from CHORUS_AGENTS
 elif download_verified "$base_url/agents.yaml" "$workdir/agents.yaml" "agents.yaml"; then
     mkdir -p "$chorus_home"
     mv "$workdir/agents.yaml" "$agents_dest"
