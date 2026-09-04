@@ -490,12 +490,19 @@ func formatCapabilities(specs []session.Spec, conns map[string]*session.Connecti
 	return b.String()
 }
 
-// formatStats prints each agent's direct-vs-delegated tool activity for
-// this run — CLAUDE.md's delegation-maximization plan item 4, added so
+// formatStats prints each agent's direct-vs-delegated tool activity, plus
+// its most recently reported token usage, for this run — the tool-call
+// tallying is CLAUDE.md's delegation-maximization plan item 4, added so
 // policy.yaml's delegation.prefer/nudge_threshold can be tuned against
-// real numbers instead of guesswork. specs is walked in registry order
-// (the same determinism convention formatCapabilities/formatCommands
-// use), not sorted, so this reads the same way run to run.
+// real numbers instead of guesswork; the token line (2026-09-04, user
+// request — "show token consumption of agents in the session so far at a
+// given point in time") reuses ACP's usage_update data trackUsage already
+// captures for auto-compaction, previously discarded once that check ran.
+// An agent shows up here if it has EITHER kind of activity — a
+// conversational agent that's never called a tool but has burned real
+// context still has something worth showing. specs is walked in registry
+// order (the same determinism convention formatCapabilities/
+// formatCommands use), not sorted, so this reads the same way run to run.
 func formatStats(specs []session.Spec, s agentStats) string {
 	var b strings.Builder
 	anyActivity := false
@@ -504,11 +511,20 @@ func formatStats(specs []session.Spec, s agentStats) string {
 		sent := s.delegateSent[spec.Name]
 		recv := s.delegateRecv[spec.Name]
 		failed := s.delegateFail[spec.Name]
-		if direct == 0 && sent == 0 && recv == 0 {
+		size, hasUsage := s.usageSize[spec.Name]
+		used := s.usageUsed[spec.Name]
+		if direct == 0 && sent == 0 && recv == 0 && !hasUsage {
 			continue
 		}
 		anyActivity = true
 		fmt.Fprintf(&b, "%s:\n", spec.Name)
+		if hasUsage {
+			if size > 0 {
+				fmt.Fprintf(&b, "  tokens used:             %d/%d (%d%%)\n", used, size, used*100/size)
+			} else {
+				fmt.Fprintf(&b, "  tokens used:             %d\n", used)
+			}
+		}
 		fmt.Fprintf(&b, "  direct tool calls:       %d\n", direct)
 		if sent > 0 {
 			fmt.Fprintf(&b, "  delegate calls sent:     %d", sent)
@@ -522,7 +538,7 @@ func formatStats(specs []session.Spec, s agentStats) string {
 		fmt.Fprintf(&b, "  delegate calls received: %d\n", recv)
 	}
 	if !anyActivity {
-		return "no tool activity recorded yet this run\n"
+		return "no activity recorded yet this run\n"
 	}
 	return b.String()
 }

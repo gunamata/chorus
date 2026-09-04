@@ -15,17 +15,12 @@ partial exception: see [Prerequisites](#prerequisites). One narrow,
 documented exception to "no sockets" exists to support cross-agent
 [delegation](#cross-agent-delegation) — see that section.
 
-Full design rationale lives in [`chorus-spec.md`](chorus-spec.md). This
-file is the practical "how do I run it" doc.
-
 ## Status
 
 v1 (core plumbing), v2 (auto-routing + registry), v3 (cross-agent
 delegation), session persistence, slash-command passthrough, and image
 attachments (both directions) are all built and verified live against
-real Claude and real opencode. See
-[`chorus-spec.md` §0](chorus-spec.md#0-context-for-whoever-implements-this-read-first)
-for the full verified-findings log — in particular, **Gemini's ACP
+real Claude and real opencode. In particular, **Gemini's ACP
 mode currently rejects free/individual-tier Google accounts** (a
 Google-side restriction, not a chorus bug). opencode was added as a
 third agent specifically so this repo stays usable on machines where
@@ -39,8 +34,8 @@ machine where it works.
 - `gemini` CLI, logged into a Google account with ACP access — `npm
   install -g @google/gemini-cli`, then run `gemini` once to log in.
   Note: as of this writing, free/individual-tier Google accounts are
-  rejected by `gemini --acp` itself (see chorus-spec.md §0) — this is
-  a Google-side restriction, not a chorus bug or a login problem.
+  rejected by `gemini --acp` itself — this is a Google-side restriction,
+  not a chorus bug or a login problem.
 - `opencode` (`npm install -g opencode-ai`). Works out of the box with
   **zero login** — it silently falls back to its own free hosted
   default model, unrelated to any Claude/Anthropic subscription. If
@@ -56,8 +51,7 @@ subscription/login path.
 suddenly refuses to execute with no compiler error, check whether
 Windows Smart App Control is blocking it (Settings > Windows Security
 > App & browser control) before assuming it's a code bug — it can
-silently reject unsigned local binaries. See chorus-spec.md §0 for
-what this looks like when it happens.
+silently reject unsigned local binaries.
 
 ## Install
 
@@ -127,16 +121,29 @@ irm https://raw.githubusercontent.com/gunamata/chorus/main/install.ps1 | iex
 ## Build
 
 ```sh
-go build -o chorus.exe .
+go build .   # produces ./chorus on macOS/Linux, chorus.exe on Windows
 ```
 
 ## Run
 
+macOS / Linux:
+
 ```sh
-./chorus.exe                                      # every agent starts a fresh session
-./chorus.exe --resume                             # resume prior sessions where possible instead
-./chorus.exe --agents=agents.yaml.sandbox.windows # use a different agents.yaml than the default
+./chorus                                        # every agent starts a fresh session
+./chorus --resume                               # resume prior sessions where possible instead
+./chorus --agents=agents.yaml.sandbox.linux     # use a different agents.yaml than the default
 ```
+
+Windows:
+
+```powershell
+.\chorus.exe
+.\chorus.exe --resume
+.\chorus.exe --agents=agents.yaml.sandbox.windows
+```
+
+The rest of this doc uses the macOS/Linux `./chorus` form for brevity —
+on Windows, swap in `.\chorus.exe`.
 
 On startup chorus spawns all three agent subprocesses and creates (or,
 with `--resume` — see [Session persistence](#session-persistence) —
@@ -250,14 +257,17 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   and received so far this run — real numbers to tune
   `delegation.prefer`/`nudge_threshold` against (see
   [Cross-agent delegation](#cross-agent-delegation) below) instead of
-  guesswork.
+  guesswork. Also shows each agent's most recently reported token usage
+  (`used/context-size (N%)`, from ACP's own `usage_update` — the same
+  data behind the dim `(tokens: ...)` line you see stream past inline,
+  captured here so you don't have to scroll back to find the last one).
+  An agent that's had a real conversation but never called a tool still
+  shows up for its token usage alone.
 
 Agent replies and thoughts are rendered as styled markdown (bold,
 headers, code blocks — via [glamour](https://github.com/charmbracelet/glamour)),
 redrawn in place as each chunk streams in. In-progress tool calls show
-an animated spinner. See chorus-spec.md §15b for how the TUI is
-implemented (§15a has the earlier, now-superseded plain-terminal
-version of this same markdown/spinner work).
+an animated spinner.
 
 ## Slash commands
 
@@ -459,9 +469,9 @@ keep a plain `agents.yaml` for normal use and a separate sandboxed one
 per-invocation instead of renaming/swapping files:
 
 ```sh
-./chorus.exe                                      # local -> central -> embedded, first match wins
-./chorus.exe --agents=agents.yaml.sandbox.windows # loads that local file explicitly instead
-./chorus.exe --agents=https://gist.githubusercontent.com/you/id/raw/agents.yaml # or fetch one remotely
+./chorus                                      # local -> central -> embedded, first match wins
+./chorus --agents=agents.yaml.sandbox.linux   # loads that local file explicitly instead
+./chorus --agents=https://gist.githubusercontent.com/you/id/raw/agents.yaml # or fetch one remotely
 ```
 
 `--agents` always wins over the three local-resolution steps above, and
@@ -492,7 +502,7 @@ same way you'd think twice before piping a random URL into `sh`.
 ## Permission policy (`agents.yaml`)
 
 Each agent's `auto_allow`/`auto_allow_tools` (moved here from the old
-`policy.yaml`) is the §5 allow-list, keyed on ACP's standardized
+`policy.yaml`) is the permission allow-list, keyed on ACP's standardized
 `ToolCallUpdate.Kind` (`read`, `edit`, `delete`, `move`, `search`,
 `execute`, `think`, `fetch`, `switch_mode`, `other`) since that's the one
 thing every agent reports uniformly — not on per-agent tool names, which
@@ -647,7 +657,7 @@ something that's possible:**
   pre-existing session still picks up the briefing automatically on its
   next run. (This used to require starting over with no way to resume at
   all; fixed once it turned out to be a likely real cause of unreliable
-  delegation, not just a theoretical gap — see chorus-spec.md §0.)
+  delegation, not just a theoretical gap.)
 - **Delegation nudge**: ACP gives no way to redirect a tool call
   mid-permission-check (its response carries only allow/deny, no free
   text), so instead chorus counts how many direct tool calls a
@@ -674,8 +684,10 @@ This works by chorus re-invoking itself as a small local MCP server
 spawns, which calls back into chorus's main process over a
 127.0.0.1-only HTTP listener (random port and per-run token, never
 touches the network). This is a deliberate, narrow exception to "no
-sockets" — see `chorus-spec.md` §0/§2 for why it's unavoidable given
-how ACP's `mcpServers` mechanism actually works.
+sockets," unavoidable given how ACP's `mcpServers` mechanism actually
+works: it spawns the delegate server from the *agent* subprocess, not
+from chorus, so a callback path is the only way for it to reach back
+into chorus's main process at all.
 
 ## Sandboxing (containers)
 
@@ -743,7 +755,7 @@ opencode wrapped in `docker run`, Gemini left as a plain `spawn` with a
 comment on which env vars to set), loaded via
 `--agents=agents.yaml.sandbox.<os>` (see [Agent
 registry](#agent-registry-agentsyaml)) instead of the default
-`./chorus.exe`.
+`./chorus`.
 
 ## Releases & publishing
 
@@ -795,12 +807,12 @@ prompts pick up where you left off, in the same directory, instead of
 starting cold every time:
 
 ```
-$ ./chorus.exe
+$ ./chorus
 claude ready (session 07ab2684-...)
 > claude: remember the deploy target is us-east-1
 > quit
 
-$ ./chorus.exe --resume
+$ ./chorus --resume
 claude resumed (session 07ab2684-...)
 > claude: what's the deploy target again?
 [claude] us-east-1
@@ -862,9 +874,8 @@ carried over, not a silent assumption.
 
 ## Security
 
-chorus went through a full security audit (chorus-spec.md §0's
-2026-08-22 entry has the complete findings list) before its first
-public push. What that means in practice:
+chorus went through a full security audit before its first public push.
+What that means in practice:
 
 - **The permission system is a real enforcement boundary, not a
   suggestion.** Every path that can read a file, write a file, or run
@@ -922,12 +933,12 @@ internal/acpclient/        ACP Client role — receives updates/permission reque
 internal/render/           Renders every session/update kind to the terminal,
                             including saving inbound images to disk
 internal/policy/           Permission/delegation/compaction/routing config types +
-                            AutoAllow/AutoAllowTool matching (agents.yaml, §5)
+                            AutoAllow/AutoAllowTool matching (agents.yaml)
 internal/router/           LLM-based routing decision: BuildDecisionPrompt/
-                            ParseDecision (§9 — keyword matching removed 2026-08-25)
-internal/registry/         agents.yaml loading (§10) — the single decode point for
+                            ParseDecision (keyword matching removed 2026-08-25)
+internal/registry/         agents.yaml loading — the single decode point for
                             the whole file, registry + policy.Config together
-internal/delegate/         Cross-agent delegation (§11): the delegate-mcp subprocess
+internal/delegate/         Cross-agent delegation: the delegate-mcp subprocess
                             mode and the loopback Hub it calls back into
 internal/sessionstore/     sessions.json persistence for session resume, under
                             ~/.chorus/projects/<slug>/ (see Session persistence)
@@ -951,16 +962,14 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   RPC. The real failure happens entirely inside `claude-agent-acp`'s
   own process (likely a Windows-vs-Unix shell syntax mismatch,
   `2>/dev/null` meaning nothing to whatever shell it invokes here) —
-  outside chorus's code and not something chorus can fix. See
-  `chorus-spec.md` §0 for the full account. `CreateTerminal`'s
-  `Command`/`Args` handling itself (a plain exec-style pair per ACP's
-  schema, not a shell command line) is unchanged; it *has* since
-  gained a permission gate and output-byte-limit handling — see
-  [Security](#security).
+  outside chorus's code and not something chorus can fix.
+  `CreateTerminal`'s `Command`/`Args` handling itself (a plain
+  exec-style pair per ACP's schema, not a shell command line) is
+  unchanged; it *has* since gained a permission gate and
+  output-byte-limit handling — see [Security](#security).
 - Delegation's reply-collection has a theoretical (never observed)
-  race on the very last streamed chunk of a sub-session's reply — see
-  `chorus-spec.md` §0 for details.
-- No multi-hop delegation (by design, not a gap — see §2's non-goals).
+  race on the very last streamed chunk of a sub-session's reply.
+- No multi-hop delegation (by design, not a gap).
 - **LLM-based routing (`routing.mode: llm`) is new and not yet
   live-verified** (2026-08-25): whether any of Claude/Gemini/opencode
   actually advertise a model-switch command at all is unconfirmed — the
@@ -968,20 +977,18 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   exception. The decision call also can't structurally prevent the
   decision agent from using its own built-in tools during what's meant
   to be a cheap classification turn (chorus can only ask it not to);
-  a 25s timeout bounds the damage if that happens. See `chorus-spec.md`
-  §0 for the full account and what to check first on a real run.
+  a 25s timeout bounds the damage if that happens.
 - Inbound image rendering (agent -> you) is covered by unit tests but
   hasn't been triggered by a real agent in practice — most coding
   tasks never make one send image content back.
 - `Connection.SupportsImagePrompts` is recorded but unused — chorus
   doesn't yet warn if you attach an image to an agent that never
   advertised support for receiving one.
-- The bubbletea TUI (§15b) has been built and is covered by unit tests,
-  but hasn't yet been run in a real terminal to confirm it actually
-  looks and behaves right (scrolling, mouse wheel, spinner animation,
-  terminal restoration on quit) — see `chorus-spec.md` §0's most recent
-  entry and `CLAUDE.md`'s Known open issues before assuming this is
-  fully verified.
+- The bubbletea TUI has been built and is covered by unit tests, but
+  hasn't yet been run in a real terminal to confirm it actually looks
+  and behaves right (scrolling, mouse wheel, spinner animation,
+  terminal restoration on quit) — see `CLAUDE.md`'s Known open issues
+  before assuming this is fully verified.
 - **Esc-to-interrupt and click-drag copy-on-select (2026-09) are unit-
   tested only, not yet watched live** — same PTY-less tool-invocation-
   environment caveat as the rest of the bubbletea TUI above. Worth
@@ -1016,12 +1023,10 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   Gemini's OAuth credential directory read-only (fixed by mounting it
   read-write instead — a deliberate, documented tradeoff). opencode's
   free-tier backend needed one more fix: its firewall shipped with no
-  LLM backend domain baked in until the real one
-  (`opencode.ai`) was confirmed live and added. See `chorus-spec.md`
-  §0's 2026-08-26/27 entries for the full diagnostic trail. **Resolved
-  (2026-09)**: opencode's VPN-bound Ollama endpoint reachability — the
-  actual fix was making `init-firewall.sh`'s DNS resolution non-strict
-  for `CHORUS_SANDBOX_ALLOW_HOSTS` entries, since the earlier hard
-  failure on an unresolved host was a startup-timing race against the
-  VPN coming up, not a routing problem — see `sandbox/opencode/README.md`
-  and `chorus-spec.md` §0's 2026-09-02 entry.
+  LLM backend domain baked in until the real one (`opencode.ai`) was
+  confirmed live and added. **Resolved (2026-09)**: opencode's VPN-bound
+  Ollama endpoint reachability — the actual fix was making
+  `init-firewall.sh`'s DNS resolution non-strict for
+  `CHORUS_SANDBOX_ALLOW_HOSTS` entries, since the earlier hard failure
+  on an unresolved host was a startup-timing race against the VPN
+  coming up, not a routing problem — see `sandbox/opencode/README.md`.

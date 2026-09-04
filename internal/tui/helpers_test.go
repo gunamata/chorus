@@ -213,6 +213,66 @@ func TestFormatStats_ReportsDirectAndDelegateCounts(t *testing.T) {
 	}
 }
 
+func TestFormatStats_ReportsTokenUsage(t *testing.T) {
+	specs := []session.Spec{{Name: "claude"}}
+	s := newAgentStats()
+	s.usageUsed["claude"] = 45231
+	s.usageSize["claude"] = 200000
+
+	out := formatStats(specs, s)
+	if !strings.Contains(out, "45231/200000") {
+		t.Fatalf("formatStats() = %q, want the raw used/size figures", out)
+	}
+	if !strings.Contains(out, "22%") {
+		t.Fatalf("formatStats() = %q, want the computed percentage (22%%)", out)
+	}
+}
+
+func TestFormatStats_AgentWithOnlyTokenUsageStillShown(t *testing.T) {
+	// A conversational agent that never called a tool but has burned real
+	// context still has something worth showing — this is the actual
+	// behavior change (2026-09-04, user request): previously formatStats
+	// skipped any agent with zero direct/sent/recv activity entirely.
+	specs := []session.Spec{{Name: "claude"}}
+	s := newAgentStats()
+	s.usageUsed["claude"] = 1000
+	s.usageSize["claude"] = 200000
+
+	out := formatStats(specs, s)
+	if !strings.Contains(out, "claude") {
+		t.Fatalf("formatStats() = %q, want claude listed despite having no tool-call activity", out)
+	}
+	if !strings.Contains(out, "1000/200000") {
+		t.Fatalf("formatStats() = %q, want the token usage line", out)
+	}
+}
+
+func TestFormatStats_TokenUsageWithZeroSizeShowsUsedOnlyNoPanic(t *testing.T) {
+	specs := []session.Spec{{Name: "claude"}}
+	s := newAgentStats()
+	s.usageUsed["claude"] = 500
+	s.usageSize["claude"] = 0
+
+	out := formatStats(specs, s)
+	if !strings.Contains(out, "500") {
+		t.Fatalf("formatStats() = %q, want the used figure shown even with size 0", out)
+	}
+	if strings.Contains(out, "%") {
+		t.Fatalf("formatStats() = %q, want no percentage when size is 0 (would be a divide-by-zero)", out)
+	}
+}
+
+func TestFormatStats_NoUsageDataOmitsTokenLine(t *testing.T) {
+	specs := []session.Spec{{Name: "claude"}}
+	s := newAgentStats()
+	s.direct["claude"] = 3
+
+	out := formatStats(specs, s)
+	if strings.Contains(out, "tokens used") {
+		t.Fatalf("formatStats() = %q, want no token line when no usage_update has ever arrived for this agent", out)
+	}
+}
+
 func indexOf(s, substr string) int {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {

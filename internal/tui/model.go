@@ -77,6 +77,17 @@ type agentStats struct {
 	delegateSent map[string]int // source agent -> delegate calls made
 	delegateRecv map[string]int // target agent -> delegate calls received
 	delegateFail map[string]int // source agent -> delegate calls that errored
+	// usageUsed/usageSize hold each agent's MOST RECENTLY reported
+	// context usage (ACP's usage_update — the same data trackUsage
+	// already consumed for auto-compaction, previously discarded once
+	// that check ran) — added 2026-09-04 so `stats` can answer "how many
+	// tokens has each agent used so far" as of right now, not just at
+	// whatever moment a usage_update happened to stream past on screen.
+	// A snapshot, not a running total across turns — ACP's own Used
+	// value is already cumulative for the session, so overwriting on
+	// each update (not summing) is correct.
+	usageUsed map[string]int
+	usageSize map[string]int
 }
 
 func newAgentStats() agentStats {
@@ -85,6 +96,8 @@ func newAgentStats() agentStats {
 		delegateSent: make(map[string]int),
 		delegateRecv: make(map[string]int),
 		delegateFail: make(map[string]int),
+		usageUsed:    make(map[string]int),
+		usageSize:    make(map[string]int),
 	}
 }
 
@@ -953,8 +966,14 @@ func (m Model) handleOutput(u bus.Update) (tea.Model, tea.Cmd) {
 // trackUsage checks agent's freshly-reported context usage against
 // compaction.Threshold() and fires (or defers, if agent is mid-turn)
 // compaction once it's crossed — see compactTriggered/compactPending's
-// doc comment on Model.
+// doc comment on Model. Also snapshots the raw used/size into
+// m.stats for the `stats` command (see agentStats' doc comment) —
+// recorded unconditionally, even when size<=0 would make the compaction
+// check below meaningless, since a lone `used` figure (or knowing an
+// agent hasn't reported any usage shape at all) is still worth showing.
 func (m *Model) trackUsage(agent string, used, size int) {
+	m.stats.usageUsed[agent] = used
+	m.stats.usageSize[agent] = size
 	if size <= 0 {
 		return
 	}

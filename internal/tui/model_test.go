@@ -1067,6 +1067,30 @@ func TestModel_Compaction_OneShotUntilUsageDrops(t *testing.T) {
 	}
 }
 
+func TestModel_TrackUsage_SnapshotsIntoStatsForStatsCommand(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(usageUpdateMsg("claude", 45231, 200000))
+	m = updated.(Model)
+
+	if got := m.stats.usageUsed["claude"]; got != 45231 {
+		t.Fatalf("stats.usageUsed[claude] = %d, want 45231", got)
+	}
+	if got := m.stats.usageSize["claude"]; got != 200000 {
+		t.Fatalf("stats.usageSize[claude] = %d, want 200000", got)
+	}
+
+	// A later, lower usage_update overwrites rather than accumulates —
+	// ACP's Used is already a cumulative session total, not a per-turn
+	// delta, so trackUsage snapshots (last value wins), never sums.
+	updated, _ = m.Update(usageUpdateMsg("claude", 10000, 200000))
+	m = updated.(Model)
+	if got := m.stats.usageUsed["claude"]; got != 10000 {
+		t.Fatalf("stats.usageUsed[claude] = %d after a second update, want 10000 (overwritten, not summed)", got)
+	}
+}
+
 func TestModel_Compaction_NoCommandDiscoveredSaysSoInsteadOfGuessing(t *testing.T) {
 	workers := map[string]*AgentWorker{"claude": newWorker()}
 	m := newTestModel(t, workers, policy.Routing{})
