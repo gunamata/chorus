@@ -1245,6 +1245,75 @@ func TestModel_StartRouteDecision_KicksOffAsyncCallWhenDecisionAgentConnected(t 
 	}
 }
 
+// --- routing prompt echo ordering (2026-09-03, user report) -------------
+//
+// Previously "[routing] asking X to decide..." appeared before the user's
+// own prompt was echoed at all (the echo only happened once the decision
+// resolved and the real target agent was known) — reading backwards, as
+// if chorus were reacting to a question not yet shown. Fixed by echoing
+// under a neutral "routing" tag immediately in startRouteDecision, before
+// the decision even starts, and suppressing dispatchUserTurn's own later
+// echo (echo=false) so the prompt doesn't then show a second time once
+// the real agent is known.
+
+func TestModel_StartRouteDecision_EchoesPromptBeforeAskingDecisionAgent(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "opencode"})
+	m.conns = map[string]*session.Connection{"opencode": {}}
+
+	updated, _ := m.startRouteDecision("write an elevator pitch")
+	m = updated.(Model)
+
+	view := m.viewport.View()
+	echoIdx := strings.Index(view, "write an elevator pitch")
+	askIdx := strings.Index(view, "asking opencode to decide")
+	if echoIdx == -1 {
+		t.Fatalf("viewport.View() = %q, want the prompt echoed", view)
+	}
+	if askIdx == -1 {
+		t.Fatalf("viewport.View() = %q, want the routing in-progress line", view)
+	}
+	if echoIdx >= askIdx {
+		t.Fatalf("prompt echo (index %d) does not come before \"asking ... to decide\" (index %d) — want the prompt shown first", echoIdx, askIdx)
+	}
+}
+
+func TestModel_HandleRouteDecision_DoesNotEchoPromptASecondTime(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "opencode"})
+	m.conns = map[string]*session.Connection{"opencode": {}}
+
+	updated, _ := m.startRouteDecision("write an elevator pitch")
+	m = updated.(Model)
+	updated, _ = m.Update(routeDecisionMsg{prompt: "write an elevator pitch", decision: router.Decision{Agent: "opencode"}})
+	m = updated.(Model)
+
+	if n := strings.Count(m.viewport.View(), "write an elevator pitch"); n != 1 {
+		t.Fatalf("prompt text appears %d times in viewport.View(), want exactly 1 (echoed once under \"routing\", not again once the target agent is known)", n)
+	}
+}
+
+func TestModel_StartRouteDecision_FallbackAlsoEchoesPromptOnceNotTwice(t *testing.T) {
+	workers := map[string]*AgentWorker{"opencode": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{Mode: string(policy.RoutingLLM), DecisionAgent: "claude"})
+	m.defaultAgent = "opencode"
+	// m.conns has no "claude" entry — decision_agent isn't connected, same
+	// synchronous-fallback setup as the existing test above this one.
+
+	updated, _ := m.startRouteDecision("do something")
+	m = updated.(Model)
+
+	view := m.viewport.View()
+	if n := strings.Count(view, "do something"); n != 1 {
+		t.Fatalf("prompt text appears %d times in viewport.View(), want exactly 1", n)
+	}
+	echoIdx := strings.Index(view, "do something")
+	fallbackIdx := strings.Index(view, "isn't connected")
+	if echoIdx == -1 || fallbackIdx == -1 || echoIdx >= fallbackIdx {
+		t.Fatalf("viewport.View() = %q, want the prompt echoed before the fallback explanation", view)
+	}
+}
+
 func TestModel_HandleRouteDecision_ErrorFallsBackToDefaultAgent(t *testing.T) {
 	workers := map[string]*AgentWorker{"opencode": newWorker()}
 	m := newTestModel(t, workers, policy.Routing{})

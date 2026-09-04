@@ -211,10 +211,10 @@ func TestLoadAgentConfig_MissingOverrideIsAHardError(t *testing.T) {
 }
 
 func TestFlagValue(t *testing.T) {
-	if got := flagValue([]string{"--fresh", "--agents=agents.yaml.sandbox"}, "--agents="); got != "agents.yaml.sandbox" {
+	if got := flagValue([]string{"--resume", "--agents=agents.yaml.sandbox"}, "--agents="); got != "agents.yaml.sandbox" {
 		t.Errorf("flagValue() = %q, want %q", got, "agents.yaml.sandbox")
 	}
-	if got := flagValue([]string{"--fresh"}, "--agents="); got != "" {
+	if got := flagValue([]string{"--resume"}, "--agents="); got != "" {
 		t.Errorf("flagValue() = %q, want empty when the flag is absent", got)
 	}
 }

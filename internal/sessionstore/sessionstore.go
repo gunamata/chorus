@@ -107,9 +107,10 @@ func ProjectDir(cwd string) (string, error) {
 }
 
 // entry is one agent's stored state. Briefed persists independently of
-// SessionID — a session resumed across many runs keeps its briefing
-// status, but a genuinely fresh session (new agent, --fresh, or a stale
-// ID that was rejected and replaced) must have it reset, since empty
+// SessionID — a session resumed across many runs (--resume) keeps its
+// briefing status, but a genuinely fresh session (new agent, the default
+// no-flag run, or a stale ID that was rejected and replaced) must have it
+// reset, since empty
 // history was never actually shown the earlier briefing regardless of
 // what a prior session under the same agent name received — see
 // ResetBriefed.
@@ -218,8 +219,9 @@ func (s *Store) MarkBriefed(agent string) error {
 
 // ResetBriefed clears agent's briefing status — call whenever a
 // genuinely fresh session is created (resumeOrNewSession returned
-// resumed=false), most importantly for --fresh: a fresh session's history
-// is empty, so whatever briefing status a PRIOR session under the same
+// resumed=false), most importantly for the default no-flag run (every
+// run is fresh unless --resume is passed): a fresh session's history is
+// empty, so whatever briefing status a PRIOR session under the same
 // agent name reached is no longer true for this one, and leaving it set
 // would silently skip briefing a session that has actually never seen it.
 func (s *Store) ResetBriefed(agent string) error {

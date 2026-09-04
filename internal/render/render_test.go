@@ -255,6 +255,74 @@ func TestFormatUpdate_ToolCall_DiffContentRenders(t *testing.T) {
 	}
 }
 
+func TestFormatUpdate_AvailableCommandsUpdate_IsTerseNotAFullList(t *testing.T) {
+	r := newTestRenderer()
+	_, text, ok := r.FormatUpdate(update("claude", "s1", acp.SessionUpdate{
+		AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+			AvailableCommands: []acp.AvailableCommand{
+				{Name: "design-sync", Description: "sync design"},
+				{Name: "review", Description: "review changes"},
+			},
+		},
+	}))
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if strings.Contains(text, "design-sync") || strings.Contains(text, "review") {
+		t.Fatalf("text = %q, want a terse message, not the full command list (found live to be noisy with a large command set)", text)
+	}
+	if !strings.Contains(text, "commands") {
+		t.Fatalf("text = %q, want it to at least point at the \"commands\" REPL command", text)
+	}
+}
+
+func TestFormatUpdate_ToolCall_LargeTextContentIsTruncated(t *testing.T) {
+	r := newTestRenderer()
+	big := strings.Repeat("x", toolCallContentPreviewLimit+1000)
+	_, text, ok := r.FormatUpdate(update("opencode", "s1", acp.SessionUpdate{
+		ToolCall: &acp.SessionUpdateToolCall{
+			ToolCallId: "tc1",
+			Title:      "Read chorus-spec.md",
+			Status:     acp.ToolCallStatusCompleted,
+			Content: []acp.ToolCallContent{
+				{Content: &acp.ToolCallContentContent{Content: acp.TextBlock(big)}},
+			},
+		},
+	}))
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if strings.Count(text, "x") > toolCallContentPreviewLimit {
+		t.Fatalf("tool call text contains more than %d of the repeated character, want it capped (found live: an unbounded file-read dump flooding the transcript)", toolCallContentPreviewLimit)
+	}
+	if !strings.Contains(text, "more chars") {
+		t.Fatalf("text = %q, want a truncation note", text)
+	}
+}
+
+func TestFormatUpdate_ToolCall_ShortTextContentIsNotTruncated(t *testing.T) {
+	r := newTestRenderer()
+	_, text, ok := r.FormatUpdate(update("claude", "s1", acp.SessionUpdate{
+		ToolCall: &acp.SessionUpdateToolCall{
+			ToolCallId: "tc1",
+			Title:      "Read auth.py",
+			Status:     acp.ToolCallStatusCompleted,
+			Content: []acp.ToolCallContent{
+				{Content: &acp.ToolCallContentContent{Content: acp.TextBlock("short content")}},
+			},
+		},
+	}))
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if !strings.Contains(text, "short content") {
+		t.Fatalf("text = %q, want short content shown in full, untruncated", text)
+	}
+	if strings.Contains(text, "more chars") {
+		t.Fatalf("text = %q, want no truncation note for content under the limit", text)
+	}
+}
+
 func TestFormatUpdate_Image_NoImageDirFallsBackToPlaceholder(t *testing.T) {
 	r := newTestRenderer() // WithImageDir never called
 	_, text, ok := r.FormatUpdate(update("claude", "s1", acp.SessionUpdate{

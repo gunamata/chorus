@@ -156,8 +156,9 @@ func TestResetBriefed_ClearsStatusForAFreshSession(t *testing.T) {
 	_ = s.Set("claude", "sess-123")
 	_ = s.MarkBriefed("claude")
 
-	// e.g. --fresh: a brand-new session under the same agent name, whose
-	// empty history was never actually shown the earlier briefing.
+	// e.g. a default no-flag run: a brand-new session under the same
+	// agent name, whose empty history was never actually shown the
+	// earlier briefing.
 	if err := s.ResetBriefed("claude"); err != nil {
 		t.Fatalf("ResetBriefed() error = %v", err)
 	}

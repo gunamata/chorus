@@ -305,12 +305,17 @@ func (r *Renderer) FormatUpdate(u bus.Update) (key, text string, ok bool) {
 		return "", r.formatPlan(u.Agent, up.Plan.Entries), true
 
 	case up.AvailableCommandsUpdate != nil:
+		// Deliberately doesn't list the commands inline — found live
+		// (2026-09, user report): an agent with a large command set
+		// (or one that re-reports this more than once per session, e.g.
+		// after its first turn — concurrency invariant #8) turned every
+		// occurrence into several lines of noise, most of it never
+		// actually needed since `commands` already lists everything on
+		// demand. A terse one-liner is enough to note "this agent is now
+		// discoverable," without repeating the same list from scratch
+		// every time it changes even slightly.
 		r.clearInPlaceState()
-		names := make([]string, 0, len(up.AvailableCommandsUpdate.AvailableCommands))
-		for _, c := range up.AvailableCommandsUpdate.AvailableCommands {
-			names = append(names, StripANSI(c.Name))
-		}
-		return "", fmt.Sprintf("%s %s(available commands: %s)%s\n", agentTag(u.Agent), colDim, strings.Join(names, ", "), colReset), true
+		return "", fmt.Sprintf("%s %s(commands available — type \"commands\" to list)%s\n", agentTag(u.Agent), colDim, colReset), true
 
 	case up.CurrentModeUpdate != nil:
 		r.clearInPlaceState()
@@ -399,6 +404,34 @@ func (r *Renderer) HighlightLine(line string) string {
 // command (a runaway build log, an accidental `find /`) shouldn't be able
 // to balloon the in-memory document/viewport without limit.
 const nativeCommandOutputLimit = 200_000
+
+// toolCallContentPreviewLimit caps how much of a tool call's own text
+// content (e.g. the full text of a file a "read" tool call returned)
+// gets shown inline in the transcript. Found live (2026-09, user
+// report): opencode's ACP adapter includes the complete file content in
+// ToolCallContent for a read — without a cap, this dumped an entire file
+// into the scrollback for a single tool call, and since formatToolCall
+// re-runs on every spinner tick while the call is in_progress, the same
+// full dump could appear more than once before the call completed. Much
+// smaller than nativeCommandOutputLimit, which exists to preserve
+// legitimately long output (a build/test log) in full — this is meant as
+// a peek at what the agent saw, not a substitute for opening the file.
+const toolCallContentPreviewLimit = 500
+
+// truncateToolCallContent applies toolCallContentPreviewLimit, walking
+// back to a rune boundary rather than a raw byte offset — mirrors
+// FormatNativeCommandResult's identical concern: slicing mid-rune would
+// produce invalid UTF-8 that renders corrupted.
+func truncateToolCallContent(t string) string {
+	if len(t) <= toolCallContentPreviewLimit {
+		return t
+	}
+	cut := toolCallContentPreviewLimit
+	for cut > 0 && !utf8.RuneStart(t[cut]) {
+		cut--
+	}
+	return fmt.Sprintf("%s... (%d more chars)", t[:cut], len(t)-cut)
+}
 
 // nativeTag marks a "!"-command block as chorus's own native execution,
 // not any agent's — a distinct color/glyph from agentTag so it reads
@@ -647,7 +680,7 @@ func (r *Renderer) formatToolCall(agent string, id acp.ToolCallId, title string,
 		case c.Content != nil:
 			t := r.contentText(c.Content.Content)
 			if t != "" {
-				fmt.Fprintf(&b, "%s  %s%s\n", colDim, t, colReset)
+				fmt.Fprintf(&b, "%s  %s%s\n", colDim, truncateToolCallContent(t), colReset)
 			}
 		case c.Terminal != nil:
 			fmt.Fprintf(&b, "%s  [terminal output omitted]%s\n", colDim, colReset)

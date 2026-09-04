@@ -1240,7 +1240,7 @@ func (m Model) handleRouteAnswer(line string) (tea.Model, tea.Cmd) {
 	}
 	// A slash command (isPrompt=false) — never handoff-wrapped, but still
 	// funneled through the shared choke point for consistent echo/record.
-	m.dispatchUserTurn(agent, m.pendingRoute.text, false)
+	m.dispatchUserTurn(agent, m.pendingRoute.text, false, true)
 	m.pendingRoute = nil
 	m.routeMenuIndex = -1
 	m.syncViewport()
@@ -1318,7 +1318,7 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 		m.appendLine(msg + "\n")
 	}
 	if agent != "" {
-		m.dispatchUserTurn(agent, sentText, isPrompt)
+		m.dispatchUserTurn(agent, sentText, isPrompt, true)
 	}
 	if ask != nil {
 		m.pendingRoute = ask
@@ -1339,14 +1339,26 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 // blocks Model.Update: the actual decision call runs in runRouteDecision's
 // tea.Cmd, on a hidden sub-session of the decision agent, reported back
 // via routeDecisionMsg.
+//
+// Echoes the prompt FIRST, before anything routing-related — found live
+// (2026-09, user report): the previous order showed "[routing] asking X
+// to decide..." before the user's own prompt ever appeared on screen,
+// which read backwards (you'd see chorus reacting to a question you
+// hadn't been shown yet). The target agent isn't known until the
+// decision resolves, so this echoes under a neutral "routing" tag rather
+// than the eventual agent's — dispatchUserTurn's OWN echo is then skipped
+// (echo=false) at both of this function's dispatch call sites below, to
+// avoid showing the same prompt twice once the real agent is known.
 func (m Model) startRouteDecision(text string) (tea.Model, tea.Cmd) {
+	m.appendLine(m.renderer.FormatUserPrompt("routing", text))
+
 	conn, ok := m.conns[m.routing.DecisionAgent]
 	if !ok {
 		// Config error (decision_agent unset, misspelled, or not
 		// connected) — don't cost a timeout on a call that can't succeed;
 		// fall back to defaultAgent synchronously, same as routing "off".
 		m.appendLine(fmt.Sprintf("routing.decision_agent %q isn't connected — falling back to %s\n", m.routing.DecisionAgent, m.defaultAgent))
-		m.dispatchUserTurn(m.defaultAgent, text, true)
+		m.dispatchUserTurn(m.defaultAgent, text, true, false)
 		m.syncViewport()
 		return m, nil
 	}
@@ -1402,7 +1414,7 @@ func (m Model) handleRouteDecision(msg routeDecisionMsg) (tea.Model, tea.Cmd) {
 		// at all, believed to be the common case, not the exception).
 	}
 
-	m.dispatchUserTurn(target, msg.prompt, true)
+	m.dispatchUserTurn(target, msg.prompt, true, false)
 	m.syncViewport()
 	return m, nil
 }
@@ -1441,25 +1453,33 @@ func formatContextLevelMenu(cursor int) string {
 	return b.String()
 }
 
-// dispatchUserTurn queues one resolved user turn to target, echoing it and
-// recording it in the activity log exactly like every successful dispatch
-// path does. When isPrompt is true (free text, not a slash command) and
-// this turn switches away from the agent that handled the previous one, it
-// prepends a one-time handoff preamble so the newly-selected agent — which
-// runs on its own isolated ACP session with no memory of the prior turns —
-// still gets the conversation so far as context. This is the single choke
-// point every switch-capable path funnels through (explicit "<agent>:"
-// prefix and routing "off" via handleNormalLine, the LLM router via
-// handleRouteDecision, its fallback via startRouteDecision), so the preamble
-// behaves identically no matter how the switch was triggered. Slash
-// commands (isPrompt false) are control commands, never preamble-wrapped —
-// prepending conversational context to a "/compact" or "/model" would only
-// confuse the command.
+// dispatchUserTurn queues one resolved user turn to target, optionally
+// echoing it, and records it in the activity log exactly like every
+// successful dispatch path does. When isPrompt is true (free text, not a
+// slash command) and this turn switches away from the agent that handled
+// the previous one, it prepends a one-time handoff preamble so the
+// newly-selected agent — which runs on its own isolated ACP session with
+// no memory of the prior turns — still gets the conversation so far as
+// context. This is the single choke point every switch-capable path
+// funnels through (explicit "<agent>:" prefix and routing "off" via
+// handleNormalLine, the LLM router via handleRouteDecision, its fallback
+// via startRouteDecision), so the preamble behaves identically no matter
+// how the switch was triggered. Slash commands (isPrompt false) are
+// control commands, never preamble-wrapped — prepending conversational
+// context to a "/compact" or "/model" would only confuse the command.
+//
+// echo controls whether this call renders the "echo what was asked" block
+// itself. False for both LLM-routing call sites (startRouteDecision's
+// fallback, handleRouteDecision's resolved dispatch) — startRouteDecision
+// already echoed the prompt under a neutral "routing" tag before the
+// decision was even made (see its own doc comment for why), so echoing
+// again here under the now-known target agent would show the same prompt
+// twice. True everywhere else, where this is the first and only echo.
 //
 // The echo and activity record always use the raw text, never the
 // preamble-wrapped prompt — the preamble is scaffolding for the agent, not
 // something to show the user or replay as prior context on the next switch.
-func (m *Model) dispatchUserTurn(target, text string, isPrompt bool) {
+func (m *Model) dispatchUserTurn(target, text string, isPrompt, echo bool) {
 	promptText := text
 	if isPrompt && m.lastRoutedAgent != "" && m.lastRoutedAgent != target {
 		promptText = buildHandoffPreamble(m.lastRoutedAgent, m.activityContext("full")) + "\n\n" + text
@@ -1468,11 +1488,13 @@ func (m *Model) dispatchUserTurn(target, text string, isPrompt bool) {
 		m.appendLine(errMsg + "\n")
 		return
 	}
-	// Echo what was actually asked — ACP never sends this back on a live
-	// turn (only on session/load history replay), so without this the only
-	// thing that ever appeared was the reply, with no way to tell which
-	// reply answered which question. Found live.
-	m.appendLine(m.renderer.FormatUserPrompt(target, text))
+	if echo {
+		// Echo what was actually asked — ACP never sends this back on a
+		// live turn (only on session/load history replay), so without
+		// this the only thing that ever appeared was the reply, with no
+		// way to tell which reply answered which question. Found live.
+		m.appendLine(m.renderer.FormatUserPrompt(target, text))
+	}
 	m.recordDispatch(target, text)
 }
 

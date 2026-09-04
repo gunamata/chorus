@@ -4,8 +4,9 @@ A single foreground CLI that owns several ACP agent sessions — Claude
 Code, Gemini CLI, and opencode. Type commands, they route to whichever
 agent you name, output streams back live, and permission questions
 surface as a normal prompt in the same terminal. Quit and come back
-later — see [Session persistence](#session-persistence) — and
-supported agents pick up where you left off instead of starting cold.
+later with `--resume` — see [Session persistence](#session-persistence)
+— and supported agents pick up where you left off instead of starting
+cold.
 
 No persistent daemon, no API keys required by chorus itself — Claude
 and Gemini authenticate via whatever you're already logged into
@@ -107,15 +108,15 @@ go build -o chorus.exe .
 ## Run
 
 ```sh
-./chorus.exe                                      # resumes prior sessions where possible
-./chorus.exe --fresh                              # start every agent clean, ignoring saved sessions
+./chorus.exe                                      # every agent starts a fresh session
+./chorus.exe --resume                             # resume prior sessions where possible instead
 ./chorus.exe --agents=agents.yaml.sandbox.windows # use a different agents.yaml than the default
 ```
 
-On startup chorus spawns all three agent subprocesses and creates (or
-resumes — see [Session persistence](#session-persistence)) an ACP
-session with each. If one fails to start (e.g. Gemini's tier
-restriction), chorus prints a warning and continues with whichever
+On startup chorus spawns all three agent subprocesses and creates (or,
+with `--resume` — see [Session persistence](#session-persistence) —
+resumes) an ACP session with each. If one fails to start (e.g. Gemini's
+tier restriction), chorus prints a warning and continues with whichever
 agent(s) started successfully.
 
 ### Usage
@@ -602,11 +603,11 @@ something that's possible:**
 - If a session already existed before a 2nd agent became available
   (e.g. you ran chorus with just Claude, then later added opencode to
   `agents.yaml`), chorus tracks per-agent "has this session ever been
-  briefed" independently of session resume/history, so that pre-existing
-  session picks up the briefing automatically on its next run — no
-  `--fresh` needed. (This used to require `--fresh`; fixed once it
-  turned out to be a likely real cause of unreliable delegation, not
-  just a theoretical gap — see chorus-spec.md §0.)
+  briefed" independently of session resume/history, so a `--resume`d
+  pre-existing session still picks up the briefing automatically on its
+  next run. (This used to require starting over with no way to resume at
+  all; fixed once it turned out to be a likely real cause of unreliable
+  delegation, not just a theoretical gap — see chorus-spec.md §0.)
 - **Delegation nudge**: ACP gives no way to redirect a tool call
   mid-permission-check (its response carries only allow/deny, no free
   text), so instead chorus counts how many direct tool calls a
@@ -749,9 +750,9 @@ binary assets.
 
 ## Session persistence
 
-Quit chorus and come back later — `claude:`/`opencode:` prompts pick up
-where you left off, in the same directory, instead of starting cold
-every time:
+Quit chorus and come back later with `--resume` — `claude:`/`opencode:`
+prompts pick up where you left off, in the same directory, instead of
+starting cold every time:
 
 ```
 $ ./chorus.exe
@@ -759,11 +760,17 @@ claude ready (session 07ab2684-...)
 > claude: remember the deploy target is us-east-1
 > quit
 
-$ ./chorus.exe
+$ ./chorus.exe --resume
 claude resumed (session 07ab2684-...)
 > claude: what's the deploy target again?
 [claude] us-east-1
 ```
+
+Every run starts fresh unless `--resume` is passed — this is a
+deliberate default (2026-09, inverted from the original resume-by-
+default/`--fresh`-to-opt-out behavior at the user's explicit request): a
+fresh session every time is the safer, more predictable choice for most
+usage, and resuming is the deliberate exception you ask for.
 
 This uses ACP's own `session/load` — not something chorus invented —
 so it only works for agents that advertise support for it (confirmed
@@ -799,9 +806,13 @@ carried over, not a silent assumption.
   chorus starts fresh under `~/.chorus/` the first time it runs in that
   project (falling back to a new session is already the normal, safe
   behavior for a missing or stale session ID).
-- `./chorus.exe --fresh` skips resuming and starts every agent clean —
-  the new session then becomes what gets resumed next time, not a
-  permanent opt-out.
+- Every run starts every agent with a fresh session **by default** —
+  pass `--resume` to resume prior sessions instead where possible (2026-09
+  — inverted from the original default-resume/`--fresh`-to-opt-out
+  behavior, at the user's explicit request, since a fresh session is the
+  safer, more predictable default for most usage). A session created by
+  any run — with or without `--resume` — becomes what a later `--resume`
+  run picks up; it's not a one-time opt-in.
 - If a saved session ID turns out to be stale (observed live: Claude's
   agent occasionally returns `session/load: Resource not found` for an
   ID that worked before — cause not pinned down, possibly related to

@@ -58,16 +58,16 @@ func main() {
 		return
 	}
 
-	fresh := hasFlag(os.Args[1:], "--fresh")
+	resume := hasFlag(os.Args[1:], "--resume")
 	agentsOverride := flagValue(os.Args[1:], "--agents=")
 
-	if err := run(fresh, agentsOverride); err != nil {
+	if err := run(resume, agentsOverride); err != nil {
 		fmt.Fprintln(os.Stderr, "chorus:", err)
 		os.Exit(1)
 	}
 }
 
-func run(fresh bool, agentsOverride string) error {
+func run(resume bool, agentsOverride string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 
@@ -181,14 +181,18 @@ func run(fresh bool, agentsOverride string) error {
 	// agent to delegate to.
 	//
 	// Resume via ACP's own session/load (§0/CLAUDE.md): only offered when
-	// the agent advertised the 'loadSession' capability at initialize AND
-	// .chorus/sessions.json has a session ID for it from a previous run
-	// AND --fresh wasn't passed. session/load replays the session's prior
-	// history back through the normal session/update -> outputCh -> render
-	// path, so a resumed conversation appears as visible scrollback, not
-	// silent state. A stale/rejected ID falls back to a fresh session
-	// rather than failing startup, and clears the bad ID so future runs
-	// don't keep retrying it.
+	// --resume was passed AND the agent advertised the 'loadSession'
+	// capability at initialize AND sessions.json has a session ID for it
+	// from a previous run. Every run defaults to a fresh session unless
+	// --resume is explicitly given (2026-09 — inverted from the original
+	// "resume by default, --fresh to opt out," at the user's explicit
+	// request: a fresh session by default is the safer, more predictable
+	// default for most usage, and resuming is the deliberate exception).
+	// session/load replays the session's prior history back through the
+	// normal session/update -> outputCh -> render path, so a resumed
+	// conversation appears as visible scrollback, not silent state. A
+	// stale/rejected ID falls back to a fresh session rather than failing
+	// startup, and clears the bad ID so future runs don't keep retrying it.
 	sessions := make(map[string]*session.AgentSession)
 	workers := make(map[string]*tui.AgentWorker)
 	// workersMu guards every access to workers below. The main goroutine
@@ -215,7 +219,7 @@ func run(fresh bool, agentsOverride string) error {
 			mcpServers = ms
 		}
 
-		s, resumed := resumeOrNewSession(ctx, conn, store, fresh, spec.Name, spec.EffectiveCwd(cwd), mcpServers)
+		s, resumed := resumeOrNewSession(ctx, conn, store, resume, spec.Name, spec.EffectiveCwd(cwd), mcpServers)
 		if s == nil {
 			fmt.Fprintf(os.Stderr, "warning: failed to create session for %s\n", spec.Name)
 			conn.Close()
@@ -228,8 +232,9 @@ func run(fresh bool, agentsOverride string) error {
 		if !resumed {
 			// A genuinely fresh session's history is empty — whatever
 			// briefing status a PRIOR session under this agent name reached
-			// (e.g. before a stale ID was rejected, or before --fresh) no
-			// longer applies. See ResetBriefed's doc comment.
+			// (e.g. before a stale ID was rejected, or --resume wasn't
+			// passed this run) no longer applies. See ResetBriefed's doc
+			// comment.
 			if err := store.ResetBriefed(spec.Name); err != nil {
 				fmt.Fprintf(os.Stderr, "warning: failed to reset delegation-briefing status for %s: %v\n", spec.Name, err)
 			}
@@ -385,12 +390,13 @@ func run(fresh bool, agentsOverride string) error {
 	return err
 }
 
-// resumeOrNewSession tries session/load when possible, falling back to a
-// fresh session/new — on missing capability, missing --fresh override,
-// no saved ID, or a rejected load. Returns (nil, false) only if even the
-// fresh-session fallback fails. resumed reports which path was taken.
-func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *sessionstore.Store, fresh bool, agent, cwd string, mcpServers []acp.McpServer) (s *session.AgentSession, resumed bool) {
-	if !fresh && conn.SupportsLoadSession {
+// resumeOrNewSession tries session/load when resume is true and possible,
+// falling back to a fresh session/new — on resume not being requested,
+// missing capability, no saved ID, or a rejected load. Returns (nil,
+// false) only if even the fresh-session fallback fails. resumed reports
+// which path was taken.
+func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *sessionstore.Store, resume bool, agent, cwd string, mcpServers []acp.McpServer) (s *session.AgentSession, resumed bool) {
+	if resume && conn.SupportsLoadSession {
 		if savedID, ok := store.Get(agent); ok {
 			s, err := conn.LoadSession(ctx, cwd, acp.SessionId(savedID), mcpServers)
 			if err == nil {
