@@ -113,9 +113,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # pattern restricts this to the binary artifacts the build job
+      # uploaded (chorus_<goos>_<goarch>) — an unfiltered download here
+      # also picks up docker/build-push-action's own auto-uploaded
+      # "<owner>~<repo>~<random>.dockerbuild" build-record artifact from
+      # the docker job below (same workflow run, so it shares the same
+      # artifact namespace), which actions/download-artifact's bulk/
+      # merge-multiple mode fails to extract — confirmed live: this
+      # exact failure ("Unable to download artifact(s)... after 5
+      # retries") is what broke the first real test release. Disabling
+      # the docker job's build-summary upload (DOCKER_BUILD_SUMMARY:
+      # false, below) is the root fix; this filter is defense-in-depth
+      # in case any other unrelated artifact ever lands in the same run.
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: chorus_*
           merge-multiple: true
 
       # Published alongside the binaries so install.sh/install.ps1 can seed
@@ -177,7 +190,17 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # DOCKER_BUILD_SUMMARY: false disables build-push-action's own
+      # auto-uploaded ".dockerbuild" build-record artifact — harmless on
+      # its own, but it lands in this SAME workflow run's artifact
+      # namespace as the build job's chorus_* binaries, and broke the
+      # release job's bulk artifact download the first time this workflow
+      # actually ran (see that job's own comment for the confirmed
+      # failure). Nothing here needs the GitHub Actions build-summary UI
+      # feature this would otherwise power.
       - uses: docker/build-push-action@v6
+        env:
+          DOCKER_BUILD_SUMMARY: false
         with:
           context: sandbox/${{ matrix.agent }}
           platforms: ${{ matrix.platforms }}
