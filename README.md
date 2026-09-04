@@ -427,27 +427,42 @@ with no `--agents` flag:
 Each step only runs if the previous one found nothing; the first match
 wins.
 
-**More than one config can coexist via `--agents=<path>`** — e.g. keep a
-plain `agents.yaml` for normal use and a separate sandboxed one (this
-repo ships `agents.yaml.sandbox.windows`/`.macos`/`.linux` — see
+**More than one config can coexist via `--agents=<path-or-url>`** — e.g.
+keep a plain `agents.yaml` for normal use and a separate sandboxed one
+(this repo ships `agents.yaml.sandbox.windows`/`.macos`/`.linux` — see
 [Sandboxing](#sandboxing-containers)) for a containerized run, switching
 per-invocation instead of renaming/swapping files:
 
 ```sh
 ./chorus.exe                                      # local -> central -> embedded, first match wins
-./chorus.exe --agents=agents.yaml.sandbox.windows # loads that file explicitly instead
+./chorus.exe --agents=agents.yaml.sandbox.windows # loads that local file explicitly instead
+./chorus.exe --agents=https://gist.githubusercontent.com/you/id/raw/agents.yaml # or fetch one remotely
 ```
 
-`--agents=<path>` always wins over all three steps above, and unlike
-them, a missing `--agents` path is a hard error rather than a silent
-fallback — you asked for that specific file.
+`--agents` always wins over the three local-resolution steps above, and
+unlike them, a missing/unreachable source is a hard error rather than a
+silent fallback — you asked for that specific one.
+
+**`--agents` also accepts an `https://` URL** (2026-09) — e.g. a raw
+GitHub Gist link — fetched fresh over the network on every launch, never
+cached to disk, so editing the remote source takes effect on your very
+next run with no separate update step. Plain `http://` is rejected
+outright, not just discouraged: see the next paragraph for why that
+matters more here than it might elsewhere. Capped at 1 MiB and a 15s
+timeout so an unreachable or misbehaving host doesn't hang startup or
+balloon memory.
 
 **`agents.yaml` is trusted, executable configuration, not passive
 data** — `spawn` is a literal command line chorus runs unconditionally
-at startup. Never point chorus at an `agents.yaml` you didn't write or
-don't fully trust; using someone else's is equivalent to running a
-script they handed you. Same trust model as a Makefile or a VS Code
-`tasks.json`.
+at startup. Never point chorus at an `agents.yaml` (local or remote) you
+didn't write or don't fully trust; using someone else's is equivalent to
+running a script they handed you. Same trust model as a Makefile or a
+VS Code `tasks.json` — a **remote URL is a strictly bigger version of
+that same risk**, since unlike a local file, its content can change
+between runs without you touching anything, and (over plain `http://`)
+could be tampered with in transit by anyone on the network path. Only
+point `--agents` at an `https://` URL you control or fully trust, the
+same way you'd think twice before piping a random URL into `sh`.
 
 ## Permission policy (`agents.yaml`)
 

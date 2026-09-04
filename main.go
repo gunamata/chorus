@@ -8,11 +8,14 @@ import (
 	_ "embed"
 	"fmt"
 	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/glamour"
@@ -440,8 +443,13 @@ var embeddedAgentsYAML []byte
 
 // loadAgentConfig resolves agents.yaml for this run, in this order:
 //
-//  1. --agents=<path> (override) — always wins, hard error if missing
-//     (the user named a specific file).
+//  1. --agents=<path-or-https-url> (override) — always wins, hard error
+//     if missing/unfetchable (the user named a specific source). As of
+//     2026-09, an `https://` (or `http://`) value is fetched over the
+//     network instead of read from disk — e.g. a raw GitHub Gist URL —
+//     re-fetched fresh every run, never cached; see fetchAgentsYAML's
+//     doc comment for why plain http:// is rejected outright rather
+//     than allowed.
 //  2. A local ./agents.yaml in cwd — for a per-project config that
 //     differs from your usual setup.
 //  3. A central ~/.chorus/agents.yaml (sessionstore.HomeDir,
@@ -455,10 +463,17 @@ var embeddedAgentsYAML []byte
 //     for a dev build (plain `go build`, no install script ever ran) or
 //     if the central file was deleted.
 //
-// Only step 1 is a hard error on a missing file; steps 2-4 are a plain
-// progressive fallback chain, by design.
+// Only step 1 is a hard error on a missing/unreachable source; steps 2-4
+// are a plain progressive fallback chain, by design.
 func loadAgentConfig(cwd string, override string) ([]session.Spec, policy.Config, error) {
 	if override != "" {
+		if isRemoteAgentsSource(override) {
+			b, err := fetchAgentsYAML(override)
+			if err != nil {
+				return nil, policy.Config{}, fmt.Errorf("fetch %s (from --agents): %w", override, err)
+			}
+			return parseAgentsYAML(override, b)
+		}
 		agentsPath := override
 		if !filepath.IsAbs(agentsPath) {
 			agentsPath = filepath.Join(cwd, agentsPath)
@@ -467,11 +482,7 @@ func loadAgentConfig(cwd string, override string) ([]session.Spec, policy.Config
 		if err != nil {
 			return nil, policy.Config{}, fmt.Errorf("read %s (from --agents): %w", agentsPath, err)
 		}
-		agentSpecs, cfg, err := registry.Parse(b)
-		if err != nil {
-			return nil, policy.Config{}, fmt.Errorf("load %s: %w", agentsPath, err)
-		}
-		return agentSpecs, cfg, nil
+		return parseAgentsYAML(agentsPath, b)
 	}
 
 	localPath := filepath.Join(cwd, "agents.yaml")
@@ -516,6 +527,65 @@ func parseAgentsYAML(source string, b []byte) ([]session.Spec, policy.Config, er
 		return nil, policy.Config{}, fmt.Errorf("load %s: %w", source, err)
 	}
 	return agentSpecs, cfg, nil
+}
+
+// isRemoteAgentsSource reports whether a --agents= value names a network
+// URL (e.g. a raw GitHub Gist link) rather than a local file path.
+func isRemoteAgentsSource(s string) bool {
+	return strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")
+}
+
+// agentsFetchTimeout bounds how long chorus waits for a remote --agents=
+// URL to respond, so an unreachable/hung host doesn't block startup
+// indefinitely.
+const agentsFetchTimeout = 15 * time.Second
+
+// agentsFetchMaxBytes caps how much of a remote --agents= response chorus
+// reads — a real agents.yaml is a few KB at most; this only exists to
+// stop a misconfigured or malicious URL from streaming an unbounded
+// response into memory, mirroring this codebase's other defensive caps
+// (nativeCommandOutputLimit, CreateTerminal's OutputByteLimit).
+const agentsFetchMaxBytes = 1 << 20 // 1 MiB
+
+// fetchAgentsYAML downloads a --agents= URL (e.g. a raw GitHub Gist link)
+// fresh on every run — never cached to disk, so an edit to the remote
+// source takes effect on the very next launch with no separate "update"
+// step. https:// only: agents.yaml's `spawn` is a literal command line
+// chorus execs unconditionally at startup (see embeddedAgentsYAML's doc
+// comment and README's "trusted, executable configuration" warning), so
+// fetching it over plain http:// would let any on-path network attacker
+// silently rewrite what gets executed on every future run that reuses
+// the same URL — a materially worse version of the same risk a local
+// file already carries, since a local file at least can't be tampered
+// with remotely. Rejected outright rather than allowed with a warning:
+// this isn't a call the network layer should get to make silently.
+func fetchAgentsYAML(rawURL string) ([]byte, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("invalid URL: %w", err)
+	}
+	if u.Scheme != "https" {
+		return nil, fmt.Errorf("only https:// URLs are supported (got %q) — agents.yaml's spawn commands are exec'd unconditionally, so fetching it over plain http would let a network attacker inject arbitrary commands", u.Scheme)
+	}
+
+	client := &http.Client{Timeout: agentsFetchTimeout}
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected HTTP status: %s", resp.Status)
+	}
+
+	b, err := io.ReadAll(io.LimitReader(resp.Body, agentsFetchMaxBytes+1))
+	if err != nil {
+		return nil, fmt.Errorf("read response body: %w", err)
+	}
+	if len(b) > agentsFetchMaxBytes {
+		return nil, fmt.Errorf("response exceeds %d bytes — refusing to load", agentsFetchMaxBytes)
+	}
+	return b, nil
 }
 
 // validateRoutingConfig catches a routing.decision_agent misconfiguration

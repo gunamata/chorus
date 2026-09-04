@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -207,6 +210,110 @@ func TestLoadAgentConfig_MissingOverrideIsAHardError(t *testing.T) {
 	dir := t.TempDir()
 	if _, _, err := loadAgentConfig(dir, "does-not-exist.yaml"); err == nil {
 		t.Fatal("loadAgentConfig() error = nil, want an error for a missing --agents override (unlike the no-override case, this must not silently fall back to the embedded default)")
+	}
+}
+
+// --- loadAgentConfig: --agents=<https-url> (remote fetch) ---------------
+
+func TestIsRemoteAgentsSource(t *testing.T) {
+	cases := map[string]bool{
+		"https://gist.githubusercontent.com/u/id/raw/agents.yaml": true,
+		"http://example.com/agents.yaml":                          true,
+		"agents.yaml":                                             false,
+		"agents.yaml.sandbox":                                     false,
+		"/abs/path/agents.yaml":                                   false,
+		"C:\\agents.yaml":                                         false,
+	}
+	for in, want := range cases {
+		if got := isRemoteAgentsSource(in); got != want {
+			t.Errorf("isRemoteAgentsSource(%q) = %v, want %v", in, got, want)
+		}
+	}
+}
+
+func TestFetchAgentsYAML_RejectsPlainHTTP(t *testing.T) {
+	_, err := fetchAgentsYAML("http://example.com/agents.yaml")
+	if err == nil {
+		t.Fatal("fetchAgentsYAML() error = nil, want plain http:// rejected outright")
+	}
+	if !strings.Contains(err.Error(), "https") {
+		t.Fatalf("error = %q, want it to explain https-only", err)
+	}
+}
+
+func TestFetchAgentsYAML_SuccessOverHTTPS(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, testAgentsYAML)
+	}))
+	defer srv.Close()
+	// httptest.NewTLSServer uses a self-signed cert; fetchAgentsYAML uses
+	// http.DefaultTransport via a plain http.Client, which won't trust it
+	// unless we borrow the test server's own client (same cert pool).
+	orig := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = orig }()
+
+	b, err := fetchAgentsYAML(srv.URL)
+	if err != nil {
+		t.Fatalf("fetchAgentsYAML() error = %v", err)
+	}
+	if string(b) != testAgentsYAML {
+		t.Fatalf("fetchAgentsYAML() = %q, want %q", b, testAgentsYAML)
+	}
+}
+
+func TestFetchAgentsYAML_NonOKStatusIsAnError(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	orig := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = orig }()
+
+	if _, err := fetchAgentsYAML(srv.URL); err == nil {
+		t.Fatal("fetchAgentsYAML() error = nil, want an error for a 404 response")
+	}
+}
+
+func TestFetchAgentsYAML_OversizedResponseIsRejected(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, strings.Repeat("x", agentsFetchMaxBytes+1))
+	}))
+	defer srv.Close()
+	orig := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = orig }()
+
+	if _, err := fetchAgentsYAML(srv.URL); err == nil {
+		t.Fatal("fetchAgentsYAML() error = nil, want an error for a response over the size cap")
+	}
+}
+
+func TestLoadAgentConfig_RemoteURLOverrideIsFetchedAndParsed(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, testAgentsYAML)
+	}))
+	defer srv.Close()
+	orig := http.DefaultTransport
+	http.DefaultTransport = srv.Client().Transport
+	defer func() { http.DefaultTransport = orig }()
+
+	agentSpecs, cfg, err := loadAgentConfig(t.TempDir(), srv.URL)
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v", err)
+	}
+	if len(agentSpecs) != 1 || agentSpecs[0].Name != "test-only-agent" {
+		t.Fatalf("agentSpecs = %+v, want the remote file's test-only-agent", agentSpecs)
+	}
+	if cfg.DefaultAgent != "test-only-agent" {
+		t.Fatalf("cfg.DefaultAgent = %q, want the remote file's value", cfg.DefaultAgent)
+	}
+}
+
+func TestLoadAgentConfig_UnreachableRemoteURLIsAHardError(t *testing.T) {
+	if _, _, err := loadAgentConfig(t.TempDir(), "https://127.0.0.1:1/agents.yaml"); err == nil {
+		t.Fatal("loadAgentConfig() error = nil, want an error when the --agents URL can't be reached")
 	}
 }
 
