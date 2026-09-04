@@ -1,5 +1,20 @@
 # chorus
 
+> **⚠️ Experimental, not production-ready.** chorus is a personal/
+> exploratory project under active development. Interfaces, defaults,
+> and behavior can change without notice between versions, several
+> features are unit-tested but not yet confirmed working in a real
+> terminal (see [Known limitations](#known-limitations)), and it hasn't
+> had the kind of broad real-world usage that would surface issues a
+> single developer's testing wouldn't catch. Use at your own risk —
+> don't point it at anything you can't afford to have go sideways, and
+> review what `agents.yaml` lets each agent do (see
+> [Permission policy](#permission-policy-agentsyaml)) before trusting it
+> with real work.
+>
+> Feedback, bug reports, and contributions are very welcome — this is
+> exactly the stage where they're most useful.
+
 A single foreground CLI that owns several ACP agent sessions — Claude
 Code, Gemini CLI, and opencode. Type commands, they route to whichever
 agent you name, output streams back live, and permission questions
