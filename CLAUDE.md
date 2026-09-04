@@ -32,7 +32,18 @@ image's `arm64` availability was never confirmed). Needs
 `DOCKERHUB_USERNAME`/`DOCKERHUB_TOKEN` (an access token, not the account
 password) as repo secrets for the Docker half. `main.go`'s
 `version`/`commit`/`date` vars are stamped via `-ldflags` in that
-workflow — `chorus --version` surfaces them.
+workflow — `chorus --version` surfaces them. The `softprops/action-gh-release`
+step sets `prerelease: false`/`make_latest: true` explicitly — don't
+remove these. Early releases were manually marked "prerelease" on
+GitHub after creation, which made them invisible to
+`/releases/latest` (GitHub excludes prereleases/drafts from that
+endpoint by design) even though the assets themselves were complete —
+the exact failure a user hit live via `install.sh`/`install.ps1`'s
+"look up the latest release" step. Explicit here so a normal release
+never depends on remembering not to check that box, and so a
+`workflow_dispatch` re-run against an existing release is
+deterministic — this action's documented behavior is that an unset
+field on a re-run RETAINS whatever the existing release already had.
 
 `install.sh` (POSIX sh)/`install.ps1` (Windows) download the matching
 release binary and seed `~/.chorus/agents.yaml` on first install only

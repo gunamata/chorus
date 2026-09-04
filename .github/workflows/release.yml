@@ -143,10 +143,26 @@ jobs:
         working-directory: dist
         run: sha256sum chorus_* agents.yaml > checksums.txt
 
+      # prerelease/make_latest set explicitly rather than left unset:
+      # v0.0.2-v0.0.4 were all manually marked "prerelease" on GitHub
+      # after creation, which made them invisible to GitHub's own
+      # /releases/latest API endpoint (excludes prereleases/drafts by
+      # design) even though their assets were complete and correct —
+      # the exact failure a user hit live via install.sh/install.ps1's
+      # "look up the latest release" step. Explicit here so (a) a normal
+      # tag-push release never depends on remembering to leave a
+      # checkbox alone, and (b) a workflow_dispatch re-run against an
+      # existing release is deterministic — this action's own documented
+      # behavior is that any field left unset on a re-run RETAINS
+      # whatever the existing release already had, so an unset
+      # `prerelease` here would silently stay `true` on a re-run against
+      # a release that had been manually flagged that way.
       - uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ needs.prepare.outputs.tag }}
           generate_release_notes: true
+          prerelease: false
+          make_latest: true
           files: dist/*
 
   # Builds and pushes the three sandbox images (see sandbox/*/README.md) to

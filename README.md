@@ -1,7 +1,7 @@
 # chorus
 
 > **⚠️ Experimental, not production-ready.** chorus is a personal/
-> exploratory project under active development. Interfaces, defaults,
+> exploratory project. Interfaces, defaults,
 > and behavior can change without notice between versions, several
 > features are unit-tested but not yet confirmed working in a real
 > terminal (see [Known limitations](#known-limitations)), and it hasn't
