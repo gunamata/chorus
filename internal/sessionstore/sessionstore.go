@@ -1,9 +1,21 @@
 // Package sessionstore persists each agent's main-interactive-session ID
-// across chorus runs, in a project-local file, so a resumed run can call
-// ACP's session/load instead of always starting fresh. Sessions are
-// scoped per-project because ACP's session/load itself requires the
-// request's cwd to match the session's original cwd — a session ID is
-// only meaningful in the directory it was created in.
+// across chorus runs, so a resumed run can call ACP's session/load
+// instead of always starting fresh. Sessions are scoped per-project
+// because ACP's session/load itself requires the request's cwd to match
+// the session's original cwd — a session ID is only meaningful in the
+// directory it was created in.
+//
+// As of 2026-09-03, the store itself lives centrally under
+// ~/.chorus/projects/<slug>/ (ProjectDir) rather than a per-project
+// ./.chorus/ directory — the per-project SCOPING of session IDs hasn't
+// changed (still keyed by cwd, for the reason above), only WHERE that
+// per-project state is physically kept on disk, so a project's .git-style
+// clutter doesn't include a chorus-owned directory and every project's
+// state is visible/cleanable from one place. Pre-existing ./.chorus/
+// directories from before this change are simply orphaned, not migrated
+// — chorus never reads them again, and a "session not found" style fresh
+// restart is already the documented fallback behavior for a missing or
+// stale session anyway (see resumeOrNewSession in main.go).
 //
 // Only the main interactive session per agent is ever stored here.
 // Delegation sub-sessions (§11) are intentionally short-lived and never
@@ -23,10 +35,76 @@
 package sessionstore
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
+	"runtime"
+	"strings"
 )
+
+// HomeDir returns chorus's centralized per-user state root (~/.chorus),
+// overridable via CHORUS_HOME (mainly so tests never touch a real home
+// directory, but also a legitimate escape hatch for anyone who wants
+// chorus's state somewhere else entirely, e.g. a non-default drive).
+func HomeDir() (string, error) {
+	if h := os.Getenv("CHORUS_HOME"); h != "" {
+		return h, nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".chorus"), nil
+}
+
+var slugUnsafe = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+// ProjectDir returns the directory under HomeDir that holds cwd's session
+// store, agent stderr logs, and inbound-image cache
+// (~/.chorus/projects/<slug>). A pure path computation — it does not
+// create the directory; callers (Load's caller via os.MkdirAll in save,
+// main.go for logs/images) create it exactly as they did when this lived
+// under a project-local ./.chorus/.
+//
+// <slug> is cwd's base name (for a directory listing a human can actually
+// recognize) plus a short hash of the full absolute path (for collision
+// safety — two different projects that happen to share a base name, e.g.
+// two separate "chorus" checkouts in different places, must never share
+// state). Windows paths are case-insensitive, so the hash is computed on
+// a lower-cased path there specifically so "C:\Chorus" and "c:\chorus"
+// — the same directory as far as the filesystem is concerned — hash
+// identically instead of silently getting two unrelated state dirs.
+func ProjectDir(cwd string) (string, error) {
+	home, err := HomeDir()
+	if err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(cwd)
+	if err != nil {
+		return "", err
+	}
+	// Both the hash AND the human-readable base name are derived from this
+	// same case-folded form on Windows — deriving only the hash from it
+	// (an earlier version of this function) still let "C:\Chorus" and
+	// "c:\chorus" collide on the hash but land in two different-looking
+	// sibling directories ("Chorus-<hash>" vs "chorus-<hash>"), defeating
+	// the whole point. Caught by TestProjectDir_CaseInsensitiveOnWindows
+	// before shipping.
+	slugInput := abs
+	if runtime.GOOS == "windows" {
+		slugInput = strings.ToLower(abs)
+	}
+	sum := sha256.Sum256([]byte(slugInput))
+	hash := hex.EncodeToString(sum[:6]) // 12 hex chars — plenty to avoid collisions here
+	base := slugUnsafe.ReplaceAllString(filepath.Base(slugInput), "_")
+	if base == "" || base == "_" {
+		base = "project"
+	}
+	return filepath.Join(home, "projects", base+"-"+hash), nil
+}
 
 // entry is one agent's stored state. Briefed persists independently of
 // SessionID — a session resumed across many runs keeps its briefing

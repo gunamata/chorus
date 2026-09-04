@@ -7,9 +7,17 @@
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/gunamata/chorus/main/install.sh | sh
 #
+# Also seeds ~/.chorus/agents.yaml from the release's bundled default, but
+# ONLY if that file doesn't already exist — never overwrites it on an
+# upgrade, so any local edits (models, cost tiers, delegation/routing
+# settings) survive across chorus versions instead of reverting to
+# whatever the new binary happens to embed.
+#
 # Env overrides:
 #   CHORUS_VERSION     specific tag to install, e.g. "v0.2.0" (default: latest)
-#   CHORUS_INSTALL_DIR directory to install the binary into (default: see below)
+#   CHORUS_INSTALL_DIR directory to install the binary into (default: ~/.chorus/bin)
+#   CHORUS_HOME        directory the seeded agents.yaml goes into (default: ~/.chorus) —
+#                      must match what chorus itself resolves (sessionstore.HomeDir)
 set -eu
 
 REPO="gunamata/chorus"
@@ -65,35 +73,53 @@ base_url="https://github.com/$REPO/releases/download/$version"
 workdir=$(mktemp -d)
 trap 'rm -rf "$workdir"' EXIT
 
-log "Downloading $archive..."
-curl -fsSL -o "$workdir/$archive" "$base_url/$archive" \
-    || die "download failed — does release $version have a $goos/$goarch asset? ($base_url/$archive)"
-
-log "Verifying checksum..."
+log "Verifying checksums.txt for $version..."
 curl -fsSL -o "$workdir/checksums.txt" "$base_url/checksums.txt" \
     || die "couldn't download checksums.txt for $version"
-# sha256sum's own output format varies (a plain space or a
-# space-then-asterisk before the filename, depending on platform/mode) —
-# match by filename via awk (whitespace-delimited, so both forms line up
-# in $2) rather than a fragile fixed-spacing grep.
-expected=$(awk -v f="$archive" '$2 == f || $2 == "*" f {print $1}' "$workdir/checksums.txt")
-[ -n "$expected" ] || die "no checksum entry found for $archive in checksums.txt"
-actual=$(sha256 "$workdir/$archive")
-[ "$expected" = "$actual" ] || die "checksum mismatch for $archive (expected $expected, got $actual)"
+
+# download_verified URL DEST NAME [strict]
+# Downloads URL to DEST and verifies it against checksums.txt's entry for
+# NAME (sha256sum's own output format varies — a plain space or a
+# space-then-asterisk before the filename, depending on platform/mode —
+# so this matches by filename via awk, whitespace-delimited, rather than
+# a fragile fixed-spacing grep). "strict" (the main chorus archive): any
+# failure aborts the whole install. Non-strict (the optional agents.yaml
+# seed below): a failure — e.g. CHORUS_VERSION pinned to an older release
+# published before agents.yaml existed as an asset — just warns and
+# returns non-zero, since seeding the central config is a convenience,
+# never a requirement (chorus falls back to its embedded default with no
+# central file present).
+download_verified() {
+    url="$1"; dest="$2"; name="$3"; strict="${4:-}"
+    if ! curl -fsSL -o "$dest" "$url"; then
+        [ "$strict" = "strict" ] && die "download failed: $url"
+        log "warning: couldn't download $name ($url) — skipping"
+        return 1
+    fi
+    expected=$(awk -v f="$name" '$2 == f || $2 == "*" f {print $1}' "$workdir/checksums.txt")
+    if [ -z "$expected" ]; then
+        [ "$strict" = "strict" ] && die "no checksum entry found for $name in checksums.txt"
+        log "warning: no checksum entry found for $name — skipping"
+        return 1
+    fi
+    actual=$(sha256 "$dest")
+    if [ "$expected" != "$actual" ]; then
+        [ "$strict" = "strict" ] && die "checksum mismatch for $name (expected $expected, got $actual)"
+        log "warning: checksum mismatch for $name — skipping"
+        return 1
+    fi
+    return 0
+}
+
+log "Downloading $archive..."
+download_verified "$base_url/$archive" "$workdir/$archive" "$archive" strict
 
 log "Extracting..."
 tar -xzf "$workdir/$archive" -C "$workdir"
 [ -f "$workdir/chorus" ] || die "archive didn't contain a 'chorus' binary as expected"
 chmod +x "$workdir/chorus"
 
-install_dir="${CHORUS_INSTALL_DIR:-}"
-if [ -z "$install_dir" ]; then
-    if [ -w /usr/local/bin ]; then
-        install_dir=/usr/local/bin
-    else
-        install_dir="$HOME/.local/bin"
-    fi
-fi
+install_dir="${CHORUS_INSTALL_DIR:-$HOME/.chorus/bin}"
 mkdir -p "$install_dir"
 mv "$workdir/chorus" "$install_dir/chorus"
 log "Installed to $install_dir/chorus"
@@ -107,6 +133,16 @@ case ":$PATH:" in
         log "then restart your shell."
         ;;
 esac
+
+chorus_home="${CHORUS_HOME:-$HOME/.chorus}"
+agents_dest="$chorus_home/agents.yaml"
+if [ -f "$agents_dest" ]; then
+    log "Existing $agents_dest left untouched (never overwritten on install/upgrade)."
+elif download_verified "$base_url/agents.yaml" "$workdir/agents.yaml" "agents.yaml"; then
+    mkdir -p "$chorus_home"
+    mv "$workdir/agents.yaml" "$agents_dest"
+    log "Wrote default config to $agents_dest"
+fi
 
 log ""
 "$install_dir/chorus" --version 2>/dev/null || true

@@ -111,14 +111,24 @@ jobs:
     needs: [prepare, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
 
+      # Published alongside the binaries so install.sh/install.ps1 can seed
+      # ~/.chorus/agents.yaml on first install without needing to execute
+      # the freshly-downloaded binary just to extract its embedded copy —
+      # this IS that embedded copy (go:embed agents.yaml in main.go reads
+      # the exact same repo file, checked out at this exact tag).
+      - name: Include agents.yaml
+        run: cp agents.yaml dist/agents.yaml
+
       - name: Checksums
         working-directory: dist
-        run: sha256sum chorus_* > checksums.txt
+        run: sha256sum chorus_* agents.yaml > checksums.txt
 
       - uses: softprops/action-gh-release@v2
         with:

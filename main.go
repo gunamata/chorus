@@ -84,9 +84,18 @@ func run(fresh bool, agentsOverride string) error {
 		return err
 	}
 
-	store, err := sessionstore.Load(filepath.Join(cwd, ".chorus", "sessions.json"))
+	// projectDir is this project's slice of chorus's centralized state
+	// (~/.chorus/projects/<slug> — see sessionstore.ProjectDir's doc
+	// comment) — session IDs, agent stderr logs, and the inbound-image
+	// cache all live under here now instead of a per-project ./.chorus/.
+	projectDir, err := sessionstore.ProjectDir(cwd)
 	if err != nil {
-		return fmt.Errorf("load .chorus/sessions.json: %w", err)
+		return fmt.Errorf("determine chorus state directory: %w", err)
+	}
+
+	store, err := sessionstore.Load(filepath.Join(projectDir, "sessions.json"))
+	if err != nil {
+		return fmt.Errorf("load sessions.json: %w", err)
 	}
 
 	outputCh := make(chan bus.Update, 64)
@@ -103,7 +112,7 @@ func run(fresh bool, agentsOverride string) error {
 	// to discarding subprocess stderr entirely (io.Discard) rather than
 	// falling back to the terminal, which would reintroduce exactly the
 	// problem this exists to avoid.
-	logDir := filepath.Join(cwd, ".chorus", "logs")
+	logDir := filepath.Join(projectDir, "logs")
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: couldn't create %s, agent subprocess stderr will be discarded (not shown, not logged): %v\n", logDir, err)
 		logDir = ""
@@ -311,7 +320,7 @@ func run(fresh bool, agentsOverride string) error {
 		style = "dark"
 	}
 	r.SetStyle(glamour.WithStandardStyle(style))
-	imageDir := filepath.Join(cwd, ".chorus", "images")
+	imageDir := filepath.Join(projectDir, "images")
 	if err := os.MkdirAll(imageDir, 0o700); err != nil { // owner-only, see chorus-spec.md §0's 2026-08-22 audit
 		fmt.Fprintf(os.Stderr, "warning: couldn't create %s, inbound images will show as a placeholder: %v\n", imageDir, err)
 	} else {
@@ -407,7 +416,12 @@ func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *se
 // per CLAUDE.md's delegation-maximization plan) doubles as the shipped
 // default, rather than maintaining a second, separate "default" file
 // that could drift from what's actually tested. loadAgentConfig falls
-// back to this only when no local agents.yaml exists in cwd.
+// back to this only when neither a local nor a central agents.yaml
+// exists (see loadAgentConfig's doc comment) — the same file also ships
+// as a release asset (see .github/workflows/release.yml) so
+// install.sh/install.ps1 can seed the central copy with byte-identical
+// content without needing to run the freshly-downloaded binary to
+// extract it.
 //
 // policy.yaml no longer exists (chorus-spec.md §0) — permission settings
 // (auto_allow/auto_allow_tools) moved into each agent's own entry in this
@@ -418,18 +432,25 @@ func resumeOrNewSession(ctx context.Context, conn *session.Connection, store *se
 //go:embed agents.yaml
 var embeddedAgentsYAML []byte
 
-// loadAgentConfig resolves agents.yaml for this run.
+// loadAgentConfig resolves agents.yaml for this run, in this order:
 //
-// override (from --agents=<path>, e.g. --agents=agents.yaml.sandbox) lets
-// more than one config coexist in the same directory without renaming —
-// added so a sandboxed config can sit alongside the default one, picked
-// explicitly per invocation rather than by swapping files in place. An
-// override that doesn't exist is a hard error (the user asked for that
-// specific file), unlike the no-override case below, where a missing
-// agents.yaml silently falls back to the embedded default by design.
+//  1. --agents=<path> (override) — always wins, hard error if missing
+//     (the user named a specific file).
+//  2. A local ./agents.yaml in cwd — for a per-project config that
+//     differs from your usual setup.
+//  3. A central ~/.chorus/agents.yaml (sessionstore.HomeDir,
+//     CHORUS_HOME-overridable) — added 2026-09-03 so a user's own
+//     tuned defaults (models, cost tiers, delegation/routing settings)
+//     survive a chorus upgrade instead of reverting to whatever that
+//     new binary happens to embed. install.sh/install.ps1 seed this
+//     file once, on first install only — see their own comments for why
+//     they never overwrite it.
+//  4. The embedded default (embeddedAgentsYAML) — the final fallback
+//     for a dev build (plain `go build`, no install script ever ran) or
+//     if the central file was deleted.
 //
-// With no override: a local agents.yaml file in cwd always takes
-// precedence over the embedded default.
+// Only step 1 is a hard error on a missing file; steps 2-4 are a plain
+// progressive fallback chain, by design.
 func loadAgentConfig(cwd string, override string) ([]session.Spec, policy.Config, error) {
 	if override != "" {
 		agentsPath := override
@@ -447,26 +468,47 @@ func loadAgentConfig(cwd string, override string) ([]session.Spec, policy.Config
 		return agentSpecs, cfg, nil
 	}
 
-	agentsPath := filepath.Join(cwd, "agents.yaml")
-
-	localAgents, err := fileExists(agentsPath)
+	localPath := filepath.Join(cwd, "agents.yaml")
+	localExists, err := fileExists(localPath)
 	if err != nil {
-		return nil, policy.Config{}, fmt.Errorf("check %s: %w", agentsPath, err)
+		return nil, policy.Config{}, fmt.Errorf("check %s: %w", localPath, err)
 	}
-
-	agentsYAML := embeddedAgentsYAML
-	if localAgents {
-		b, err := os.ReadFile(agentsPath)
+	if localExists {
+		b, err := os.ReadFile(localPath)
 		if err != nil {
-			return nil, policy.Config{}, fmt.Errorf("read %s: %w", agentsPath, err)
+			return nil, policy.Config{}, fmt.Errorf("read %s: %w", localPath, err)
 		}
-		agentsYAML = b
-	}
-	agentSpecs, cfg, err := registry.Parse(agentsYAML)
-	if err != nil {
-		return nil, policy.Config{}, fmt.Errorf("load agents.yaml: %w", err)
+		return parseAgentsYAML(localPath, b)
 	}
 
+	// No local override — try the central copy before falling back to
+	// the embedded default. A HomeDir failure (os.UserHomeDir erroring —
+	// unusual, e.g. no HOME/USERPROFILE set at all) degrades straight to
+	// embedded rather than failing the whole run: the central file is a
+	// convenience layer, never a requirement.
+	if home, homeErr := sessionstore.HomeDir(); homeErr == nil {
+		centralPath := filepath.Join(home, "agents.yaml")
+		centralExists, err := fileExists(centralPath)
+		if err != nil {
+			return nil, policy.Config{}, fmt.Errorf("check %s: %w", centralPath, err)
+		}
+		if centralExists {
+			b, err := os.ReadFile(centralPath)
+			if err != nil {
+				return nil, policy.Config{}, fmt.Errorf("read %s: %w", centralPath, err)
+			}
+			return parseAgentsYAML(centralPath, b)
+		}
+	}
+
+	return parseAgentsYAML("embedded agents.yaml", embeddedAgentsYAML)
+}
+
+func parseAgentsYAML(source string, b []byte) ([]session.Spec, policy.Config, error) {
+	agentSpecs, cfg, err := registry.Parse(b)
+	if err != nil {
+		return nil, policy.Config{}, fmt.Errorf("load %s: %w", source, err)
+	}
 	return agentSpecs, cfg, nil
 }
 

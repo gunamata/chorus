@@ -235,6 +235,20 @@ type Model struct {
 	selecting        bool
 	selectAnchorLine int
 	selectCurLine    int
+	// selectionActive is whether [selectAnchorLine, selectCurLine] should
+	// currently be rendered with a highlight (applySelectionHighlight) —
+	// separate from `selecting` (which specifically means "mouse button
+	// currently held, motion events should keep extending the range").
+	// True from the initial press through release AND for a while after
+	// (so the just-copied text stays visibly marked, the same lifespan as
+	// lastCopyStatus's confirmation message below), cleared on the next
+	// keypress. Found live (2026-09, user report): without any highlight
+	// at all, a click-drag copied the right text to the clipboard but
+	// looked like nothing happened on screen — the copy worked, but a
+	// user watching the screen had no visual confirmation anything was
+	// selected while dragging, which reads as broken even though it
+	// wasn't.
+	selectionActive bool
 	// lastCopyStatus is a one-shot confirmation ("3 lines copied" / a
 	// clipboard error) shown on the mode-status line in View() right
 	// after a selection completes, then cleared on the next keypress or
@@ -674,10 +688,12 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case tea.MouseActionPress:
 			if msg.Y >= 0 && msg.Y < m.viewport.Height {
 				m.selecting = true
+				m.selectionActive = true
 				m.lastCopyStatus = ""
 				line := m.viewport.YOffset + msg.Y
 				m.selectAnchorLine = line
 				m.selectCurLine = line
+				m.syncViewport()
 			} else {
 				m.selecting = false
 			}
@@ -686,13 +702,16 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		case tea.MouseActionMotion:
 			if m.selecting {
 				m.selectCurLine = m.viewport.YOffset + clampInt(msg.Y, 0, m.viewport.Height-1)
+				m.syncViewport()
 			}
 			return m, nil
 
 		case tea.MouseActionRelease:
 			if m.selecting {
 				m.selecting = false
-				return m.copySelection(), nil
+				m = m.copySelection()
+				m.syncViewport()
+				return m, nil
 			}
 			return m, nil
 		}
@@ -1009,6 +1028,15 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) Model {
 // original REPL's lineCh-handling order (main.go's old select loop).
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.lastCopyStatus = "" // one-shot — see its doc comment
+	if m.selectionActive {
+		// Dismiss a lingering selection highlight on the next keypress,
+		// same one-shot lifespan as lastCopyStatus above. Only re-syncs
+		// the viewport when there was actually something to clear, so an
+		// ordinary keypress with no prior selection doesn't pay for a
+		// redundant re-render.
+		m.selectionActive = false
+		m.syncViewport()
+	}
 	switch msg.Type {
 	case tea.KeyCtrlC:
 		m.quitting = true
@@ -1700,7 +1728,19 @@ func (m *Model) appendLine(text string) {
 // menu is resolved.
 func (m *Model) syncViewport() {
 	atBottom := m.viewport.AtBottom()
-	m.viewport.SetContent(m.renderDocument())
+	doc := m.renderDocument()
+	if m.selectionActive {
+		// Display-only concern, deliberately not part of renderDocument
+		// itself: copySelection/extractSelection also call renderDocument
+		// to know what text to put on the clipboard, and must always see
+		// the plain, unhighlighted document — HighlightLine's padding
+		// isn't real content, and copying it in would pollute the
+		// clipboard with garbage whitespace (a real bug caught by
+		// TestModel_HandleMouse_PressDragReleaseCopiesSelection before
+		// this split existed).
+		doc = m.applySelectionHighlight(doc)
+	}
+	m.viewport.SetContent(doc)
 	if atBottom || m.mode() != modeNormal {
 		m.viewport.GotoBottom()
 	}
@@ -1727,6 +1767,41 @@ func (m Model) renderDocument() string {
 		return doc
 	}
 	return wordwrap.String(doc, m.viewport.Width)
+}
+
+// applySelectionHighlight re-styles the lines between selectAnchorLine and
+// selectCurLine (inclusive, order-independent) with a full-width
+// background highlight (renderer.HighlightLine — the same convention used
+// for the prompt-echo highlight), so click-drag selection (handleMouse)
+// gives real-time visual feedback while dragging instead of silently
+// copying to the clipboard on release with nothing shown on screen in the
+// meantime — a real gap reported live (2026-09).
+//
+// Deliberately strips each selected line's own ANSI styling first rather
+// than layering the highlight's background on top of it: many lines carry
+// embedded SGR resets (glamour markdown, diff coloring, tool-call status
+// colors) that would cut the highlight short partway through the line if
+// simply prepended/appended around the existing codes, leaving a ragged,
+// partially-highlighted look — the exact problem HighlightLine's own
+// padding already solves for plain text. Trading the underlying syntax
+// color for a solid, unambiguous highlight during selection matches how
+// most editors/terminals visually treat a selection anyway.
+func (m Model) applySelectionHighlight(doc string) string {
+	lo, hi := m.selectAnchorLine, m.selectCurLine
+	if lo > hi {
+		lo, hi = hi, lo
+	}
+	if lo < 0 {
+		lo = 0
+	}
+	lines := strings.Split(doc, "\n")
+	if hi >= len(lines) {
+		hi = len(lines) - 1
+	}
+	for i := lo; i <= hi && i < len(lines); i++ {
+		lines[i] = m.renderer.HighlightLine(render.StripANSI(lines[i]))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // StripANSI applies to e.Err.Error() even though most such errors are

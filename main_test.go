@@ -52,6 +52,12 @@ agents:
 `
 
 func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFile(t *testing.T) {
+	// An empty CHORUS_HOME guarantees no central agents.yaml exists either
+	// — without this, the test would silently pass or fail depending on
+	// whether the machine running it happens to have a seeded
+	// ~/.chorus/agents.yaml (e.g. from install.sh), which is exactly the
+	// kind of environment-dependent flakiness a unit test must not have.
+	t.Setenv("CHORUS_HOME", t.TempDir())
 	agentSpecs, cfg, err := loadAgentConfig(t.TempDir(), "")
 	if err != nil {
 		t.Fatalf("loadAgentConfig() error = %v, want it to fall back to the embedded default cleanly", err)
@@ -72,6 +78,7 @@ func TestLoadAgentConfig_FallsBackToEmbeddedDefaultsWhenNoLocalFile(t *testing.T
 }
 
 func TestLoadAgentConfig_LocalFileTakesPrecedenceOverEmbedded(t *testing.T) {
+	t.Setenv("CHORUS_HOME", t.TempDir())
 	dir := t.TempDir()
 	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
 
@@ -85,6 +92,73 @@ func TestLoadAgentConfig_LocalFileTakesPrecedenceOverEmbedded(t *testing.T) {
 	if cfg.DefaultAgent != "test-only-agent" {
 		t.Fatalf("cfg.DefaultAgent = %q, want the local file's value", cfg.DefaultAgent)
 	}
+}
+
+// --- loadAgentConfig: central ~/.chorus/agents.yaml (2026-09-03) --------
+
+func TestLoadAgentConfig_CentralFileUsedWhenNoLocalFile(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CHORUS_HOME", home)
+	writeFile(t, filepath.Join(home, "agents.yaml"), testAgentsYAML)
+
+	agentSpecs, cfg, err := loadAgentConfig(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v", err)
+	}
+	if len(agentSpecs) != 1 || agentSpecs[0].Name != "test-only-agent" {
+		t.Fatalf("agentSpecs = %+v, want the central file's test-only-agent used when no local agents.yaml exists", agentSpecs)
+	}
+	if cfg.DefaultAgent != "test-only-agent" {
+		t.Fatalf("cfg.DefaultAgent = %q, want the central file's value", cfg.DefaultAgent)
+	}
+}
+
+func TestLoadAgentConfig_LocalFileTakesPrecedenceOverCentral(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CHORUS_HOME", home)
+	writeFile(t, filepath.Join(home, "agents.yaml"), `
+default_agent: central-agent
+agents:
+  - name: central-agent
+    spawn: ["true"]
+    cost_tier: free
+`)
+	dir := t.TempDir()
+	writeFile(t, filepath.Join(dir, "agents.yaml"), testAgentsYAML)
+
+	agentSpecs, cfg, err := loadAgentConfig(dir, "")
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v", err)
+	}
+	if len(agentSpecs) != 1 || agentSpecs[0].Name != "test-only-agent" {
+		t.Fatalf("agentSpecs = %+v, want the local file's test-only-agent (local must win over central)", agentSpecs)
+	}
+	if cfg.DefaultAgent != "test-only-agent" {
+		t.Fatalf("cfg.DefaultAgent = %q, want the local file's value, not the central one", cfg.DefaultAgent)
+	}
+}
+
+func TestLoadAgentConfig_FallsBackToEmbeddedWhenCentralFileAbsent(t *testing.T) {
+	// A CHORUS_HOME that exists but has no agents.yaml in it yet (the
+	// state before install.sh/install.ps1 ever seed one, or right after
+	// CHORUS_HOME is pointed somewhere new) must still fall through
+	// cleanly to the embedded default, not error.
+	t.Setenv("CHORUS_HOME", t.TempDir())
+	agentSpecs, _, err := loadAgentConfig(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("loadAgentConfig() error = %v, want a clean fallback to embedded when CHORUS_HOME has no agents.yaml", err)
+	}
+	if !contains(specNames(agentSpecs), "claude") {
+		t.Fatalf("agentSpecs = %v, want the embedded default's \"claude\" entry present", specNames(agentSpecs))
+	}
+}
+
+func specNames(specs []session.Spec) []string {
+	var names []string
+	for _, s := range specs {
+		names = append(names, s.Name)
+	}
+	return names
 }
 
 // --- loadAgentConfig: --agents=<path> override ---------------------------

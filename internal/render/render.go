@@ -360,16 +360,20 @@ func (r *Renderer) FormatUserPrompt(agent, text string) string {
 	var b strings.Builder
 	fmt.Fprintln(&b, agentTag(agent))
 	for _, line := range strings.Split(text, "\n") {
-		fmt.Fprintln(&b, r.highlightLine(line))
+		fmt.Fprintln(&b, r.HighlightLine(line))
 	}
 	return b.String()
 }
 
-// highlightLine wraps line in a full-width background highlight — the
+// HighlightLine wraps line in a full-width background highlight — the
 // same visual convention Claude Code's own CLI uses to set an echoed
 // user prompt apart from the reply that follows it — padded with
 // colHighlightBg-colored spaces so the block reads as solid, not just
-// colored text with a ragged right edge.
+// colored text with a ragged right edge. Exported (2026-09) so
+// internal/tui can reuse the exact same visual treatment for click-drag
+// text selection (Model.applySelectionHighlight) — a selection highlight
+// and a prompt echo are the same visual idea (mark these specific lines
+// as distinct from surrounding output), just triggered differently.
 //
 // Padding is rune-counted (utf8.RuneCountInString), not measured as true
 // terminal display width — a deliberate, documented approximation: a
@@ -380,7 +384,7 @@ func (r *Renderer) FormatUserPrompt(agent, text string) string {
 // doesn't otherwise depend on — not worth the addition for a cosmetic
 // edge, but worth this comment if wide-character prompts ever become a
 // real complaint.
-func (r *Renderer) highlightLine(line string) string {
+func (r *Renderer) HighlightLine(line string) string {
 	content := " " + line
 	pad := r.width - utf8.RuneCountInString(content)
 	if pad < 0 {
@@ -420,7 +424,7 @@ func (r *Renderer) FormatNativeCommandEcho(cmdline string) string {
 	cmdline = StripANSI(cmdline)
 	var b strings.Builder
 	fmt.Fprintln(&b, nativeTag())
-	fmt.Fprintln(&b, r.highlightLine(cmdline))
+	fmt.Fprintln(&b, r.HighlightLine(cmdline))
 	return b.String()
 }
 

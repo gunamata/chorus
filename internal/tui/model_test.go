@@ -1642,6 +1642,75 @@ func TestModel_HandleMouse_PressDragReleaseCopiesSelection(t *testing.T) {
 	}
 }
 
+// highlightSGR is render's HighlightLine background code — checked
+// directly against the raw viewport output rather than via a helper,
+// since the point of these tests is confirming the ANSI actually reaches
+// the rendered screen content, not just that some internal flag got set.
+const highlightSGR = "\x1b[100m"
+
+func TestModel_HandleMouse_DragHighlightsSelectedLinesInViewport(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendLine("one\n")
+	m.appendLine("two\n")
+	m.appendLine("three\n")
+	m.syncViewport()
+	if strings.Contains(m.viewport.View(), highlightSGR) {
+		t.Fatal("viewport already contains a highlight before any selection started")
+	}
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Y: 0, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	if !strings.Contains(m.viewport.View(), highlightSGR) {
+		t.Fatal("viewport has no highlight immediately after a press starts a selection — a drag must be visible as it happens, not only after release")
+	}
+
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion})
+	m = updated.(Model)
+	view := m.viewport.View()
+	if !strings.Contains(view, "one") || !strings.Contains(view, "two") {
+		t.Fatalf("viewport = %q, want both dragged-over lines still present (just re-styled)", view)
+	}
+	if n := strings.Count(view, highlightSGR); n != 2 {
+		t.Fatalf("highlightSGR appears %d times after dragging over 2 lines, want exactly 2", n)
+	}
+}
+
+func TestModel_HandleMouse_HighlightPersistsAfterReleaseThenClearsOnNextKey(t *testing.T) {
+	stubClipboard(t, nil)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.appendLine("one\n")
+	m.appendLine("two\n")
+	m.syncViewport()
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Y: 0, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m = updated.(Model)
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion})
+	m = updated.(Model)
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: 1, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease})
+	m = updated.(Model)
+
+	if !strings.Contains(m.viewport.View(), highlightSGR) {
+		t.Fatal("highlight disappeared immediately on release, want it to persist as confirmation of what was just copied")
+	}
+
+	// Any keypress dismisses it, same one-shot lifespan as lastCopyStatus.
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("x")})
+	m = updated.(Model)
+	if strings.Contains(m.viewport.View(), highlightSGR) {
+		t.Fatal("highlight still present after a keypress, want it cleared")
+	}
+}
+
+func TestModel_ApplySelectionHighlight_OnlyRestylesTheSelectedRange(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.selectAnchorLine, m.selectCurLine = 1, 1
+	got := m.applySelectionHighlight("alpha\nbeta\ngamma")
+	want := "alpha\n" + highlightSGR + " beta" + strings.Repeat(" ", m.viewport.Width-5) + "\x1b[0m\ngamma"
+	if got != want {
+		t.Fatalf("applySelectionHighlight() = %q, want %q", got, want)
+	}
+}
+
 func TestModel_HandleMouse_PressOutsideViewportDoesNotSelect(t *testing.T) {
 	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
 

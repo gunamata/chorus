@@ -78,13 +78,25 @@ irm https://raw.githubusercontent.com/gunamata/chorus/main/install.ps1 | iex
 ```
 
 Both scripts detect your OS/arch, download the matching release archive,
-verify its checksum, and install `chorus`/`chorus.exe` onto your PATH
-(`$HOME/.local/bin` or `/usr/local/bin` on macOS/Linux,
-`%LOCALAPPDATA%\chorus\bin` on Windows — override with
-`CHORUS_INSTALL_DIR`). Pass `CHORUS_VERSION=vX.Y.Z` (env var on macOS/
-Linux, `$env:CHORUS_VERSION` on Windows) to install a specific version
-instead of the latest release. Run `chorus --version` afterward to
-confirm.
+verify its checksum, and install into `~/.chorus/bin` (override with
+`CHORUS_INSTALL_DIR`). On Windows, that directory is added to your user
+PATH automatically (restart your terminal afterward); on macOS/Linux the
+script prints the line to add to your shell profile if `~/.chorus/bin`
+isn't already on PATH, rather than editing your dotfiles for you. Pass
+`CHORUS_VERSION=vX.Y.Z` (env var on macOS/Linux, `$env:CHORUS_VERSION` on
+Windows) to install a specific version instead of the latest release.
+Run `chorus --version` afterward to confirm.
+
+Both scripts also seed `~/.chorus/agents.yaml` from the release's
+bundled default config — but **only on first install**: if that file
+already exists, it's left completely untouched. This is what chorus
+itself falls back to (see [Agent registry](#agent-registry-agentsyaml))
+when no local `./agents.yaml` is present, so your own edits (models,
+cost tiers, delegation/routing settings) persist across upgrades instead
+of reverting to whatever a new chorus version happens to embed. Override
+the location with `CHORUS_HOME` (must match whatever chorus itself uses
+— see [Session persistence](#session-persistence)) if you want it
+somewhere other than `~/.chorus`.
 
 ## Build
 
@@ -151,9 +163,11 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   chorus, not your terminal, owns plain click-drag — so instead of
   leaving that dead, chorus implements copy-on-select itself, the same
   approach Claude Code CLI's own fullscreen UI takes: dragging over one
-  or more lines and releasing copies the selected lines (whole lines,
-  not partial — a deliberate line-level tradeoff) straight to your
-  system clipboard, with a brief "N lines copied" confirmation. If you'd
+  or more lines highlights them live as you drag (whole lines, not
+  partial — a deliberate line-level tradeoff) and releasing copies them
+  straight to your system clipboard, with a brief "N lines copied"
+  confirmation (the highlight stays visible until your next keypress).
+  If you'd
   rather have your terminal's own native selection instead (e.g. for
   exact character/column ranges), set `CHORUS_DISABLE_MOUSE=1` before
   starting chorus — this gives up mouse-wheel scrolling (PgUp/PgDn/
@@ -278,8 +292,10 @@ extensions: `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`. A token that
 doesn't resolve to a readable file is left in the prompt text
 untouched (with a warning printed) rather than silently dropped.
 
-If an agent sends an image back, it's saved under `.chorus/images/`
-and the path is printed — a terminal can't display the bytes inline,
+If an agent sends an image back, it's saved under this project's
+`images/` directory (see [Session persistence](#session-persistence) for
+where that lives) and the path is printed — a terminal can't display the
+bytes inline,
 but a path you can open beats a bare `[image]` placeholder.
 
 ## Native commands (`!`)
@@ -393,11 +409,22 @@ omit it entirely (as the registry's own `gemini`/`opencode` entries do)
 to let LLM-based routing pick that agent but never attempt to switch its
 model.
 
-**`agents.yaml` isn't actually required on disk** — chorus embeds its
-own copy (this repo's own reference config, baked in at build time) and
-falls back to it when no local `agents.yaml` exists in the directory you
-run it from, so `chorus` works out of the box with zero setup. A local
-file always takes precedence over the embedded default.
+**`agents.yaml` isn't actually required on disk.** Resolution order,
+with no `--agents` flag:
+
+1. A local `./agents.yaml` in the directory you run chorus from — for a
+   per-project config that differs from your usual setup.
+2. A central `~/.chorus/agents.yaml` (as of 2026-09-03 — override the
+   root with `CHORUS_HOME`) — the file `install.sh`/`install.ps1` seed
+   once on first install (see [Install](#install)) and never touch
+   again, so your own edits survive an upgrade.
+3. The embedded default (this repo's own reference config, baked into
+   the binary at build time) — the final fallback, so `chorus` still
+   works out of the box with zero setup even without ever having run an
+   install script (e.g. a plain `go build`).
+
+Each step only runs if the previous one found nothing; the first match
+wins.
 
 **More than one config can coexist via `--agents=<path>`** — e.g. keep a
 plain `agents.yaml` for normal use and a separate sandboxed one (this
@@ -406,13 +433,13 @@ repo ships `agents.yaml.sandbox.windows`/`.macos`/`.linux` — see
 per-invocation instead of renaming/swapping files:
 
 ```sh
-./chorus.exe                                      # loads agents.yaml (or the embedded default)
+./chorus.exe                                      # local -> central -> embedded, first match wins
 ./chorus.exe --agents=agents.yaml.sandbox.windows # loads that file explicitly instead
 ```
 
-Unlike the no-flag case, a missing `--agents` path is a hard error
-rather than a silent fallback to the embedded default — you asked for
-that specific file.
+`--agents=<path>` always wins over all three steps above, and unlike
+them, a missing `--agents` path is a hard error rather than a silent
+fallback — you asked for that specific file.
 
 **`agents.yaml` is trusted, executable configuration, not passive
 data** — `spawn` is a literal command line chorus runs unconditionally
@@ -686,10 +713,13 @@ v0.2.0`):
 - **Binaries** for `linux`/`darwin`/`windows` × `amd64`/`arm64` (6
   archives total — cross-compiled from a single Linux runner, since
   chorus and its dependencies are pure Go with no cgo), packaged as
-  `.tar.gz` (macOS/Linux) or `.zip` (Windows), plus a `checksums.txt` —
-  all attached as downloadable assets on a GitHub Release the workflow
-  creates automatically for the tag. This is what [Install](#install)'s
-  `install.sh`/`install.ps1` download from.
+  `.tar.gz` (macOS/Linux) or `.zip` (Windows), plus this repo's own
+  `agents.yaml` (the exact same file `//go:embed`s into the binary) and
+  a `checksums.txt` covering all of it — all attached as downloadable
+  assets on a GitHub Release the workflow creates automatically for the
+  tag. This is what [Install](#install)'s `install.sh`/`install.ps1`
+  download from, both for the binary itself and to seed
+  `~/.chorus/agents.yaml` on first install.
 - **Sandbox Docker images** (see [Sandboxing](#sandboxing-containers)),
   built and pushed to Docker Hub as `matamagu/chorus-claude-sandbox`,
   `matamagu/chorus-gemini-sandbox`, and `matamagu/chorus-opencode-sandbox`,
@@ -742,18 +772,33 @@ resumed session replays its prior turns back onto your screen as
 scrollback before you type anything new, so it's visible what got
 carried over, not a silent assumption.
 
-- Each agent's last session ID is saved to `.chorus/sessions.json`
-  (project-local — gitignored, since a session ID is a pointer into
-  that agent's own history tied to your account/machine, not something
-  to share). Only the main interactive session is ever saved;
-  delegation sub-sessions never are.
+- All of this state lives centrally under `~/.chorus/projects/<slug>/`
+  (as of 2026-09-03 — previously a per-project `./.chorus/`), where
+  `<slug>` is your project directory's own name plus a short hash of its
+  full path (so two different projects that happen to share a folder
+  name, e.g. two unrelated repos both called "backend", never collide).
+  Override the root with `CHORUS_HOME` if you want chorus's state
+  somewhere other than your home directory. Session IDs are still scoped
+  per-project underneath that shared root — ACP's own `session/load`
+  requires the request's cwd to match the session's original cwd, so
+  centralizing *where* the files live doesn't change *what* gets resumed
+  where.
+- Each agent's last session ID is saved to `sessions.json` in that
+  directory (a session ID is a pointer into that agent's own history
+  tied to your account/machine, not something to share). Only the main
+  interactive session is ever saved; delegation sub-sessions never are.
 - Each agent subprocess's raw stderr (its own debug/error output — e.g.
   a stack trace if it fails to authenticate) is captured to
-  `.chorus/logs/<agent>.stderr.log` (truncated fresh each run), never
-  printed to your terminal directly — chorus's TUI owns the screen
-  exclusively, so a subprocess writing unexpectedly to its own stderr
-  can't corrupt it. Check that file if an agent is behaving oddly and
-  chorus's own warning message isn't detailed enough.
+  `logs/<agent>.stderr.log` in that same directory (truncated fresh each
+  run), never printed to your terminal directly — chorus's TUI owns the
+  screen exclusively, so a subprocess writing unexpectedly to its own
+  stderr can't corrupt it. Check that file if an agent is behaving oddly
+  and chorus's own warning message isn't detailed enough.
+- Upgrading from a version that used a per-project `./.chorus/`
+  directory: that old directory is no longer read and can be deleted —
+  chorus starts fresh under `~/.chorus/` the first time it runs in that
+  project (falling back to a new session is already the normal, safe
+  behavior for a missing or stale session ID).
 - `./chorus.exe --fresh` skips resuming and starts every agent clean —
   the new session then becomes what gets resumed next time, not a
   permanent opt-out.
@@ -833,7 +878,8 @@ internal/registry/         agents.yaml loading (§10) — the single decode poin
                             the whole file, registry + policy.Config together
 internal/delegate/         Cross-agent delegation (§11): the delegate-mcp subprocess
                             mode and the loopback Hub it calls back into
-internal/sessionstore/     .chorus/sessions.json persistence for session resume
+internal/sessionstore/     sessions.json persistence for session resume, under
+                            ~/.chorus/projects/<slug>/ (see Session persistence)
 internal/bus/               Shared message types between agent connections and main
 sandbox/                   Opt-in per-agent container images for filesystem/network
                             containment — see Sandboxing above and sandbox/README.md
