@@ -200,6 +200,19 @@ internal/tui          Bubbletea Model/Update/View. Model holds five
                       terminal where that doesn't work; don't remove
                       `WithMouseCellMotion()` itself without live
                       evidence the override genuinely fails somewhere.
+                      `modes`/`mode <agent> <id-or-name>`/`auto [agent]`
+                      (ACP session modes — e.g. Claude Code's own "accept
+                      edits"/"bypass permissions" concept) run
+                      session/set_mode asynchronously via runSetMode (a
+                      tea.Cmd, same async one-shot pattern as
+                      runNativeCommand — never call SetMode directly from
+                      Update, same reasoning as invariant #1).
+                      `auto`/`auto <agent>` toggles into agents.yaml's
+                      per-agent `auto_mode` and back, remembering the
+                      prior mode in Model.autoPrevMode so a second call
+                      restores it; chorus never guesses a mode string —
+                      `auto_mode` is something you discover via `modes`
+                      and set yourself.
 
 internal/session      Connection (one subprocess + ACP initialize
                       handshake — records SupportsLoadSession,
@@ -217,6 +230,16 @@ internal/session      Connection (one subprocess + ACP initialize
                       logs/<agent>.stderr.log instead (or io.Discard),
                       so a subprocess's raw stderr can never land on the
                       same screen bubbletea is actively redrawing.
+                      AgentSession also holds ACP session-mode state
+                      (AvailableModes/CurrentModeId, from
+                      NewSession/LoadSession's response) and SetMode
+                      (session/set_mode) — backs the `modes`/`mode`/`auto`
+                      REPL commands (internal/tui). SetMode doesn't update
+                      CurrentModeId itself; the agent's own
+                      current_mode_update notification is the source of
+                      truth (internal/tui applies it belt-and-suspenders
+                      after a successful SetMode too, in case an agent
+                      doesn't send one).
 
 internal/acpclient    Implements acp.Client — the callback interface the
                       SDK invokes from the subprocess's own read
@@ -290,7 +313,9 @@ internal/registry     Parse(): agents.yaml -> ([]session.Spec,
                       Notes/Models are threaded through for
                       internal/delegate (roster/briefing) and
                       internal/router (candidate-agent list) — unused
-                      by registry/session themselves.
+                      by registry/session themselves. Spec.AutoMode
+                      (yaml `auto_mode`) is optional per agent, backs the
+                      `auto` REPL command — see internal/session's entry.
 
 internal/delegate     Cross-agent delegation. Two roles: RunMCPServer
                       (the `chorus __mcp_delegate` subcommand — an MCP
@@ -561,6 +586,14 @@ sandbox/              Opt-in per-agent container images for filesystem/
   framing, not guaranteed to transfer) is untested; whether
   `SessionUsageUpdate` (auto-compaction's trigger) is emitted reliably
   by Gemini/opencode, not just Claude, is unconfirmed.
+- **ACP session modes (`modes`/`mode`/`auto`) are unverified against real
+  agents** — no session in this project's testing has exercised
+  `current_mode_update` live, so whether Claude/Gemini/opencode
+  advertise session modes at all, and under what id/name (e.g. whether
+  Claude Code's "accept edits"/"bypass permissions" concept is exposed
+  this way over ACP), is unconfirmed. `agents.yaml`'s `auto_mode` is
+  deliberately never guessed or defaulted — discover the real value via
+  `modes` before setting it.
 - **opencode runs with zero configured credentials by default**,
   silently falling back to its own free hosted backend
   (`providerID=opencode`, `model=big-pickle`) — not the
@@ -633,6 +666,10 @@ working exactly like the others," which is itself worth recording:
 10. Delegation both directions, if `delegation.enabled: true`.
 11. An unprefixed prompt under `routing.mode: llm` → confirms it routes
     to Gemini when appropriate.
+12. `modes` → does Gemini report any ACP session modes at all? If so,
+    record the real id/name here and in "Known limitations" above —
+    this whole mechanism has zero live confirmation from any agent so
+    far.
 
 ## Cross-agent delegation & cost model
 

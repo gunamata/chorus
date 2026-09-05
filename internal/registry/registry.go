@@ -52,6 +52,12 @@ type entry struct {
 	// session.ModelInfo. Absent/empty is fine; the LLM router then never
 	// picks a model for this agent, only the agent itself.
 	Models []session.ModelInfo `yaml:"models"`
+
+	// AutoMode is this agent's ACP session-mode id/name for the `auto`
+	// REPL command — see session.Spec.AutoMode's doc comment. Omit until
+	// you've discovered the real value via the `modes` REPL command;
+	// chorus never guesses one on your behalf.
+	AutoMode string `yaml:"auto_mode"`
 }
 
 // file is agents.yaml's whole top-level shape.
@@ -121,6 +127,7 @@ func Parse(b []byte) ([]session.Spec, policy.Config, error) {
 			CostTier: e.CostTier,
 			Notes:    e.Notes,
 			Models:   e.Models,
+			AutoMode: e.AutoMode,
 		})
 		cfg.Agents[e.Name] = policy.AgentPolicy{
 			AutoAllow:      e.AutoAllow,

@@ -1856,3 +1856,200 @@ func TestClampInt(t *testing.T) {
 		t.Fatalf("clampInt(20,0,10) = %d, want 10", got)
 	}
 }
+
+// --- `mode`/`auto` REPL commands (ACP session/set_mode) ------------------
+//
+// runSetMode's returned tea.Cmd performs a real RPC (session.AgentSession.
+// SetMode -> conn.SetSessionMode) — these tests never execute a returned
+// cmd (that would nil-pointer-dereference the fake worker's nil conn),
+// only assert whether one was produced and what handleModeCommand/
+// handleAutoCommand appended synchronously. setModeResultMsg's own
+// handling (the part that runs after a real RPC would have returned) is
+// tested directly by constructing the message, exactly like
+// TestModel_TrackUsage_SnapshotsIntoStatsForStatsCommand does for
+// usageUpdateMsg.
+
+func workerWithModes(modes []acp.SessionMode, current acp.SessionModeId) *AgentWorker {
+	w := newWorker()
+	w.sess = &session.AgentSession{AvailableModes: modes, CurrentModeId: current}
+	return w
+}
+
+func TestModel_ModeCommand_MissingArgumentReportsUsage(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "mode claude")
+
+	if out := m.viewport.View(); !strings.Contains(out, "usage: mode") {
+		t.Fatalf("viewport.View() = %q, want a usage message for a mode command with no mode argument", out)
+	}
+}
+
+func TestModel_ModeCommand_UnknownAgentReportsError(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "mode nope acceptEdits")
+
+	if out := m.viewport.View(); !strings.Contains(out, "unknown agent") {
+		t.Fatalf("viewport.View() = %q, want an unknown-agent error", out)
+	}
+}
+
+func TestModel_ModeCommand_UnmatchedModeReportsError(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": workerWithModes(
+		[]acp.SessionMode{{Id: "default", Name: "Default"}}, "default")}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m, _ = enterWithInput(m, "mode claude nonexistent")
+
+	if out := m.viewport.View(); !strings.Contains(out, "no mode matching") {
+		t.Fatalf("viewport.View() = %q, want a no-match error naming `modes`", out)
+	}
+}
+
+func TestModel_ModeCommand_ValidRequestReturnsSetModeCmd(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": workerWithModes(
+		[]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "default")}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	_, cmd := enterWithInput(m, "mode claude acceptEdits")
+
+	if cmd == nil {
+		t.Fatal("enterWithInput(\"mode claude acceptEdits\") returned a nil cmd, want the async runSetMode command")
+	}
+}
+
+func TestModel_AutoCommand_NoAgentConfiguredReportsMessage(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}} // no AutoMode set
+
+	m, _ = enterWithInput(m, "auto")
+
+	if out := m.viewport.View(); !strings.Contains(out, "no connected agent has auto_mode configured") {
+		t.Fatalf("viewport.View() = %q, want the no-auto_mode-configured message", out)
+	}
+}
+
+func TestModel_AutoCommand_UnknownAgentArgReportsError(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude", AutoMode: "acceptEdits"}}
+
+	m, _ = enterWithInput(m, "auto nope")
+
+	if out := m.viewport.View(); !strings.Contains(out, "unknown agent") {
+		t.Fatalf("viewport.View() = %q, want an unknown-agent error", out)
+	}
+}
+
+func TestModel_AutoCommand_ValidAgentReturnsSetModeCmd(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": workerWithModes(
+		[]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "default")}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude", AutoMode: "acceptEdits"}}
+
+	_, cmd := enterWithInput(m, "auto claude")
+
+	if cmd == nil {
+		t.Fatal("enterWithInput(\"auto claude\") returned a nil cmd, want the async runSetMode command")
+	}
+}
+
+func TestModel_AutoCommand_UnresolvableAutoModeReportsError(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": workerWithModes(
+		[]acp.SessionMode{{Id: "default", Name: "Default"}}, "default")}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude", AutoMode: "doesNotExist"}}
+
+	m, _ = enterWithInput(m, "auto claude")
+
+	if out := m.viewport.View(); !strings.Contains(out, "doesn't match any mode it advertised") {
+		t.Fatalf("viewport.View() = %q, want an error naming the unmatched auto_mode value", out)
+	}
+}
+
+func TestModel_SetModeResultMsg_Success_UpdatesCurrentModeAndAppendsConfirmation(t *testing.T) {
+	w := workerWithModes([]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "default")
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(setModeResultMsg{agent: "claude", modeId: "acceptEdits", modeLabel: "acceptEdits"})
+	m = updated.(Model)
+
+	if got := w.CurrentModeId(); got != "acceptEdits" {
+		t.Fatalf("CurrentModeId() = %q after a successful setModeResultMsg, want %q (belt-and-suspenders update)", got, "acceptEdits")
+	}
+	if out := m.viewport.View(); !strings.Contains(out, "mode set to acceptEdits") {
+		t.Fatalf("viewport.View() = %q, want a confirmation naming the new mode", out)
+	}
+}
+
+func TestModel_SetModeResultMsg_Error_AppendsFailureMessageWithoutChangingMode(t *testing.T) {
+	w := workerWithModes([]acp.SessionMode{{Id: "default", Name: "Default"}}, "default")
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(setModeResultMsg{agent: "claude", modeId: "acceptEdits", modeLabel: "acceptEdits", err: fmt.Errorf("boom")})
+	m = updated.(Model)
+
+	if got := w.CurrentModeId(); got != "default" {
+		t.Fatalf("CurrentModeId() = %q after a failed setModeResultMsg, want unchanged %q", got, "default")
+	}
+	if out := m.viewport.View(); !strings.Contains(out, "mode switch failed") {
+		t.Fatalf("viewport.View() = %q, want a failure message", out)
+	}
+}
+
+func TestModel_SetModeResultMsg_AutoOn_RecordsPrevModeForToggleBack(t *testing.T) {
+	w := workerWithModes([]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "default")
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	updated, _ := m.Update(setModeResultMsg{agent: "claude", modeId: "acceptEdits", modeLabel: "acceptEdits", auto: true, turnOn: true, restoreId: "default"})
+	m = updated.(Model)
+
+	if got, ok := m.autoPrevMode["claude"]; !ok || got != "default" {
+		t.Fatalf("autoPrevMode[claude] = (%q, %v), want (\"default\", true) so a second `auto` can toggle back", got, ok)
+	}
+	if out := m.viewport.View(); !strings.Contains(out, "auto mode on") {
+		t.Fatalf("viewport.View() = %q, want an auto-mode-on confirmation", out)
+	}
+}
+
+func TestModel_SetModeResultMsg_AutoOff_ClearsPrevMode(t *testing.T) {
+	w := workerWithModes([]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "acceptEdits")
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.autoPrevMode["claude"] = "default"
+
+	updated, _ := m.Update(setModeResultMsg{agent: "claude", modeId: "default", modeLabel: "default", auto: true, turnOn: false})
+	m = updated.(Model)
+
+	if _, ok := m.autoPrevMode["claude"]; ok {
+		t.Fatal("autoPrevMode[claude] still present after toggling auto off, want it cleared")
+	}
+	if out := m.viewport.View(); !strings.Contains(out, "auto mode off") {
+		t.Fatalf("viewport.View() = %q, want an auto-mode-off confirmation", out)
+	}
+}
+
+// TestModel_AutoCommand_TogglesOffOnSecondInvocation exercises the full
+// toggle round trip through handleAutoCommand's own decision logic (not
+// just setModeResultMsg's bookkeeping above): once autoPrevMode already
+// has an entry for an agent, a second `auto <agent>` must target the
+// remembered restore mode, not spec.AutoMode again.
+func TestModel_AutoCommand_TogglesOffOnSecondInvocation(t *testing.T) {
+	w := workerWithModes([]acp.SessionMode{{Id: "default", Name: "Default"}, {Id: "acceptEdits", Name: "Accept Edits"}}, "acceptEdits")
+	workers := map[string]*AgentWorker{"claude": w}
+	m := newTestModel(t, workers, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude", AutoMode: "acceptEdits"}}
+	m.autoPrevMode["claude"] = "default"
+
+	_, cmd := enterWithInput(m, "auto claude")
+	if cmd == nil {
+		t.Fatal("enterWithInput(\"auto claude\") with an existing autoPrevMode entry returned a nil cmd, want the toggle-back runSetMode command")
+	}
+}

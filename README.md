@@ -278,6 +278,15 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   captured here so you don't have to scroll back to find the last one).
   An agent that's had a real conversation but never called a tool still
   shows up for its token usage alone.
+- `modes` lists each connected agent's [ACP session
+  modes](https://agentclientprotocol.com/protocol/session-modes) (e.g.
+  Claude Code's "accept edits"/"bypass permissions" concept, if the
+  agent advertises it this way) and which one is currently active. `mode
+  <agent> <id-or-name>` switches explicitly; `auto`/`auto <agent>`
+  toggles into (and back out of) whichever mode `agents.yaml`'s
+  `auto_mode` names for that agent. See [Auto mode](#auto-mode-acp-session-modes)
+  below — mode IDs/names are entirely agent-defined, so chorus never
+  guesses one for you.
 
 Agent replies and thoughts are rendered as styled markdown (bold,
 headers, code blocks — via [glamour](https://github.com/charmbracelet/glamour)),
@@ -388,6 +397,65 @@ A couple of things worth knowing:
   interacting with agents (or run another `!` command) while a long
   one is still going.
 
+## Auto mode (ACP session modes)
+
+ACP has a real protocol mechanism for this —
+[session modes](https://agentclientprotocol.com/protocol/session-modes):
+an agent can advertise a list of named modes (id + human-readable name,
+e.g. Claude Code's own "accept edits"/"bypass permissions" concept) and
+lets a client switch between them mid-session via `session/set_mode`.
+chorus surfaces this directly rather than guessing at any agent's
+specific mode name:
+
+```
+> modes
+claude:
+    default (default)
+  * acceptEdits (Accept Edits) — auto-accept file edits without asking
+
+> mode claude acceptEdits
+claude: mode set to acceptEdits
+
+> auto claude
+claude: auto mode off        # toggled back, since it was already in that mode
+```
+
+- **`modes`** lists every connected agent's advertised modes and marks
+  the currently active one with `*`. An agent that hasn't reported any
+  (no `AvailableModes` in its `session/new`/`session/load` response)
+  simply doesn't appear — this is not an error, it just means that
+  agent has nothing here to offer, or hasn't reported it yet (same
+  discovery-timing caveat as [Slash commands](#slash-commands)).
+- **`mode <agent> <id-or-name>`** switches explicitly — matches either
+  the short id (`acceptEdits`) or the human-readable name (`Accept
+  Edits`, case-insensitive), so you don't have to remember which form a
+  given agent uses.
+- **`auto` / `auto <agent>`** toggles a configured agent into (and back
+  out of) its own "auto"/"accept edits"/"yolo"-equivalent mode, driven
+  by an `auto_mode` value you set yourself in `agents.yaml` (see below)
+  — chorus remembers whatever mode was active before switching, so a
+  second `auto`/`auto <agent>` restores it rather than needing you to
+  look it up again. With no argument, `auto` applies to every connected
+  agent that has `auto_mode` configured.
+
+**chorus never hardcodes or guesses a mode string for any agent** — mode
+ids/names are entirely agent-defined, and (as of this writing) unconfirmed
+for Claude Code, Gemini CLI, and opencode specifically, since no session
+in this project's own testing has exercised `current_mode_update` live.
+Use `modes` to discover the real value for your agent and setup, then set
+it once in `agents.yaml`:
+
+```yaml
+agents:
+  - name: claude
+    spawn: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+    auto_mode: acceptEdits   # optional — the id/name `modes` showed you
+```
+
+Leaving `auto_mode` unset (the default) just means `auto`/`auto <agent>`
+has nothing configured to switch that agent to — `mode <agent> <id>`
+still works either way, since it doesn't depend on this field at all.
+
 ## Agent registry (`agents.yaml`)
 
 **`agents.yaml` is chorus's only config file** (2026-08-25 — `policy.yaml`
@@ -458,7 +526,8 @@ agent has concrete signal for deciding whether/to whom to delegate, or
 which agent+model fits a given prompt. `models` is optional per agent —
 omit it entirely (as the registry's own `gemini`/`opencode` entries do)
 to let LLM-based routing pick that agent but never attempt to switch its
-model.
+model. `auto_mode` is also optional per agent — see [Auto
+mode](#auto-mode-acp-session-modes) above.
 
 **`agents.yaml` isn't actually required on disk.** Resolution order,
 with no `--agents` flag:

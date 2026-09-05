@@ -79,6 +79,34 @@ func (w *AgentWorker) Cancel(ctx context.Context) error {
 	return w.sess.Cancel(ctx)
 }
 
+// SetMode requests this agent switch to modeId (ACP session/set_mode) —
+// backs the `mode`/`auto` REPL commands. Thin wrapper, same shape as
+// Cancel; callers are expected to have already resolved modeId against
+// AvailableModes (see resolveMode).
+func (w *AgentWorker) SetMode(ctx context.Context, modeId acp.SessionModeId) error {
+	return w.sess.SetMode(ctx, modeId)
+}
+
+// AvailableModes/CurrentModeId expose this worker's underlying session's
+// ACP mode state (read-only from the caller's perspective — CurrentModeId
+// is kept in sync by Model.handleOutput's CurrentModeUpdate case, not
+// mutated here) for the `modes`/`mode`/`auto` commands to inspect without
+// reaching into AgentWorker's otherwise-unexported sess field from
+// outside this package.
+func (w *AgentWorker) AvailableModes() []acp.SessionMode {
+	if w.sess == nil {
+		return nil
+	}
+	return w.sess.AvailableModes
+}
+
+func (w *AgentWorker) CurrentModeId() acp.SessionModeId {
+	if w.sess == nil {
+		return ""
+	}
+	return w.sess.CurrentModeId
+}
+
 // StartedAt reports when w's current in-flight prompt began, if it's busy
 // right now. The second return is false while idle — callers must check
 // Idle() (or this) before trusting the time, since startedAt isn't cleared
@@ -207,6 +235,59 @@ func runNativeCommand(ctx context.Context, cmdline string) tea.Cmd {
 		out, err := shellCommand(cctx, cmdline).CombinedOutput()
 		return nativeCmdResultMsg{cmdline: cmdline, output: string(out), err: err, duration: time.Since(start)}
 	}
+}
+
+// setModeResultMsg reports a completed session/set_mode RPC — see
+// runSetMode's doc comment. auto records whether this call originated from
+// the `auto` REPL command (vs. an explicit `mode` command); when auto is
+// true, turnOn distinguishes switching INTO auto mode (restoreId is the
+// mode that was active beforehand, to remember for switching back) from
+// switching back OUT of it (restoreId unused). Neither field affects the
+// RPC itself — they only tell Update()'s handler how to update
+// Model.autoPrevMode and how to word the confirmation.
+type setModeResultMsg struct {
+	agent     string
+	modeId    acp.SessionModeId
+	modeLabel string
+	auto      bool
+	turnOn    bool
+	restoreId acp.SessionModeId
+	err       error
+}
+
+// setModeTimeout guards a session/set_mode call the same way
+// nativeCommandTimeout guards a "!"-command — ACP gives no guarantee this
+// RPC returns promptly, and Update() must never block waiting for it
+// (concurrency invariant #1).
+const setModeTimeout = 30 * time.Second
+
+// runSetMode issues session/set_mode against w as a tea.Cmd, the same
+// async one-shot pattern as runNativeCommand — SetMode is a blocking RPC
+// (AgentSession.Prompt's same concern applies to any client->agent call),
+// so it must never be invoked directly from Update(). modeLabel is carried
+// through purely for a friendlier confirmation message; auto/turnOn/
+// restoreId are opaque payload for setModeResultMsg's handler (see its own
+// doc comment) — this function doesn't interpret them.
+func runSetMode(ctx context.Context, w *AgentWorker, agent string, modeId acp.SessionModeId, modeLabel string, auto, turnOn bool, restoreId acp.SessionModeId) tea.Cmd {
+	return func() tea.Msg {
+		cctx, cancel := context.WithTimeout(ctx, setModeTimeout)
+		defer cancel()
+		err := w.SetMode(cctx, modeId)
+		return setModeResultMsg{agent: agent, modeId: modeId, modeLabel: modeLabel, auto: auto, turnOn: turnOn, restoreId: restoreId, err: err}
+	}
+}
+
+// specByName finds spec's entry for agent, the zero value if not found —
+// a small linear lookup (agentSpecs is at most a handful of entries) used
+// by the `auto` command to read AutoMode without adding a name->spec map
+// to Model for what's a rare, interactive-only lookup.
+func specByName(specs []session.Spec, agent string) session.Spec {
+	for _, s := range specs {
+		if s.Name == agent {
+			return s
+		}
+	}
+	return session.Spec{}
 }
 
 // pendingRoute is a prompt awaiting a user choice of agent — either §9's
@@ -488,6 +569,68 @@ func formatCapabilities(specs []session.Spec, conns map[string]*session.Connecti
 		fmt.Fprintf(&b, "  promptCapabilities.image: %v\n", conn.SupportsImagePrompts)
 	}
 	return b.String()
+}
+
+// formatModes lists each connected agent's ACP session modes
+// (https://agentclientprotocol.com/protocol/session-modes) and which one
+// is currently active, `*`-marked. A pure discovery command — added
+// specifically so `mode <agent> <id-or-name>`/`auto` never have to guess
+// a mode's real ID or name, since these are entirely agent-defined and
+// have never been confirmed for Claude/Gemini/opencode specifically (no
+// agent in any session so far has been observed switching modes at
+// all). An agent with no AvailableModes simply doesn't support ACP
+// session modes — not an error, just nothing to list for it.
+func formatModes(specs []session.Spec, workers map[string]*AgentWorker) string {
+	var b strings.Builder
+	anyModes := false
+	for _, spec := range specs {
+		w, ok := workers[spec.Name]
+		if !ok {
+			continue
+		}
+		modes := w.AvailableModes()
+		if len(modes) == 0 {
+			continue
+		}
+		anyModes = true
+		fmt.Fprintf(&b, "%s:\n", spec.Name)
+		current := w.CurrentModeId()
+		for _, md := range modes {
+			marker := " "
+			if md.Id == current {
+				marker = "*"
+			}
+			desc := ""
+			if md.Description != nil {
+				desc = " — " + render.StripANSI(*md.Description)
+			}
+			fmt.Fprintf(&b, "  %s %s (%s)%s\n", marker, render.StripANSI(md.Name), render.StripANSI(string(md.Id)), desc)
+		}
+	}
+	if !anyModes {
+		return "no agent has reported any ACP session modes\n"
+	}
+	return b.String()
+}
+
+// resolveMode matches a user-typed mode identifier against agent's
+// actual AvailableModes — by ID (exact) first, then by Name
+// (case-insensitive), so a user can type either the short id
+// ("acceptEdits") or whatever human-readable name the agent advertises
+// ("Accept Edits") without needing to remember which. Returns ok=false
+// if nothing matches, rather than guessing.
+func resolveMode(w *AgentWorker, typed string) (acp.SessionModeId, bool) {
+	for _, md := range w.AvailableModes() {
+		if string(md.Id) == typed {
+			return md.Id, true
+		}
+	}
+	for _, md := range w.AvailableModes() {
+		if strings.EqualFold(md.Name, typed) {
+			return md.Id, true
+		}
+	}
+	return "", false
 }
 
 // formatStats prints each agent's direct-vs-delegated tool activity, plus

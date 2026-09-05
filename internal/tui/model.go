@@ -220,6 +220,16 @@ type Model struct {
 	compactTriggered map[string]bool
 	compactPending   map[string]bool
 
+	// autoPrevMode remembers, per agent, whichever ACP session mode it was
+	// in immediately before the `auto` REPL command switched it into
+	// spec.AutoMode — so a second `auto`/`auto <agent>` toggles back to
+	// that instead of just leaving the agent stuck in auto mode forever.
+	// Absence of an entry means "not currently in auto mode via this
+	// command" (distinct from CurrentModeId itself, which an agent can
+	// also change on its own via a current_mode_update — see
+	// handleOutput's CurrentModeUpdate case).
+	autoPrevMode map[string]acp.SessionModeId
+
 	outputCh      chan bus.Update
 	permCh        chan bus.PermissionRequest
 	errCh         chan ErrMsg
@@ -392,6 +402,7 @@ func New(cfg Config) Model {
 		compaction:       cfg.Compaction,
 		compactTriggered: make(map[string]bool),
 		compactPending:   make(map[string]bool),
+		autoPrevMode:     make(map[string]acp.SessionModeId),
 		outputCh:         cfg.OutputCh,
 		permCh:           cfg.PermCh,
 		errCh:            cfg.ErrCh,
@@ -572,6 +583,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case nativeCmdResultMsg:
 		m.appendLine(render.FormatNativeCommandResult(msg.cmdline, msg.output, msg.err, msg.duration))
+		m.syncViewport()
+		return m, nil
+
+	case setModeResultMsg:
+		if msg.err != nil {
+			m.appendLine(fmt.Sprintf("%s: mode switch failed: %v\n", msg.agent, msg.err))
+			m.syncViewport()
+			return m, nil
+		}
+		// Belt-and-suspenders update, same reasoning as AgentSession.SetMode's
+		// own doc comment: an agent's current_mode_update notification is
+		// still the source of truth (handleOutput's CurrentModeUpdate case),
+		// but not every agent is confirmed to send one after every switch.
+		if w, ok := m.workers[msg.agent]; ok && w.sess != nil {
+			w.sess.CurrentModeId = msg.modeId
+		}
+		if msg.auto {
+			if msg.turnOn {
+				m.autoPrevMode[msg.agent] = msg.restoreId
+				m.appendLine(fmt.Sprintf("%s: auto mode on (%s)\n", msg.agent, msg.modeLabel))
+			} else {
+				delete(m.autoPrevMode, msg.agent)
+				m.appendLine(fmt.Sprintf("%s: auto mode off\n", msg.agent))
+			}
+		} else {
+			m.appendLine(fmt.Sprintf("%s: mode set to %s\n", msg.agent, msg.modeLabel))
+		}
 		m.syncViewport()
 		return m, nil
 
@@ -935,6 +973,18 @@ func (m Model) handleOutput(u bus.Update) (tea.Model, tea.Cmd) {
 		m.commands[u.Agent] = acu.AvailableCommands
 	}
 
+	// Keep AgentSession.CurrentModeId in sync with the agent's own
+	// current_mode_update notification — the agent's mode changing on
+	// its own (e.g. its own /plan-style command) isn't only something
+	// chorus's `mode`/`auto` commands cause. See AgentSession's own doc
+	// comment on why this notification, not the SetMode request itself,
+	// is treated as the source of truth.
+	if cmu := u.Notification.Update.CurrentModeUpdate; cmu != nil {
+		if w, ok := m.workers[u.Agent]; ok && w.sess != nil {
+			w.sess.CurrentModeId = cmu.CurrentModeId
+		}
+	}
+
 	// Tally direct mechanical work for the `stats` command (see agentStats'
 	// doc comment) — ToolCall (not ToolCallUpdate) fires exactly once per
 	// tool call, when it's first announced, so this can't double-count a
@@ -1290,6 +1340,98 @@ func (m Model) handleContextLevelAnswer(line string) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// handleModeCommand parses and executes "mode <agent> <id-or-name>" —
+// an explicit ACP session/set_mode switch. Expects the id/name to have
+// been discovered via `modes` first — chorus never guesses one (see
+// session.Spec.AutoMode's doc comment). The RPC itself runs
+// asynchronously via runSetMode (concurrency invariant #1); this only
+// validates the input and kicks it off.
+func (m Model) handleModeCommand(rest string) (tea.Model, tea.Cmd) {
+	idx := strings.IndexByte(rest, ' ')
+	if idx < 0 {
+		m.appendLine("usage: mode <agent> <id-or-name> — see `modes` to list what's available\n")
+		m.syncViewport()
+		return m, nil
+	}
+	agentTok, modeTok := rest[:idx], strings.TrimSpace(rest[idx+1:])
+	agent, ok := matchName(agentTok, agentNames(m.workers))
+	if !ok {
+		m.appendLine(fmt.Sprintf("unknown agent %q\n", agentTok))
+		m.syncViewport()
+		return m, nil
+	}
+	w := m.workers[agent]
+	modeId, ok := resolveMode(w, modeTok)
+	if !ok {
+		m.appendLine(fmt.Sprintf("%s: no mode matching %q — see `modes`\n", agent, modeTok))
+		m.syncViewport()
+		return m, nil
+	}
+	return m, runSetMode(m.ctx, w, agent, modeId, modeTok, false, false, "")
+}
+
+// handleAutoCommand implements the `auto`/`auto <agent>` toggle: switch
+// into (or back out of) whichever ACP session mode agents.yaml's
+// auto_mode names for the given agent(s) — chorus's answer to "Claude/
+// Gemini/opencode's own auto-accept/yolo mode," without hardcoding what
+// that mode is actually called for any of them (session.Spec.AutoMode's
+// doc comment). No argument applies to every connected agent that has
+// auto_mode configured. Whether an agent is "currently in auto mode" is
+// decided by Model.autoPrevMode's presence, not by comparing
+// CurrentModeId to AutoMode — the agent could have separately switched
+// itself to the exact same mode ID on its own, which shouldn't be
+// treated as "chorus put it there, toggle it off." The actual mode
+// switch happens asynchronously (runSetMode); autoPrevMode itself is
+// only updated once setModeResultMsg confirms the RPC succeeded.
+func (m Model) handleAutoCommand(arg string) (tea.Model, tea.Cmd) {
+	var targets []string
+	if arg == "" {
+		for _, spec := range m.agentSpecs {
+			if spec.AutoMode == "" {
+				continue
+			}
+			if _, ok := m.workers[spec.Name]; ok {
+				targets = append(targets, spec.Name)
+			}
+		}
+		if len(targets) == 0 {
+			m.appendLine("no connected agent has auto_mode configured in agents.yaml\n")
+			m.syncViewport()
+			return m, nil
+		}
+	} else {
+		agent, ok := matchName(arg, agentNames(m.workers))
+		if !ok {
+			m.appendLine(fmt.Sprintf("unknown agent %q\n", arg))
+			m.syncViewport()
+			return m, nil
+		}
+		targets = []string{agent}
+	}
+
+	var cmds []tea.Cmd
+	for _, agent := range targets {
+		w := m.workers[agent]
+		spec := specByName(m.agentSpecs, agent)
+		if spec.AutoMode == "" {
+			m.appendLine(fmt.Sprintf("%s: no auto_mode configured in agents.yaml — use `modes` to find the real value, then set it there\n", agent))
+			continue
+		}
+		if prev, inAuto := m.autoPrevMode[agent]; inAuto {
+			cmds = append(cmds, runSetMode(m.ctx, w, agent, prev, string(prev), true, false, ""))
+			continue
+		}
+		modeId, ok := resolveMode(w, spec.AutoMode)
+		if !ok {
+			m.appendLine(fmt.Sprintf("%s: auto_mode %q doesn't match any mode it advertised — see `modes`\n", agent, spec.AutoMode))
+			continue
+		}
+		cmds = append(cmds, runSetMode(m.ctx, w, agent, modeId, spec.AutoMode, true, true, w.CurrentModeId()))
+	}
+	m.syncViewport()
+	return m, tea.Batch(cmds...)
+}
+
 func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 	if line == "" {
 		return m, nil
@@ -1322,6 +1464,18 @@ func (m Model) handleNormalLine(line string) (tea.Model, tea.Cmd) {
 		m.appendLine(formatStats(m.agentSpecs, m.stats))
 		m.syncViewport()
 		return m, nil
+	}
+	if line == "modes" {
+		m.appendLine(formatModes(m.agentSpecs, m.workers))
+		m.syncViewport()
+		return m, nil
+	}
+	if strings.HasPrefix(line, "mode ") {
+		return m.handleModeCommand(strings.TrimSpace(strings.TrimPrefix(line, "mode ")))
+	}
+	if line == "auto" || strings.HasPrefix(line, "auto ") {
+		arg := strings.TrimSpace(strings.TrimPrefix(line, "auto"))
+		return m.handleAutoCommand(arg)
 	}
 	if line == "context" {
 		m.contextMenuOpen = true

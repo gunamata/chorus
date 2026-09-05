@@ -81,6 +81,37 @@ agents:
 	}
 }
 
+func TestLoad_ParsesAutoMode(t *testing.T) {
+	path := writeTempAgents(t, `
+agents:
+  - name: claude
+    spawn: ["claude-agent-acp"]
+    auto_mode: acceptEdits
+`)
+	specs, _, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if specs[0].AutoMode != "acceptEdits" {
+		t.Errorf("specs[0].AutoMode = %q, want %q", specs[0].AutoMode, "acceptEdits")
+	}
+}
+
+func TestLoad_AutoModeOptional(t *testing.T) {
+	path := writeTempAgents(t, `
+agents:
+  - name: claude
+    spawn: ["claude-agent-acp"]
+`)
+	specs, _, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if specs[0].AutoMode != "" {
+		t.Errorf("specs[0].AutoMode = %q, want empty when omitted", specs[0].AutoMode)
+	}
+}
+
 func TestLoad_TransportDefaultsToAcp(t *testing.T) {
 	path := writeTempAgents(t, `
 agents:

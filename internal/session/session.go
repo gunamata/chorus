@@ -80,6 +80,18 @@ type Spec struct {
 	// a model-switch command. Empty/nil is fine: the router simply never
 	// picks a model for that agent, only the agent itself.
 	Models []ModelInfo
+
+	// AutoMode is this agent's ACP session-mode ID (or exact advertised
+	// Name — resolved the same way as the `mode` REPL command) to switch
+	// into for the `auto` REPL command — e.g. whatever this agent calls
+	// its own "accept edits"/"bypass permissions"/"yolo" mode. Left empty
+	// by default: chorus does not guess a mode string on your behalf,
+	// since mode IDs/names are entirely agent-defined and unconfirmed for
+	// any of Claude/Gemini/opencode. Use the `modes` REPL command to
+	// discover the real value for your agent, then set this once you
+	// know it. Empty means `auto`/`auto <name>` has nothing to switch
+	// this agent to — not an error, just a no-op with a clear message.
+	AutoMode string
 }
 
 // EffectiveCwd returns the cwd to send to this agent via ACP: WorkDir if
@@ -251,7 +263,12 @@ func (c *Connection) NewSession(ctx context.Context, cwd string, mcpServers []ac
 	if err != nil {
 		return nil, fmt.Errorf("%s: session/new: %w", c.Name, describeErr(err))
 	}
-	return &AgentSession{Name: c.Name, SessionID: newSess.SessionId, conn: c.conn}, nil
+	s := &AgentSession{Name: c.Name, SessionID: newSess.SessionId, conn: c.conn}
+	if newSess.Modes != nil {
+		s.AvailableModes = newSess.Modes.AvailableModes
+		s.CurrentModeId = newSess.Modes.CurrentModeId
+	}
+	return s, nil
 }
 
 // LoadSession resumes a previously created session by ID, replaying its
@@ -261,14 +278,20 @@ func (c *Connection) NewSession(ctx context.Context, cwd string, mcpServers []ac
 // SupportsLoadSession is true; calling it otherwise returns whatever
 // error the agent gives for an unsupported method.
 func (c *Connection) LoadSession(ctx context.Context, cwd string, sessionID acp.SessionId, mcpServers []acp.McpServer) (*AgentSession, error) {
-	if _, err := c.conn.LoadSession(ctx, acp.LoadSessionRequest{
+	loaded, err := c.conn.LoadSession(ctx, acp.LoadSessionRequest{
 		Cwd:        cwd,
 		SessionId:  sessionID,
 		McpServers: nonNil(mcpServers),
-	}); err != nil {
+	})
+	if err != nil {
 		return nil, fmt.Errorf("%s: session/load: %w", c.Name, describeErr(err))
 	}
-	return &AgentSession{Name: c.Name, SessionID: sessionID, conn: c.conn}, nil
+	s := &AgentSession{Name: c.Name, SessionID: sessionID, conn: c.conn}
+	if loaded.Modes != nil {
+		s.AvailableModes = loaded.Modes.AvailableModes
+		s.CurrentModeId = loaded.Modes.CurrentModeId
+	}
+	return s, nil
 }
 
 // nonNil turns a nil McpServer slice into an empty one. A nil slice
@@ -294,6 +317,19 @@ func (c *Connection) Close() {
 type AgentSession struct {
 	Name      string
 	SessionID acp.SessionId
+
+	// AvailableModes/CurrentModeId hold this session's ACP session-mode
+	// state (https://agentclientprotocol.com/protocol/session-modes) —
+	// populated from NewSession/LoadSession's response (both return an
+	// optional Modes field), then kept in sync by internal/tui: once on
+	// every current_mode_update notification (the agent's own source of
+	// truth), and optimistically right after a successful SetMode call,
+	// in case a given agent doesn't echo one back. Empty AvailableModes
+	// means this agent doesn't support ACP session modes at all — not
+	// an error, just nothing for the `modes`/`mode`/`auto` REPL commands
+	// to offer for it.
+	AvailableModes []acp.SessionMode
+	CurrentModeId  acp.SessionModeId
 
 	conn *acp.ClientSideConnection
 }
@@ -323,6 +359,23 @@ func (s *AgentSession) PromptContent(ctx context.Context, blocks []acp.ContentBl
 // Cancel requests the agent stop its current turn.
 func (s *AgentSession) Cancel(ctx context.Context) error {
 	return s.conn.Cancel(ctx, acp.CancelNotification{SessionId: s.SessionID})
+}
+
+// SetMode requests the agent switch this session into modeId — ACP's
+// session/set_mode. Does not update CurrentModeId itself on success; the
+// agent's own current_mode_update notification (or the caller, as a
+// belt-and-suspenders measure for an agent that doesn't send one) is
+// what keeps that field in sync, consistent with treating ACP
+// notifications as the source of truth rather than assuming a request's
+// success implies a particular resulting state. Callers should validate
+// modeId against AvailableModes themselves — this is a thin RPC wrapper,
+// same as Cancel, and doesn't second-guess what it's asked to send.
+func (s *AgentSession) SetMode(ctx context.Context, modeId acp.SessionModeId) error {
+	_, err := s.conn.SetSessionMode(ctx, acp.SetSessionModeRequest{SessionId: s.SessionID, ModeId: modeId})
+	if err != nil {
+		return describeErr(err)
+	}
+	return nil
 }
 
 func describeErr(err error) error {

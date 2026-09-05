@@ -273,6 +273,76 @@ func TestFormatStats_NoUsageDataOmitsTokenLine(t *testing.T) {
 	}
 }
 
+// --- ACP session modes (`modes`/`mode`/`auto` REPL commands) ------------
+
+func strPtr(s string) *string { return &s }
+
+func TestFormatModes_ListsPerAgentWithCurrentMarked(t *testing.T) {
+	specs := []session.Spec{{Name: "claude"}, {Name: "opencode"}}
+	claude := newWorker()
+	claude.sess = &session.AgentSession{
+		AvailableModes: []acp.SessionMode{
+			{Id: "default", Name: "Default"},
+			{Id: "acceptEdits", Name: "Accept Edits", Description: strPtr("auto-accept edits")},
+		},
+		CurrentModeId: "acceptEdits",
+	}
+	workers := map[string]*AgentWorker{"claude": claude, "opencode": newWorker()}
+
+	out := formatModes(specs, workers)
+	if !strings.Contains(out, "claude:") {
+		t.Fatalf("formatModes() = %q, want a claude section", out)
+	}
+	if !strings.Contains(out, "* Accept Edits (acceptEdits) — auto-accept edits") {
+		t.Fatalf("formatModes() = %q, want the current mode marked with *, name/id/description shown", out)
+	}
+	if !strings.Contains(out, "  Default (default)") {
+		t.Fatalf("formatModes() = %q, want the non-current mode listed unmarked", out)
+	}
+	if strings.Contains(out, "opencode:") {
+		t.Fatalf("formatModes() = %q, want opencode omitted — it reported no AvailableModes", out)
+	}
+}
+
+func TestFormatModes_NoAgentHasModesReturnsFriendlyMessage(t *testing.T) {
+	specs := []session.Spec{{Name: "claude"}}
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+
+	out := formatModes(specs, workers)
+	if !strings.Contains(out, "no agent has reported") {
+		t.Fatalf("formatModes() = %q, want a friendly no-modes message, not blank/panic", out)
+	}
+}
+
+func TestResolveMode_MatchesById(t *testing.T) {
+	w := newWorker()
+	w.sess = &session.AgentSession{AvailableModes: []acp.SessionMode{{Id: "acceptEdits", Name: "Accept Edits"}}}
+
+	id, ok := resolveMode(w, "acceptEdits")
+	if !ok || id != "acceptEdits" {
+		t.Fatalf("resolveMode() = (%q, %v), want (\"acceptEdits\", true)", id, ok)
+	}
+}
+
+func TestResolveMode_MatchesByNameCaseInsensitive(t *testing.T) {
+	w := newWorker()
+	w.sess = &session.AgentSession{AvailableModes: []acp.SessionMode{{Id: "acceptEdits", Name: "Accept Edits"}}}
+
+	id, ok := resolveMode(w, "accept edits")
+	if !ok || id != "acceptEdits" {
+		t.Fatalf("resolveMode() = (%q, %v), want a case-insensitive name match to resolve to id \"acceptEdits\"", id, ok)
+	}
+}
+
+func TestResolveMode_NoMatchReturnsFalse(t *testing.T) {
+	w := newWorker()
+	w.sess = &session.AgentSession{AvailableModes: []acp.SessionMode{{Id: "acceptEdits", Name: "Accept Edits"}}}
+
+	if _, ok := resolveMode(w, "nonexistent"); ok {
+		t.Fatal("resolveMode() = ok=true for a typed value matching neither id nor name, want false")
+	}
+}
+
 func indexOf(s, substr string) int {
 	for i := 0; i+len(substr) <= len(s); i++ {
 		if s[i:i+len(substr)] == substr {
