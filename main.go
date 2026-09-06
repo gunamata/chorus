@@ -353,22 +353,27 @@ func run(resume bool, agentsOverride string) error {
 	// (2026-08, reverting an earlier removal) once it became clear most
 	// terminal emulators (confirmed: Windows Terminal) let a modifier key
 	// (commonly Shift) held during click-drag override a program's mouse
-	// capture and select text natively regardless — the same mechanism
-	// Claude Code/Gemini CLI's own UIs rely on, not evidence they avoid
-	// mouse capture altogether. Whether the SAME override works in
+	// capture and select text natively regardless — a general terminal-
+	// emulator convention, not evidence a mouse-capturing app should avoid
+	// it altogether. Whether the SAME override works in
 	// classic cmd.exe/conhost specifically (vs. Windows Terminal) is
 	// unconfirmed — if selection turns out to be unrecoverable on a given
 	// terminal, that terminal's own mouse-mode override is the thing to
 	// chase, not another removal of this line.
 	//
-	// CHORUS_DISABLE_MOUSE (2026-09, closing a gap found against Claude
-	// Code CLI's own CLAUDE_CODE_DISABLE_MOUSE) is the escape hatch for a
+	// CHORUS_DISABLE_MOUSE (2026-09) is the escape hatch for a
 	// terminal where that modifier-key override doesn't apply, or a user
 	// who'd simply rather have guaranteed native selection than mouse-
 	// wheel scrolling — PageUp/PageDown/ctrl+u/ctrl+d already reach
 	// viewport.Update the same way (see handleKey), so scrolling stays
 	// fully usable from the keyboard alone with mouse capture off.
-	opts := []tea.ProgramOption{tea.WithAltScreen()}
+	// WithReportFocus backs the turn-completion bell (internal/tui's
+	// bellSuffix/FocusMsg/BlurMsg handling) — a no-op on a terminal that
+	// doesn't support focus reporting, in which case Model.focused simply
+	// never flips false and the bell never fires, rather than risking a
+	// false "you're unfocused" bell-spam on one that silently ignores the
+	// enabling sequence.
+	opts := []tea.ProgramOption{tea.WithAltScreen(), tea.WithReportFocus()}
 	if os.Getenv("CHORUS_DISABLE_MOUSE") == "" {
 		opts = append(opts, tea.WithMouseCellMotion())
 	}
@@ -383,6 +388,7 @@ func run(resume bool, agentsOverride string) error {
 		Cwd:           cwd,
 		AgentSpecs:    agentSpecs,
 		Conns:         conns,
+		ImageDir:      imageDir,
 		OutputCh:      outputCh,
 		PermCh:        permCh,
 		ErrCh:         errCh,

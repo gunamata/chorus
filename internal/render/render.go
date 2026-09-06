@@ -45,11 +45,10 @@ const (
 	colMag    = "\x1b[35m"
 	colBlue   = "\x1b[34m"
 	// colHighlightBg sets a solid background — used only to set an echoed
-	// user prompt visually apart from what follows it (FormatUserPrompt),
-	// the same convention Claude Code's own CLI uses. SGR 100 (bright
-	// black background) rather than a specific 256-color code, since it
-	// works on any ANSI-compatible terminal without needing extended
-	// color support.
+	// user prompt visually apart from what follows it (FormatUserPrompt).
+	// SGR 100 (bright black background) rather than a specific 256-color
+	// code, since it works on any ANSI-compatible terminal without needing
+	// extended color support.
 	colHighlightBg = "\x1b[100m"
 )
 
@@ -68,9 +67,9 @@ func SpinnerFrame(tick int) rune {
 }
 
 // thinkingWords are the whimsical single-word indicators shown while an
-// agent is reasoning and ShowThoughts is off (the default) — the same
-// idea as Claude Code/Gemini CLI/Codex's own rotating-word "thinking"
-// indicators. One is picked per thinking burst (not re-rolled on every
+// agent is reasoning and ShowThoughts is off (the default) — a rotating
+// word beats a wall of chain-of-thought text for a brief "still working"
+// signal. One is picked per thinking burst (not re-rolled on every
 // chunk — see formatThinkingIndicator) and animated by the same spinner
 // tick as an in-progress tool call.
 var thinkingWords = []string{
@@ -370,11 +369,11 @@ func (r *Renderer) FormatUserPrompt(agent, text string) string {
 	return b.String()
 }
 
-// HighlightLine wraps line in a full-width background highlight — the
-// same visual convention Claude Code's own CLI uses to set an echoed
-// user prompt apart from the reply that follows it — padded with
-// colHighlightBg-colored spaces so the block reads as solid, not just
-// colored text with a ragged right edge. Exported (2026-09) so
+// HighlightLine wraps line in a full-width background highlight — used
+// to set an echoed user prompt visually apart from the reply that
+// follows it — padded with colHighlightBg-colored spaces so the block
+// reads as solid, not just colored text with a ragged right edge.
+// Exported (2026-09) so
 // internal/tui can reuse the exact same visual treatment for click-drag
 // text selection (Model.applySelectionHighlight) — a selection highlight
 // and a prompt echo are the same visual idea (mark these specific lines

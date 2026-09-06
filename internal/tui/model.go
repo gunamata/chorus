@@ -13,7 +13,10 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -152,6 +155,12 @@ type Config struct {
 	Cwd          string
 	AgentSpecs   []session.Spec
 	Conns        map[string]*session.Connection
+	// ImageDir is where a Ctrl+V clipboard-image paste is saved before
+	// being referenced as an ordinary "@path" attachment — the same
+	// directory main.go already creates for inbound agent-sent images, so
+	// a session's images (sent or received) all live in one place. ""
+	// falls back to os.TempDir() rather than erroring.
+	ImageDir string
 
 	OutputCh      chan bus.Update
 	PermCh        chan bus.PermissionRequest
@@ -175,6 +184,7 @@ type Model struct {
 	conns        map[string]*session.Connection
 	commands     map[string][]acp.AvailableCommand
 	stats        agentStats
+	imageDir     string
 
 	// activity is a merged-by-turn log of what's happened in the interactive
 	// session — the mechanical (no extra LLM call) backing for all three
@@ -251,10 +261,10 @@ type Model struct {
 	// clicked row), not column offsets — selecting always copies whole
 	// lines. This avoids tracking exact rune/column positions through
 	// wordwrap's reflow and glamour's ANSI styling (materially more
-	// complex, and Claude Code CLI's own line-oriented feel from a
-	// scrolling terminal buffer is what users actually expect here) at
-	// the cost of not supporting a mid-line-to-mid-line selection — a
-	// deliberate, documented trade-off, not an oversight.
+	// complex than a line-oriented selection over a scrolling terminal
+	// buffer needs to be) at the cost of not supporting a mid-line-to-
+	// mid-line selection — a deliberate, documented trade-off, not an
+	// oversight.
 	selecting        bool
 	selectAnchorLine int
 	selectCurLine    int
@@ -292,6 +302,32 @@ type Model struct {
 	historyIndex  int
 	historyDraft  string
 
+	// pastes backs the large-paste collapse feature ("[Pasted text #N
+	// +NN lines]"): keyed by the chip inserted into the textarea, valued
+	// by the full pasted text. expandPastes resolves a chip back to its
+	// full text at the actual dispatch choke point, so the input box,
+	// scrollback echo, and promptHistory all keep showing the short form.
+	// Never cleared — a chip recalled from promptHistory later must still
+	// expand correctly.
+	pastes      map[string]string
+	nextPasteID int
+
+	// suggestKind/Items/Cursor/TokenStart/Token back the live "/"-command
+	// and "@"-file completion popup, recomputed once per keypress
+	// (refreshSuggest) and cached here so View()/relayout() only ever
+	// read — never recompute — and so can't disagree about the popup's
+	// size for a given keystroke. suggestToken is the token the cached
+	// items were computed for, used to detect "filter changed, reset the
+	// cursor." suggestSuppressed/SuppressedToken implement Esc-to-dismiss
+	// for exactly that one token — typing further naturally un-suppresses.
+	suggestKind            suggestKind
+	suggestItems           []suggestItem
+	suggestCursor          int
+	suggestTokenStart      int
+	suggestToken           string
+	suggestSuppressed      bool
+	suggestSuppressedToken string
+
 	// uiTick counts spinnerTickMsg deliveries unconditionally (unlike
 	// renderer.spinnerFrame, which only advances while an in-place
 	// document block is actively animating) — used purely to animate the
@@ -326,6 +362,14 @@ type Model struct {
 	ready         bool // true once the first WindowSizeMsg has sized viewport/input
 
 	quitting bool
+
+	// focused tracks terminal focus (tea.FocusMsg/BlurMsg, enabled via
+	// main.go's tea.WithReportFocus()) — defaults true so a terminal that
+	// never reports focus at all (the option is a no-op if unsupported)
+	// never rings a bell it was never asked to, rather than bell-spamming
+	// every single turn. Backs bellSuffix's "notify only while the user
+	// probably isn't looking" behavior.
+	focused bool
 }
 
 // inputHeight is the textarea's fixed visible height in rows. Not
@@ -354,10 +398,10 @@ var inputKeyMap = func() textarea.KeyMap {
 func New(cfg Config) Model {
 	ta := textarea.New()
 	// Prompt was never set before textinput's own default ("" — no visual
-	// marker at all for "this is where you type," unlike Claude Code/
-	// Gemini CLI's own input lines). "❯ " matches the same cursor glyph the
-	// arrow-key menu selection already uses (render.FormatMenuLine), so the
-	// one glyph reads consistently as "here" throughout chorus's UI. A
+	// marker at all for "this is where you type"). "❯ " matches the same
+	// cursor glyph the arrow-key menu selection already uses
+	// (render.FormatMenuLine), so the one glyph reads consistently as
+	// "here" throughout chorus's UI. A
 	// continuation line (the 2nd+ line of a multi-line prompt) gets a
 	// blank prompt of the same width instead of repeating "❯ ", so a
 	// multi-line prompt doesn't read as several separate ones.
@@ -397,6 +441,7 @@ func New(cfg Config) Model {
 		cwd:              cfg.Cwd,
 		agentSpecs:       cfg.AgentSpecs,
 		conns:            cfg.Conns,
+		imageDir:         cfg.ImageDir,
 		commands:         make(map[string][]acp.AvailableCommand),
 		stats:            newAgentStats(),
 		compaction:       cfg.Compaction,
@@ -410,6 +455,8 @@ func New(cfg Config) Model {
 		delegateLogCh:    cfg.DelegateLogCh,
 		viewport:         vp,
 		input:            ta,
+		focused:          true,
+		pastes:           make(map[string]string),
 		historyIndex:     -1,
 		permMenuIndex:    -1,
 		routeMenuIndex:   -1,
@@ -547,7 +594,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case errChMsg:
-		m.appendLine(strings.TrimRight(formatErrLine(msg.e), "\n") + "\n")
+		m.appendLine(strings.TrimRight(formatErrLine(msg.e), "\n") + "\n" + m.bellSuffix())
 		m.syncViewport()
 		return m, waitForErr(m.errCh)
 
@@ -557,7 +604,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the same event would just be noise on top of it. On success this
 		// is the only place a completed turn is ever announced at all.
 		if msg.e.Err == nil {
-			m.appendLine(fmt.Sprintf("[%s] finished in %s\n", msg.e.Agent, formatDuration(msg.e.Duration)))
+			m.appendLine(fmt.Sprintf("[%s] finished in %s\n", msg.e.Agent, formatDuration(msg.e.Duration)) + m.bellSuffix())
 			m.syncViewport()
 			// A usage update crossing threshold while this agent was mid-turn
 			// deferred compaction rather than interrupting it — fire it now
@@ -648,6 +695,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.MouseMsg:
 		return m.handleMouse(msg)
+
+	case tea.FocusMsg:
+		m.focused = true
+		return m, nil
+
+	case tea.BlurMsg:
+		m.focused = false
+		return m, nil
 	}
 
 	return m, nil
@@ -679,7 +734,7 @@ func (m Model) View() string {
 		modeStatus = m.lastCopyStatus
 	}
 	status := statusStyle.Render(modeStatus) + "\n" + statusStyle.Render(m.formatBusyStatus()) + "\n"
-	return m.viewport.View() + "\n" + status + inputBoxStyle.Width(m.width).Render(m.input.View())
+	return m.viewport.View() + "\n" + status + m.renderSuggestOverlay() + inputBoxStyle.Width(m.width).Render(m.input.View())
 }
 
 // formatBusyStatus renders one line listing every currently-busy agent with
@@ -715,17 +770,28 @@ func (m Model) formatBusyStatus() string {
 	return strings.Join(parts, "  ·  ") + "   (esc to interrupt)"
 }
 
-// handleMouse implements click-drag text selection + copy-on-select —
-// closing the second-biggest gap (after Esc-to-interrupt) found against
-// Claude Code CLI's own UI: tea.WithMouseCellMotion() (main.go) puts
-// chorus, not the terminal, in charge of mouse events, which means a plain
-// click-drag never reaches the terminal's native selection at all unless a
-// user knows to hold a modifier key (Shift on most terminals) — something
-// CHORUS_DISABLE_MOUSE documents as the escape hatch, but shouldn't be the
-// ONLY way to select and copy text, since a user migrating from Claude Code
-// CLI (which solves this the same way: owning mouse capture, then writing
-// the selection to the system clipboard itself) would otherwise lose a
-// basic, expected capability by switching to chorus.
+// bellSuffix returns a terminal bell character when the terminal is known
+// to be unfocused, "" otherwise — appended to a turn's completion/error
+// line so it rides through the normal View()-rendered document (concurrency
+// invariant #3: nothing outside bubbletea's own render cycle may write to
+// the terminal) rather than needing a separate raw write. Deliberately
+// silent while focused ("tell me when I've looked away, not on every
+// turn") rather than bell-spamming a user who's actively watching the
+// screen.
+func (m Model) bellSuffix() string {
+	if m.focused {
+		return ""
+	}
+	return "\a"
+}
+
+// handleMouse implements click-drag text selection + copy-on-select:
+// tea.WithMouseCellMotion() (main.go) puts chorus, not the terminal, in
+// charge of mouse events, which means a plain click-drag never reaches
+// the terminal's native selection at all unless a user knows to hold a
+// modifier key (Shift on most terminals) — something CHORUS_DISABLE_MOUSE
+// documents as the escape hatch, but shouldn't be the ONLY way to select
+// and copy text, since that's a basic, expected terminal-app capability.
 //
 // Only left-button events participate; wheel events fall through to
 // viewport.Update unchanged (its own MouseWheelEnabled path, untouched by
@@ -777,11 +843,11 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 // selectCurLine (inclusive, order-independent) from the current document,
 // strips ANSI styling (a terminal clipboard should receive plain text, not
 // chorus's own color codes), and writes the result to the system clipboard
-// via github.com/atotto/clipboard — which already implements the same
-// per-platform mechanisms Claude Code CLI's own copy-on-select relies on
-// (pbcopy on macOS, wl-copy/xclip/xsel on Linux depending on the session
-// type, the native Win32 clipboard API on Windows with no external process
-// needed). Recomputes the document fresh (renderDocument is a pure,
+// via github.com/atotto/clipboard — which already implements the
+// necessary per-platform mechanisms (pbcopy on macOS, wl-copy/xclip/xsel
+// on Linux depending on the session type, the native Win32 clipboard API
+// on Windows with no external process needed). Recomputes the document
+// fresh (renderDocument is a pure,
 // cheap function of m.blocks/m.viewport.Width) rather than reading from a
 // cache, so a selection made while output is actively streaming in still
 // reflects exactly what was on screen at release time.
@@ -862,16 +928,13 @@ func clampInt(v, lo, hi int) int {
 }
 
 // interruptBusyAgents implements Esc's "stop the current turn without
-// quitting the program" behavior — chorus's answer to Claude Code CLI's own
-// Esc-to-interrupt, and the single biggest gap found in a direct UI/UX
-// parity comparison against it (2026-09-02): previously the only way to
+// quitting the program" behavior (2026-09-02): previously the only way to
 // stop a running turn was Ctrl+C, which kills every connected agent's
 // subprocess at once, mid-turn, discarding whatever any OTHER agent was
 // doing too — not just the one turn the user actually wanted to stop.
 //
-// Claude Code CLI never has to decide WHICH agent Esc interrupts, since it
-// only ever runs itself — chorus does, because running several agents at
-// once is its whole point. Resolved by picking lastRoutedAgent (the most
+// Deciding WHICH agent Esc interrupts only matters because chorus runs
+// several agents at once — resolved by picking lastRoutedAgent (the most
 // recently dispatched turn — the one the user is most likely watching) if
 // it's currently busy; otherwise every currently-busy agent is interrupted,
 // so Esc is never a silent no-op just because the most recent dispatch
@@ -1064,17 +1127,29 @@ func (m *Model) fireCompaction(agent string) {
 func (m *Model) handleResize(msg tea.WindowSizeMsg) Model {
 	m.width, m.height = msg.Width, msg.Height
 	m.ready = true
+	m.relayout()
+	return *m
+}
 
-	// Must match View()'s exact layout line-for-line: viewport, then a
-	// literal "\n" separator, then two always-reserved (even when blank
-	// this frame) status lines, then inputBoxStyle's rendered output —
-	// which is itself 1 (top border) + inputHeight (textarea content)
-	// lines. Under-reserving here would make the input box (or its
-	// border) get clipped off the bottom by the terminal itself.
+// relayout recomputes viewport/input dimensions from m.width/m.height and
+// the current suggestion popup's line count. Called from handleResize AND
+// from handleKey's wrapper (a popup opening/closing mid-typing resizes the
+// viewport just like a terminal resize does) so there's one source of
+// truth instead of two drifting copies. Must match View()'s layout
+// line-for-line: viewport, "\n" separator, two status lines, the
+// suggestion overlay (suggestOverlayLineCount()/renderSuggestOverlay() are
+// the same computation, so they can't disagree), then the input box (1
+// border line + inputHeight). Under-reserving clips the input box off the
+// bottom.
+func (m *Model) relayout() {
+	if !m.ready {
+		return
+	}
 	separatorHeight := 1
 	statusHeight := 2
+	overlayHeight := m.suggestOverlayLineCount()
 	inputBoxHeight := 1 + inputHeight // border line + textarea content lines
-	vpHeight := m.height - separatorHeight - statusHeight - inputBoxHeight
+	vpHeight := m.height - separatorHeight - statusHeight - overlayHeight - inputBoxHeight
 	if vpHeight < 1 {
 		vpHeight = 1
 	}
@@ -1088,14 +1163,27 @@ func (m *Model) handleResize(msg tea.WindowSizeMsg) Model {
 
 	m.renderer.SetWidth(m.width)
 	m.syncViewport()
-
-	return *m
 }
 
-// handleKey routes a keypress through m.mode()'s priority chain
+// handleKey wraps handleKeyDispatch with the bookkeeping that must run
+// after EVERY keypress regardless of which branch inside it fired:
+// refreshSuggest recomputes the live "/"/"@" popup from whatever the input
+// box now contains, and relayout resizes the viewport to match — done
+// here, once, rather than scattered across handleKeyDispatch's many early
+// returns, so there's exactly one place that can get this wrong instead of
+// N of them.
+func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	newModel, cmd := m.handleKeyDispatch(msg)
+	mm := newModel.(Model)
+	mm.refreshSuggest()
+	mm.relayout()
+	return mm, cmd
+}
+
+// handleKeyDispatch routes a keypress through m.mode()'s priority chain
 // (permission answer > routeAsk answer > normal dispatch), exactly the
 // original REPL's lineCh-handling order (main.go's old select loop).
-func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+func (m Model) handleKeyDispatch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.lastCopyStatus = "" // one-shot — see its doc comment
 	if m.selectionActive {
 		// Dismiss a lingering selection highlight on the next keypress,
@@ -1108,18 +1196,49 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.Type {
 	case tea.KeyCtrlC:
+		// First press clears the in-progress draft rather than quitting
+		// outright — an immediate, unconfirmed Ctrl+C used to kill every
+		// connected agent's subprocess at once. Only quits once the input
+		// is already empty, which a second press naturally satisfies
+		// without needing a press-twice timer.
+		if m.input.Value() != "" {
+			m.input.Reset()
+			return m, nil
+		}
 		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyEsc:
 		// Only in modeNormal — a pending permission/routeAsk/contextLevel
 		// menu already has its own answer paths (type "cancel", arrow+enter,
 		// etc.), and those have real, tested invariants (concurrency
-		// invariants #4/#10/#11) not worth disturbing here. Esc's new job is
-		// strictly "stop a running turn without quitting," Claude Code CLI's
-		// single biggest interaction chorus was missing entirely — see
+		// invariants #4/#10/#11) not worth disturbing here. Esc's job is
+		// strictly "stop a running turn without quitting" — see
 		// interruptBusyAgents' doc comment.
 		if m.mode() == modeNormal {
+			// Dismissing an open "/"/"@" suggestion popup takes priority
+			// over interrupting a busy agent — the popup is what's
+			// actually in front of the user's attention right now.
+			// Suppressed by exact token, not just "hide until next
+			// keystroke": continuing to type without changing the active
+			// token (e.g. an arrow key that isn't bound to anything here)
+			// must keep it dismissed.
+			if m.suggestKind != suggestNone {
+				m.suggestSuppressed = true
+				m.suggestSuppressedToken = m.suggestToken
+				m.suggestKind = suggestNone
+				m.suggestItems = nil
+				return m, nil
+			}
 			return m.interruptBusyAgents(), nil
+		}
+	case tea.KeyCtrlV:
+		// A literal Ctrl+V keystroke only ever reaches the program at all
+		// when the terminal had nothing to bracket-paste as text — i.e.
+		// the clipboard holds an image, or nothing. Only meaningful in
+		// modeNormal, same as Esc above; otherwise falls through
+		// unhandled (a permission/routeAsk answer is text-only).
+		if m.mode() == modeNormal {
+			return m.handleClipboardImagePaste(), nil
 		}
 	}
 
@@ -1167,6 +1286,30 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 
+	// An open "/"-command or "@"-file suggestion popup claims Up/Down/Tab/
+	// Enter next, before the prompt-history recall or normal submit below:
+	// arrow keys move the highlighted row, Tab/Enter accepts it. Never
+	// intercepts a plain character key — those must still reach the
+	// textarea so the filter keeps narrowing.
+	if m.mode() == modeNormal && m.suggestKind != suggestNone {
+		switch msg.Type {
+		case tea.KeyUp:
+			m.suggestCursor--
+			if m.suggestCursor < 0 {
+				m.suggestCursor = len(m.suggestItems) - 1
+			}
+			return m, nil
+		case tea.KeyDown:
+			m.suggestCursor++
+			if m.suggestCursor >= len(m.suggestItems) {
+				m.suggestCursor = 0
+			}
+			return m, nil
+		case tea.KeyTab, tea.KeyEnter:
+			return m.acceptSuggestion(), nil
+		}
+	}
+
 	// Up/Down move the cursor within a multi-line prompt exactly like any
 	// other multi-line editor (forwarded to the textarea below, unchanged)
 	// — UNLESS the cursor is already at the very top/bottom display row of
@@ -1180,6 +1323,32 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.Type == tea.KeyDown && m.atInputBottom() {
 		return m.historyDown(), nil
+	}
+
+	// A large bracketed paste (bubbletea delivers the WHOLE pasted blob as
+	// one Key{Type: KeyRunes, Paste: true}, never split into per-character
+	// events) collapses to a short "[Pasted text #N +NN lines]" chip
+	// instead of ballooning the input box. expandPastes restores the full
+	// text at the actual dispatch choke point — nothing is lost. A small
+	// paste falls through unchanged to the ordinary textarea handling below.
+	if msg.Paste {
+		if chip, ok := m.storePasteIfLarge(string(msg.Runes)); ok {
+			m.input.InsertString(chip)
+			return m, nil
+		}
+	}
+
+	// A trailing "\" before Enter inserts a newline instead of submitting —
+	// a terminal-agnostic multi-line continuation that works even where
+	// Shift+Enter isn't decoded as a distinct key (this bubbletea version
+	// has no kitty-keyboard-protocol support, so a terminal that encodes
+	// Shift+Enter that way is indistinguishable from plain Enter here) and
+	// where ctrl+j isn't already muscle memory.
+	if msg.Type == tea.KeyEnter {
+		if val := m.input.Value(); strings.HasSuffix(val, "\\") {
+			m.input.SetValue(strings.TrimSuffix(val, "\\") + "\n")
+			return m, nil
+		}
 	}
 
 	if msg.Type != tea.KeyEnter {
@@ -1256,6 +1425,247 @@ func (m Model) historyDown() Model {
 	m.input.SetValue(m.historyDraft)
 	m.historyDraft = ""
 	return m
+}
+
+// handleClipboardImagePaste implements Ctrl+V's "attach an image straight
+// from the OS clipboard" — the direct analog of typing `@screenshot.png`
+// but without saving the screenshot to a file yourself first. Reuses the
+// existing @-attachment pipeline (extractAttachments/buildPromptBlocks)
+// rather than a second image-content mechanism: the clipboard bytes are
+// saved to a real file under m.imageDir, then referenced as an ordinary
+// "@path" token. This handler fires on every Ctrl+V that reaches the
+// program (see the KeyCtrlV case in handleKeyDispatch for when that is),
+// so a clipboard with no image is silently a no-op; a real read/decode
+// failure still gets a line.
+func (m Model) handleClipboardImagePaste() Model {
+	data, mime, err := readClipboardImage()
+	if err != nil {
+		if !errors.Is(err, ErrNoClipboardImage) {
+			m.appendLine(fmt.Sprintf("clipboard image paste failed: %v\n", err))
+			m.syncViewport()
+		}
+		return m
+	}
+	path, err := m.saveClipboardImage(data, mime)
+	if err != nil {
+		m.appendLine(fmt.Sprintf("clipboard image paste failed: %v\n", err))
+		m.syncViewport()
+		return m
+	}
+	m.input.InsertString("@" + path + " ")
+	return m
+}
+
+// saveClipboardImage writes data under m.imageDir (Config.ImageDir's doc
+// comment), falling back to os.TempDir() if it's unset/uncreatable rather
+// than failing the paste outright. 0o600 (owner-only), matching every
+// other chorus-written file under this directory (security invariant #6).
+func (m Model) saveClipboardImage(data []byte, mime string) (string, error) {
+	dir := m.imageDir
+	if dir == "" || os.MkdirAll(dir, 0o700) != nil {
+		dir = os.TempDir()
+	}
+	ext := ".png"
+	if mime == "image/jpeg" {
+		ext = ".jpg"
+	}
+	path := filepath.Join(dir, fmt.Sprintf("clipboard-%d%s", time.Now().UnixNano(), ext))
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+// pasteCollapseCharThreshold/pasteCollapseLineThreshold gate the large-paste
+// collapse feature (>800 chars OR >3 lines) — high enough that ordinary
+// pasted snippets pass through untouched, low enough that a pasted log or
+// diff gets collapsed before it dominates the input box.
+const (
+	pasteCollapseCharThreshold = 800
+	pasteCollapseLineThreshold = 3
+)
+
+// storePasteIfLarge records text under a fresh chip key (Model.pastes) and
+// returns that chip if text crosses either collapse threshold; ok is false
+// (chip is "") for an ordinary small paste, telling the caller to fall
+// through to normal insertion instead.
+func (m *Model) storePasteIfLarge(text string) (chip string, ok bool) {
+	lines := strings.Count(text, "\n") + 1
+	if len(text) <= pasteCollapseCharThreshold && lines <= pasteCollapseLineThreshold {
+		return "", false
+	}
+	m.nextPasteID++
+	chip = fmt.Sprintf("[Pasted text #%d +%d lines]", m.nextPasteID, lines)
+	m.pastes[chip] = text
+	return chip, true
+}
+
+// expandPastes replaces every chip token storePasteIfLarge previously
+// inserted with the full text it stands in for — called once, at the
+// actual dispatch choke point (dispatchUserTurn/handleNativeCommand), so
+// the input box, scrollback echo, and promptHistory all keep showing the
+// short chip form; only the agent or shell ever sees the expanded text.
+// Plain string replacement, not a regex: chip keys are already exact,
+// unique strings (Model.pastes' doc comment), so there's nothing to parse.
+func (m Model) expandPastes(text string) string {
+	if len(m.pastes) == 0 || !strings.Contains(text, "[Pasted text #") {
+		return text
+	}
+	for chip, full := range m.pastes {
+		text = strings.ReplaceAll(text, chip, full)
+	}
+	return text
+}
+
+// suggestMaxVisible caps how many popup rows relayout ever reserves space
+// for — a long unfiltered match list (a bare "@" in a big directory, say)
+// still only costs a fixed, small number of lines, with a "N more" line
+// standing in for the rest.
+const suggestMaxVisible = 6
+
+// detectSuggestToken looks at the CURSOR-TRAILING end of the input value
+// only (not wherever the cursor actually is) — a deliberate simplification:
+// tracking the exact rune/column the cursor sits at through a wrapped,
+// multi-line textarea would be materially more code for a case (editing
+// back into the MIDDLE of already-typed text to add a new "/" or "@"
+// mention) that's rare in practice, since both kinds of mention are
+// almost always typed at the point you're actively composing. Slash
+// commands mirror dispatch()'s own rule exactly (the ENTIRE trimmed line
+// must start with "/", with no space yet — i.e. still composing the
+// command name itself); "@" mentions match the trailing whitespace-
+// delimited word anywhere, since a real @-attachment can appear mid-
+// sentence.
+func detectSuggestToken(val string) (kind suggestKind, tokenStart int, token string) {
+	if val == "" {
+		return suggestNone, 0, ""
+	}
+	if strings.HasPrefix(val, "/") && !strings.ContainsAny(val, " \t\n") {
+		return suggestCommand, 0, val
+	}
+	lastWS := strings.LastIndexAny(val, " \t\n")
+	word := val[lastWS+1:]
+	if strings.HasPrefix(word, "@") {
+		return suggestFile, lastWS + 1, word
+	}
+	return suggestNone, 0, ""
+}
+
+// refreshSuggest recomputes the live suggestion popup from the input box's
+// current content — called exactly once per keypress, from handleKey's
+// wrapper, regardless of which branch inside handleKeyDispatch actually
+// ran. Model.suggestKind's doc comment explains why this is cached rather
+// than recomputed by View()/relayout() themselves.
+func (m *Model) refreshSuggest() {
+	kind, tokenStart, token := detectSuggestToken(m.input.Value())
+	if kind != suggestNone && m.suggestSuppressed && token == m.suggestSuppressedToken {
+		kind = suggestNone
+	}
+	var items []suggestItem
+	if kind == suggestCommand {
+		items = matchingCommandSuggestions(m.commands, token[1:])
+	} else if kind == suggestFile {
+		items = matchingFileSuggestions(m.cwd, token[1:])
+	}
+	if len(items) == 0 {
+		m.suggestKind = suggestNone
+		m.suggestItems = nil
+		m.suggestTokenStart = 0
+		return
+	}
+	if token != m.suggestToken {
+		m.suggestCursor = 0
+	}
+	if token != m.suggestSuppressedToken {
+		m.suggestSuppressed = false
+	}
+	m.suggestToken = token
+	m.suggestKind = kind
+	m.suggestItems = items
+	m.suggestTokenStart = tokenStart
+}
+
+// acceptSuggestion replaces the active token (from suggestTokenStart to
+// the end of the input, which is always where the token runs to — see
+// detectSuggestToken) with the currently highlighted item's full
+// replacement text, then closes the popup implicitly: the very next
+// refreshSuggest call (handleKey's wrapper, right after this returns) will
+// no longer find a matching token unless the replacement itself opens a
+// new one (e.g. accepting a directory keeps "@" popup open one level
+// deeper — matchingFileSuggestions' doc comment).
+func (m Model) acceptSuggestion() Model {
+	if m.suggestKind == suggestNone || len(m.suggestItems) == 0 {
+		return m
+	}
+	idx := m.suggestCursor
+	if idx < 0 || idx >= len(m.suggestItems) {
+		idx = 0
+	}
+	val := m.input.Value()
+	if m.suggestTokenStart > len(val) {
+		return m
+	}
+	m.input.SetValue(val[:m.suggestTokenStart] + m.suggestItems[idx].insert)
+	return m
+}
+
+// suggestOverlayLineCount and renderSuggestOverlay are two views of the
+// exact same computation (the latter calls the former's sibling logic
+// directly) — relayout() sizes the viewport by the count, View() renders
+// the string, and they can never disagree because neither recomputes the
+// item list itself (both just read Model.suggestItems, already cached by
+// refreshSuggest).
+func (m Model) suggestOverlayLineCount() int {
+	if m.suggestKind == suggestNone || len(m.suggestItems) == 0 {
+		return 0
+	}
+	shown := len(m.suggestItems)
+	if shown > suggestMaxVisible {
+		shown = suggestMaxVisible
+	}
+	lines := shown
+	if len(m.suggestItems) > shown {
+		lines++
+	}
+	return lines
+}
+
+var suggestCursorStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+
+// renderSuggestOverlay renders the live popup as plain lines, one per
+// matched item (cursor-highlighted row marked "❯", same glyph convention
+// as render.FormatMenuLine's permission/routeAsk menus) — never appended
+// to m.blocks/the scrollback document: unlike a permission prompt, this
+// has no reason to leave any permanent trace once you've moved on, and
+// only View() ever calls this (Model.blocks stays untouched), so there's
+// nothing to clean up when the popup closes.
+func (m Model) renderSuggestOverlay() string {
+	n := m.suggestOverlayLineCount()
+	if n == 0 {
+		return ""
+	}
+	shown := len(m.suggestItems)
+	if shown > suggestMaxVisible {
+		shown = suggestMaxVisible
+	}
+	var b strings.Builder
+	for i := 0; i < shown; i++ {
+		it := m.suggestItems[i]
+		marker := "  "
+		if i == m.suggestCursor {
+			marker = suggestCursorStyle.Render("❯ ")
+		}
+		label := render.StripANSI(it.label)
+		desc := render.StripANSI(it.desc)
+		if desc != "" {
+			fmt.Fprintf(&b, "%s%-24s %s\n", marker, label, desc)
+		} else {
+			fmt.Fprintf(&b, "%s%s\n", marker, label)
+		}
+	}
+	if len(m.suggestItems) > shown {
+		fmt.Fprintf(&b, "  … %d more\n", len(m.suggestItems)-shown)
+	}
+	return b.String()
 }
 
 // recordHistory appends a just-submitted line to promptHistory (skipping
@@ -1653,9 +2063,13 @@ func formatContextLevelMenu(cursor int) string {
 // preamble-wrapped prompt — the preamble is scaffolding for the agent, not
 // something to show the user or replay as prior context on the next switch.
 func (m *Model) dispatchUserTurn(target, text string, isPrompt, echo bool) {
-	promptText := text
+	// Expanded here, not earlier: text itself (used below for the echo and
+	// the activity log) must stay in its short chip form — only the actual
+	// wire content sent to the agent needs the real pasted text. See
+	// expandPastes' doc comment.
+	promptText := m.expandPastes(text)
 	if isPrompt && m.lastRoutedAgent != "" && m.lastRoutedAgent != target {
-		promptText = buildHandoffPreamble(m.lastRoutedAgent, m.activityContext("full")) + "\n\n" + text
+		promptText = buildHandoffPreamble(m.lastRoutedAgent, m.activityContext("full")) + "\n\n" + promptText
 	}
 	if errMsg := queuePrompt(target, promptText, m.workers); errMsg != "" {
 		m.appendLine(errMsg + "\n")
@@ -1815,7 +2229,7 @@ func (m Model) handleNativeCommand(line string) (tea.Model, tea.Cmd) {
 	}
 	m.appendLine(m.renderer.FormatNativeCommandEcho(cmdline))
 	m.syncViewport()
-	return m, runNativeCommand(m.ctx, cmdline)
+	return m, runNativeCommand(m.ctx, m.expandPastes(cmdline))
 }
 
 // mergeBlock implements the document's merge rule: a mergeable block

@@ -415,6 +415,162 @@ func TestBuildPromptBlocks_TextOnly(t *testing.T) {
 	}
 }
 
+// --- generic (non-image) file attachments -------------------------------
+
+func TestExtractFileAttachments_SplicesRealFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "notes.txt")
+	if err := os.WriteFile(path, []byte("hello from notes"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := extractFileAttachments("see @" + path)
+	if !strings.Contains(got, "hello from notes") {
+		t.Fatalf("extractFileAttachments(...) = %q, want the file's content spliced in", got)
+	}
+	if !containsPath(got, path) {
+		t.Fatalf("extractFileAttachments(...) = %q, want the original @path mention preserved", got)
+	}
+}
+
+func TestExtractFileAttachments_ImageExtensionLeftForExtractAttachments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shot.png")
+	if err := os.WriteFile(path, []byte("fake-png"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := extractFileAttachments("look at @" + path)
+	if strings.Contains(got, "fake-png") {
+		t.Fatal("extractFileAttachments spliced an image file's raw bytes into text, want it left untouched for extractAttachments")
+	}
+}
+
+func TestExtractFileAttachments_UnresolvableTokenLeftAlone(t *testing.T) {
+	got := extractFileAttachments("email me at joe@example.com please")
+	if got != "email me at joe@example.com please" {
+		t.Fatalf("extractFileAttachments(...) = %q, want an unresolvable @-token left completely unchanged", got)
+	}
+}
+
+func TestExtractFileAttachments_OversizedFileLeftAlone(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "big.log")
+	if err := os.WriteFile(path, make([]byte, maxAttachedFileBytes+1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := extractFileAttachments("see @" + path)
+	if !containsPath(got, path) || strings.Contains(got, "```") {
+		t.Fatalf("extractFileAttachments(...) = %q, want an oversized file left as a bare mention, not spliced", got)
+	}
+}
+
+// --- live "/"-command and "@"-file suggestion popup ---------------------
+
+func TestDetectSuggestToken_SlashOnlyAtLineStartWithNoSpaceYet(t *testing.T) {
+	kind, start, token := detectSuggestToken("/pla")
+	if kind != suggestCommand || start != 0 || token != "/pla" {
+		t.Fatalf("detectSuggestToken(\"/pla\") = (%v,%d,%q), want (suggestCommand,0,\"/pla\")", kind, start, token)
+	}
+	if kind, _, _ := detectSuggestToken("/plan now"); kind != suggestNone {
+		t.Fatalf("detectSuggestToken(\"/plan now\") kind = %v, want suggestNone once a space follows the command name", kind)
+	}
+	if kind, _, _ := detectSuggestToken("please /plan"); kind != suggestNone {
+		t.Fatalf("detectSuggestToken(\"please /plan\") kind = %v, want suggestNone — dispatch() only treats a LEADING slash specially", kind)
+	}
+}
+
+func TestDetectSuggestToken_AtAnywhereInLine(t *testing.T) {
+	kind, start, token := detectSuggestToken("claude: look at @scree")
+	if kind != suggestFile || token != "@scree" {
+		t.Fatalf("detectSuggestToken(...) = (%v,%d,%q), want (suggestFile,_,\"@scree\")", kind, start, token)
+	}
+	if want := len("claude: look at "); start != want {
+		t.Fatalf("tokenStart = %d, want %d", start, want)
+	}
+}
+
+func TestDetectSuggestToken_NoneForPlainText(t *testing.T) {
+	if kind, _, _ := detectSuggestToken("just talking about email@example.com"); kind != suggestNone {
+		t.Fatalf("kind = %v, want suggestNone — no bare @ token at all here", kind)
+	}
+	if kind, _, _ := detectSuggestToken(""); kind != suggestNone {
+		t.Fatalf("kind for empty input = %v, want suggestNone", kind)
+	}
+}
+
+func TestMatchingCommandSuggestions_FiltersByPrefixAndAnnotatesOwners(t *testing.T) {
+	commands := map[string][]acp.AvailableCommand{
+		"claude":   {{Name: "plan", Description: "make a plan"}, {Name: "compact", Description: "summarize"}},
+		"opencode": {{Name: "plan", Description: "make a plan"}},
+	}
+	items := matchingCommandSuggestions(commands, "pl")
+	if len(items) != 1 {
+		t.Fatalf("matchingCommandSuggestions(_, \"pl\") = %+v, want exactly 1 match (\"plan\")", items)
+	}
+	if items[0].insert != "/plan " {
+		t.Fatalf("items[0].insert = %q, want \"/plan \" (trailing space)", items[0].insert)
+	}
+	if !strings.Contains(items[0].desc, "claude") || !strings.Contains(items[0].desc, "opencode") {
+		t.Fatalf("items[0].desc = %q, want both owning agents mentioned", items[0].desc)
+	}
+}
+
+func TestMatchingCommandSuggestions_NoMatch(t *testing.T) {
+	commands := map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+	if items := matchingCommandSuggestions(commands, "zzz"); len(items) != 0 {
+		t.Fatalf("matchingCommandSuggestions(_, \"zzz\") = %+v, want none", items)
+	}
+}
+
+func TestMatchingFileSuggestions_ListsCwdEntriesByPrefix(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "screenshot.png"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "screens"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "other.go"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	items := matchingFileSuggestions(dir, "scre")
+	if len(items) != 2 {
+		t.Fatalf("matchingFileSuggestions(dir, \"scre\") = %+v, want 2 matches (screenshot.png, screens/)", items)
+	}
+	var sawDir, sawFile bool
+	for _, it := range items {
+		if it.insert == "@screens/" {
+			sawDir = true
+		}
+		if it.insert == "@screenshot.png " {
+			sawFile = true
+		}
+	}
+	if !sawDir || !sawFile {
+		t.Fatalf("items = %+v, want a directory entry (no trailing space, trailing /) and a file entry (trailing space)", items)
+	}
+}
+
+func TestMatchingFileSuggestions_NestedDirToken(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "internal"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "internal", "tui.go"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	items := matchingFileSuggestions(dir, "internal/tu")
+	if len(items) != 1 || items[0].insert != "@internal/tui.go " {
+		t.Fatalf("matchingFileSuggestions(dir, \"internal/tu\") = %+v, want [\"@internal/tui.go \"]", items)
+	}
+}
+
+func TestMatchingFileSuggestions_UnreadableDirReturnsNil(t *testing.T) {
+	if items := matchingFileSuggestions(t.TempDir(), "no-such-subdir/anything"); items != nil {
+		t.Fatalf("matchingFileSuggestions with an unreadable dir = %+v, want nil", items)
+	}
+}
+
 func TestBuildPromptBlocks_WithAttachment(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shot.png")

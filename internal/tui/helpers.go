@@ -62,11 +62,10 @@ func (w *AgentWorker) Idle() bool {
 }
 
 // Cancel requests the agent stop its current in-flight prompt, if any —
-// backs Esc's interrupt-one-turn behavior (Model.interruptBusyAgents),
-// chorus's answer to the single biggest gap found against Claude Code
-// CLI's own Esc-to-interrupt: previously the only way to stop a running
-// turn was Ctrl+C, which kills every connected agent's subprocess at
-// once. Sends ACP's session/cancel notification and returns immediately —
+// backs Esc's interrupt-one-turn behavior (Model.interruptBusyAgents):
+// previously the only way to stop a running turn was Ctrl+C, which kills
+// every connected agent's subprocess at once. Sends ACP's session/cancel
+// notification and returns immediately —
 // it does not itself wait for the in-flight PromptContent call to return;
 // StartWorker's goroutine still owns that, and reports the (typically
 // early-terminated, not erroring) result via doneCh/errCh exactly as for
@@ -288,6 +287,145 @@ func specByName(specs []session.Spec, agent string) session.Spec {
 		}
 	}
 	return session.Spec{}
+}
+
+// suggestKind distinguishes chorus's two live, type-to-filter input popups
+// — the "/" command menu and the "@" file menu — from suggestNone
+// (nothing currently matches). See Model.suggestKind's doc comment for
+// the render/relayout invariant this backs.
+type suggestKind int
+
+const (
+	suggestNone suggestKind = iota
+	suggestCommand
+	suggestFile
+)
+
+// suggestItem is one row in a live suggestion popup. insert is the FULL
+// replacement for the active token (including its leading "/" or "@", and
+// a trailing space/slash where appropriate — see matchingFileSuggestions);
+// label/desc are display-only.
+type suggestItem struct {
+	insert string
+	label  string
+	desc   string
+}
+
+// maxSuggestResults caps both popup kinds — a long, unfiltered list (every
+// file in cwd for a bare "@", say) is neither useful nor cheap to keep
+// re-rendering every keystroke.
+const maxSuggestResults = 20
+
+// matchingCommandSuggestions returns every agent-advertised slash command
+// whose name has namePrefix as a case-insensitive prefix, deduped by name
+// across agents (an ambiguous command still shows once here — chorus's
+// existing routeAsk menu is what actually resolves ambiguity at dispatch
+// time, this is just discovery) and annotated with which agent(s) declared
+// it when that's not all of them. Sorted by name for a stable, predictable
+// order as the filter narrows.
+func matchingCommandSuggestions(commands map[string][]acp.AvailableCommand, namePrefix string) []suggestItem {
+	type entry struct {
+		desc   string
+		owners []string
+	}
+	byName := map[string]*entry{}
+	lowerPrefix := strings.ToLower(namePrefix)
+	for agent, cmds := range commands {
+		for _, c := range cmds {
+			if !strings.HasPrefix(strings.ToLower(c.Name), lowerPrefix) {
+				continue
+			}
+			e, ok := byName[c.Name]
+			if !ok {
+				e = &entry{desc: c.Description}
+				byName[c.Name] = e
+			}
+			e.owners = append(e.owners, agent)
+		}
+	}
+	names := make([]string, 0, len(byName))
+	for name := range byName {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	if len(names) > maxSuggestResults {
+		names = names[:maxSuggestResults]
+	}
+	items := make([]suggestItem, 0, len(names))
+	for _, name := range names {
+		e := byName[name]
+		sort.Strings(e.owners)
+		desc := render.StripANSI(e.desc)
+		if len(e.owners) > 0 {
+			owners := "(" + strings.Join(e.owners, ", ") + ")"
+			if desc == "" {
+				desc = owners
+			} else {
+				desc = desc + "  " + owners
+			}
+		}
+		items = append(items, suggestItem{insert: "/" + name + " ", label: "/" + name, desc: desc})
+	}
+	return items
+}
+
+// matchingFileSuggestions lists directory entries matching token (the text
+// typed after "@", e.g. "" for a bare "@", "internal/tu" for a partial
+// path) — a directory-scoped, non-recursive completion (like a shell's own
+// Tab-completion), deliberately simpler than a whole-repo fuzzy search:
+// cheap enough to recompute on every keystroke with no caching, and still
+// closes the real gap (discovering a file without having to already know
+// its exact path) without a background-indexing mechanism this codebase
+// has no other need for. A directory match's
+// insert has no trailing space (so selecting "internal/" naturally keeps
+// the popup open one level deeper); a file match's insert does (signaling
+// "done referencing this one").
+func matchingFileSuggestions(cwd, token string) []suggestItem {
+	dirToken, prefix := "", token
+	if idx := strings.LastIndexByte(token, '/'); idx >= 0 {
+		dirToken, prefix = token[:idx], token[idx+1:]
+	}
+	resolveDir := dirToken
+	if resolveDir == "" {
+		resolveDir = "."
+	}
+	osDir := filepath.FromSlash(resolveDir)
+	full := osDir
+	if !filepath.IsAbs(osDir) && cwd != "" {
+		full = filepath.Join(cwd, osDir)
+	}
+	entries, err := os.ReadDir(full)
+	if err != nil {
+		return nil
+	}
+	type match struct {
+		name  string
+		isDir bool
+	}
+	lowerPrefix := strings.ToLower(prefix)
+	var matches []match
+	for _, e := range entries {
+		if strings.HasPrefix(strings.ToLower(e.Name()), lowerPrefix) {
+			matches = append(matches, match{e.Name(), e.IsDir()})
+		}
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].name < matches[j].name })
+	if len(matches) > maxSuggestResults {
+		matches = matches[:maxSuggestResults]
+	}
+	items := make([]suggestItem, 0, len(matches))
+	for _, mt := range matches {
+		rel := mt.name
+		if dirToken != "" {
+			rel = dirToken + "/" + mt.name
+		}
+		if mt.isDir {
+			items = append(items, suggestItem{insert: "@" + rel + "/", label: "@" + rel + "/"})
+		} else {
+			items = append(items, suggestItem{insert: "@" + rel + " ", label: "@" + rel})
+		}
+	}
+	return items
 }
 
 // pendingRoute is a prompt awaiting a user choice of agent — either §9's
@@ -714,13 +852,16 @@ func queuePrompt(agent, text string, workers map[string]*AgentWorker) string {
 // buildPromptBlocks turns raw input text into the content-block sequence
 // actually sent to the agent: any @path.png-style attachments (see
 // extractAttachments) become leading acp.ImageBlocks, followed by a
-// single TextBlock with the attachment tokens stripped out. If nothing
-// but attachment tokens remain (or extraction found nothing at all), the
+// single TextBlock with the attachment tokens stripped out; any remaining
+// @path token for a non-image file (see extractFileAttachments) gets its
+// content spliced inline into that text block instead. If nothing but
+// attachment tokens remain (or extraction found nothing at all), the
 // original text is sent verbatim rather than an empty prompt.
 func buildPromptBlocks(text string) []acp.ContentBlock {
 	clean, images := extractAttachments(text)
+	clean = extractFileAttachments(clean)
 	if len(images) == 0 {
-		return []acp.ContentBlock{acp.TextBlock(text)}
+		return []acp.ContentBlock{acp.TextBlock(clean)}
 	}
 	blocks := make([]acp.ContentBlock, 0, len(images)+1)
 	blocks = append(blocks, images...)
@@ -761,6 +902,56 @@ func readImageBase64(path string) (data, mime string, err error) {
 		return "", "", err
 	}
 	return base64.StdEncoding.EncodeToString(b), mimeForImageExt(filepath.Ext(path)), nil
+}
+
+// genericAttachmentRE matches ANY @-prefixed token, not just image
+// extensions — used by extractFileAttachments below. Deliberately broader
+// than attachmentRE (which only matches recognized image extensions,
+// specifically so a near-miss still gets an explicit warning): a generic
+// non-image @-mention that doesn't resolve to a real file is silently left
+// as plain text instead, since this pattern also matches things that were
+// never meant to be a file reference at all (an email address, an "@agent"
+// mention) and warning about every one of those would be constant noise.
+var genericAttachmentRE = regexp.MustCompile(`@(\S+)`)
+
+// maxAttachedFileBytes bounds how much of a non-image @-file gets spliced
+// inline into the prompt text — same order of magnitude as
+// internal/render's toolCallContentPreviewLimit, guarding against the same
+// failure mode (an agent's own tool-output cap exists because a whole large
+// file dumped into the scrollback with no limit is unusable either way).
+const maxAttachedFileBytes = 200 * 1024
+
+// extractFileAttachments splices the content of any @path token that
+// resolves to a real, readable, non-image file directly into the prompt
+// text as a fenced block — "@" works for any file type this way, not just
+// images, which extractAttachments deliberately doesn't attempt (its
+// regex is image-extension-only, see attachmentRE's doc comment).
+// Runs as a second pass over extractAttachments' already-cleaned text
+// (buildPromptBlocks), so an image token is never double-processed here.
+// A token that doesn't resolve to a real, size-bounded file is left
+// completely untouched — no warning, unlike extractAttachments — since an
+// email address or an "@agent" mention should never produce spurious
+// stderr noise just because it happens to match "@\S+".
+func extractFileAttachments(text string) string {
+	return genericAttachmentRE.ReplaceAllStringFunc(text, func(tok string) string {
+		rel := tok[1:]
+		if isImageExt(filepath.Ext(rel)) {
+			return tok // extractAttachments already handled (or intentionally left) this one
+		}
+		info, err := os.Stat(rel)
+		if err != nil || info.IsDir() || info.Size() > maxAttachedFileBytes {
+			return tok
+		}
+		data, err := os.ReadFile(rel)
+		if err != nil {
+			return tok
+		}
+		return fmt.Sprintf("%s\n```\n%s\n```", tok, string(data))
+	})
+}
+
+func isImageExt(ext string) bool {
+	return mimeForImageExt(ext) != "application/octet-stream"
 }
 
 func mimeForImageExt(ext string) string {

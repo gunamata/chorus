@@ -170,9 +170,9 @@ agent(s) started successfully.
 
 chorus runs as a real terminal UI (via
 [bubbletea](https://github.com/charmbracelet/bubbletea)): a scrolling
-output pane above a fixed input box at the bottom, alt-screen just like
-Claude Code / Gemini CLI / opencode / Codex — not a plain scroll-by
-REPL. The interaction itself is unchanged, just the display:
+output pane above a fixed input box at the bottom, on the terminal's
+alt-screen — not a plain scroll-by REPL. The interaction itself is
+unchanged, just the display:
 
 ```
 [claude] fix the login bug in auth.py
@@ -188,7 +188,7 @@ PERMISSION: claude wants to: Edit auth.py
 ❯ _
 ```
 
-That first line — `[claude] fix the login bug in auth.py` — is chorus echoing your own submitted prompt back into the scrollback, tagged by which agent it went to, on a solid highlighted background (matching Claude Code's own convention for setting your input apart from the reply — not visible in this plain-text example, but real in the actual TUI). ACP has no way to do this for you on a live turn (ask returns the reply, not an echo of what was asked), so chorus does it explicitly — without it, a long session would give you replies with no record of which question each one answers.
+That first line — `[claude] fix the login bug in auth.py` — is chorus echoing your own submitted prompt back into the scrollback, tagged by which agent it went to, on a solid highlighted background (not visible in this plain-text example, but real in the actual TUI). ACP has no way to do this for you on a live turn (ask returns the reply, not an echo of what was asked), so chorus does it explicitly — without it, a long session would give you replies with no record of which question each one answers.
 
 - Type a prompt with no prefix and chorus **routes** it (see
   [Routing](#routing-agentsyaml) below — off by default, straight to
@@ -209,9 +209,8 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   proceed, so it isn't allowed to scroll out of sight).
 - **Click-drag to select and copy text.** Mouse wheel support means
   chorus, not your terminal, owns plain click-drag — so instead of
-  leaving that dead, chorus implements copy-on-select itself, the same
-  approach Claude Code CLI's own fullscreen UI takes: dragging over one
-  or more lines highlights them live as you drag (whole lines, not
+  leaving that dead, chorus implements copy-on-select itself: dragging
+  over one or more lines highlights them live as you drag (whole lines, not
   partial — a deliberate line-level tradeoff) and releasing copies them
   straight to your system clipboard, with a brief "N lines copied"
   confirmation (the highlight stays visible until your next keypress).
@@ -225,14 +224,38 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   may still reach past chorus's mouse capture too, depending on the
   terminal.
 - **The input box is multi-line** and wraps long text instead of
-  scrolling sideways forever. Press **ctrl+j** for a new line within the
-  same prompt (Enter always submits). `Home`/`End` (and, for the same
-  job, `ctrl+a`/`ctrl+e` — macOS Terminal/iTerm's own readline-style
-  bindings) jump to the start/end of the current line. `↑`/`↓` move the
-  cursor between lines like any multi-line editor — and once the cursor
-  is already on the topmost or bottommost line, they instead walk
-  through **prompt history** (everything you've submitted this session,
-  most recent first), the same way a shell's `↑` does.
+  scrolling sideways forever. Press **ctrl+j**, or end the line with a
+  trailing **`\`** before Enter, for a new line within the same prompt
+  (Enter always submits otherwise) — two terminal-agnostic ways in, since
+  Shift+Enter isn't reliably decoded as a distinct key on every terminal.
+  `Home`/`End` (and, for the same job, `ctrl+a`/`ctrl+e` — macOS Terminal/
+  iTerm's own readline-style bindings) jump to the start/end of the
+  current line. `↑`/`↓` move the cursor between lines like any multi-line
+  editor — and once the cursor is already on the topmost or bottommost
+  line, they instead walk through **prompt history** (everything you've
+  submitted this session, most recent first), the same way a shell's `↑`
+  does.
+- **Pasting a large block of text** (over ~800 characters, or more than 3
+  lines) collapses to a short
+  `[Pasted text #N +NN lines]` placeholder in the input box instead of
+  ballooning it to dozens of wrapped lines. The full text is still sent
+  exactly as pasted once you submit — only the input box and scrollback
+  echo show the short form.
+- **Typing `/` at the very start of the input** opens a live, filterable
+  popup of every agent-advertised slash command matching what you've
+  typed so far, with descriptions — narrows as you keep typing,
+  navigate with **↑/↓**, accept with **Tab or Enter**. Typing **`@`**
+  anywhere opens the same kind of popup for files in the current
+  directory (directory-scoped, not a whole-repo fuzzy search — selecting
+  a directory keeps the popup open one level deeper, matching shell
+  Tab-completion). **Esc** dismisses either popup without interrupting a
+  running turn.
+- **`ctrl+v` attaches an image straight from your OS clipboard** — copy a
+  screenshot, then paste it directly into chorus, no need to save it to
+  a file first (see
+  [Images](#images)). If the clipboard doesn't currently hold an image,
+  `ctrl+v` is a silent no-op (your terminal's own text-paste handling,
+  via bracketed paste, is unaffected either way).
 - Once a prompt finishes, chorus prints `[agent] finished in <duration>`
   (`45s`, `2m14s`, `1h05m`) — and while one or more agents are still
   working, a spinner + elapsed-time line for each of them stays visible
@@ -251,14 +274,21 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
   long request doesn't force you to kill the whole program the way
   `ctrl+c` does. The busy-status line above the input box shows
   "(esc to interrupt)" whenever it's actually actionable.
-- `quit` / `exit` / `ctrl+c` cleanly end every session, kill the
-  subprocesses, and restore your terminal (leaves the alt-screen,
-  cursor visible). Unlike `Esc`, this ends every agent's session at once
-  — reach for `Esc` first if you only want to stop one running turn.
+- `quit` / `exit` cleanly end every session, kill the subprocesses, and
+  restore your terminal (leaves the alt-screen, cursor visible). `ctrl+c`
+  does too, but only once the input box is already empty — the first
+  `ctrl+c` with a non-empty draft just clears it instead of quitting
+  outright, so an instinctive "clear what I typed" keystroke can't
+  accidentally kill every connected agent's session at once. Unlike
+  `Esc`, quitting ends every agent's session at once — reach for `Esc`
+  first if you only want to stop one running turn.
+- **A turn finishing while the terminal is unfocused rings the terminal
+  bell** (`\a`). Silent while focused; nothing to configure (a
+  terminal that doesn't report focus at all just never triggers it,
+  rather than risking a bell on every single turn).
 - Full reasoning/thinking text is **hidden by default** — while an agent
   is thinking you see a brief `[agent] ⠋ Pondering…`-style indicator (a
-  random word from a small set, spinner-animated, the same idea as
-  Claude Code/Gemini CLI/Codex's own rotating-word indicators) instead
+  random word from a small set, spinner-animated) instead
   of a wall of chain-of-thought. Type `thoughts` to toggle full
   `(thinking)`-prefixed reasoning text on or off.
 - `commands` lists every agent's currently known slash commands (see
@@ -330,6 +360,11 @@ agent has it, it goes straight there; if more than one does, chorus
 asks which you meant, the same way it does for ambiguous routing.
 `<agent>: /name ...` still works too, and always wins.
 
+You don't have to already know a command's exact name either: typing
+just `/` opens a live popup listing every matching command (narrowing as
+you keep typing) with its description and, when more than one agent
+declares it, which agents — `↑`/`↓` to move, `Tab` or `Enter` to accept.
+
 One timing nuance: an agent's commands are only known once it's
 reported them at least once — this has been observed to sometimes
 happen only after that agent's first prompt, not automatically at
@@ -351,6 +386,29 @@ alongside your text — not a text description of the path. Supported
 extensions: `.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`. A token that
 doesn't resolve to a readable file is left in the prompt text
 untouched (with a warning printed) rather than silently dropped.
+Typing `@` opens a live popup listing matching files/directories in the
+current directory as you type (directory-scoped, not a full-repo fuzzy
+search — selecting a directory keeps the popup open one level deeper,
+the same way shell Tab-completion works), so you don't need to already
+know the exact path.
+
+`@` also works for non-image files: a token that resolves to a real,
+reasonably-sized (under 200KB) file that ISN'T an image gets its content
+spliced directly into the prompt text as a fenced block, rather than
+being sent as image content. An `@`-token that doesn't resolve to
+anything real (an email address, a stray `@mention`) is silently left as
+plain text — no warning, since that's the common, expected case for a
+generic pattern this broad.
+
+**Pasting an image straight from your OS clipboard** works too — press
+`ctrl+v` after copying a screenshot (or any image) and chorus saves it
+under this project's `images/` directory, then attaches it exactly like
+a real `@path` reference. No need to save the screenshot to a file
+yourself first. Confirmed working on Windows; the macOS (`pbpaste`) and
+Linux (`wl-paste`/`xclip`) code paths are implemented but not yet
+verified live, since this codebase is currently developed from a Windows
+environment — if the clipboard simply doesn't have an image, `ctrl+v` is
+a silent no-op either way.
 
 If an agent sends an image back, it's saved under this project's
 `images/` directory (see [Session persistence](#session-persistence) for
@@ -661,7 +719,7 @@ Long sessions accumulate context — left alone, some agents only compact
 very late (and expensively). `compaction.enabled: true` makes chorus
 proactively trigger a compaction-style command once an agent's reported
 context usage crosses `threshold_percent` (default 60, based on research
-into Claude Code's own usage patterns — compacting around 60% produces
+into real-world agent usage patterns — compacting around 60% produces
 much better, cheaper summaries than letting an agent wait until it's
 nearly full). Never hardcoded as `/compact`: chorus only sends a command
 an agent has actually advertised, matched against `compaction.aliases` by
@@ -1083,13 +1141,13 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   request was sent), and that a click-drag selection lines up with what
   you'd visually expect to have highlighted, including across a
   scrolled/streaming viewport.
-- **No checkpointing/rewind** (Claude Code CLI's `/rewind`, double-Esc,
-  restore code/conversation/both) — deliberately out of scope for this
-  pass, not an oversight. It's a materially larger feature (durable
-  per-turn snapshots, a restore UI, deciding what "restore" even means
-  across N independently-running agent sessions rather than one) than
-  the other gaps closed alongside it; worth a dedicated design pass of
-  its own if it turns out to matter to real usage.
+- **No checkpointing/rewind** (restore code/conversation/both to an
+  earlier turn) — deliberately out of scope for this pass, not an
+  oversight. It's a materially larger feature (durable per-turn
+  snapshots, a restore UI, deciding what "restore" even means across N
+  independently-running agent sessions rather than one) than the other
+  gaps closed alongside it; worth a dedicated design pass of its own if
+  it turns out to matter to real usage.
 - **Sandboxing (2026-08-26/27): confirmed working end-to-end for
   Claude, Gemini, and opencode's free-tier backend, on a real machine,
   with real ACP handshakes — not just the underlying mechanism.** A live

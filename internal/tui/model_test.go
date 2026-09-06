@@ -2,7 +2,10 @@ package tui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -2051,5 +2054,390 @@ func TestModel_AutoCommand_TogglesOffOnSecondInvocation(t *testing.T) {
 	_, cmd := enterWithInput(m, "auto claude")
 	if cmd == nil {
 		t.Fatal("enterWithInput(\"auto claude\") with an existing autoPrevMode entry returned a nil cmd, want the toggle-back runSetMode command")
+	}
+}
+
+// --- Ctrl+C clear-then-quit --------------------------------------------
+
+func TestModel_CtrlC_ClearsNonEmptyInputInsteadOfQuitting(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.input.SetValue("fix the login bug")
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+
+	if m.quitting {
+		t.Fatal("Ctrl+C with non-empty input set quitting=true, want it to just clear the draft")
+	}
+	if cmd != nil {
+		t.Fatal("Ctrl+C with non-empty input returned a non-nil cmd, want nil (no tea.Quit)")
+	}
+	if m.input.Value() != "" {
+		t.Fatalf("input.Value() = %q after Ctrl+C, want cleared", m.input.Value())
+	}
+}
+
+func TestModel_CtrlC_QuitsWhenInputAlreadyEmpty(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	m = updated.(Model)
+
+	if !m.quitting {
+		t.Fatal("Ctrl+C with empty input did not set quitting=true")
+	}
+	if cmd == nil {
+		t.Fatal("Ctrl+C with empty input returned a nil cmd, want tea.Quit")
+	}
+}
+
+// --- backslash-Enter newline continuation -------------------------------
+
+func TestModel_BackslashEnter_InsertsNewlineInsteadOfSubmitting(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.input.SetValue(`claude: first line\`)
+
+	updated, cmd := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if cmd != nil {
+		t.Fatal("backslash+Enter returned a non-nil cmd, want nil (must not submit/dispatch)")
+	}
+	want := "claude: first line\n"
+	if got := m.input.Value(); got != want {
+		t.Fatalf("input.Value() = %q after backslash+Enter, want %q", got, want)
+	}
+}
+
+// --- turn-completion bell (bellSuffix) -----------------------------------
+
+func TestModel_BellSuffix_SilentWhileFocused(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	if got := m.bellSuffix(); got != "" {
+		t.Fatalf("bellSuffix() = %q while focused, want \"\"", got)
+	}
+}
+
+func TestModel_BellSuffix_RingsAfterBlur(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	updated, _ := m.Update(tea.BlurMsg{})
+	m = updated.(Model)
+	if got := m.bellSuffix(); got != "\a" {
+		t.Fatalf("bellSuffix() = %q after BlurMsg, want \"\\a\"", got)
+	}
+
+	updated, _ = m.Update(tea.FocusMsg{})
+	m = updated.(Model)
+	if got := m.bellSuffix(); got != "" {
+		t.Fatalf("bellSuffix() = %q after a following FocusMsg, want \"\" (refocused)", got)
+	}
+}
+
+func TestModel_PromptDoneMsg_AppendsBellWhenUnfocused(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	updated, _ := m.Update(tea.BlurMsg{})
+	m = updated.(Model)
+
+	updated, _ = m.Update(promptDoneMsg{e: PromptDoneMsg{Agent: "claude", Duration: 2 * time.Second}})
+	m = updated.(Model)
+
+	if out := m.viewport.View(); !strings.Contains(out, "\a") {
+		t.Fatalf("viewport.View() after a completed turn while unfocused doesn't contain a bell char: %q", out)
+	}
+}
+
+// --- large-paste collapse (storePasteIfLarge / expandPastes) ------------
+
+func TestModel_StorePasteIfLarge_SmallPasteNotCollapsed(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	if _, ok := m.storePasteIfLarge("just a short paste"); ok {
+		t.Fatal("storePasteIfLarge collapsed a short, few-line paste, want it left alone")
+	}
+}
+
+func TestModel_StorePasteIfLarge_CollapsesOverCharThreshold(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	big := strings.Repeat("x", pasteCollapseCharThreshold+1)
+	chip, ok := m.storePasteIfLarge(big)
+	if !ok {
+		t.Fatal("storePasteIfLarge did not collapse a paste over the char threshold")
+	}
+	if !strings.Contains(chip, "Pasted text #1") {
+		t.Fatalf("chip = %q, want it to mention \"Pasted text #1\"", chip)
+	}
+	if got := m.pastes[chip]; got != big {
+		t.Fatalf("m.pastes[chip] = %q (len %d), want the original paste back verbatim", got, len(got))
+	}
+}
+
+func TestModel_StorePasteIfLarge_CollapsesOverLineThreshold(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	big := "one\ntwo\nthree\nfour\nfive"
+	if _, ok := m.storePasteIfLarge(big); !ok {
+		t.Fatal("storePasteIfLarge did not collapse a paste over the line threshold despite being short")
+	}
+}
+
+func TestModel_ExpandPastes_RoundTrips(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	big := strings.Repeat("y", pasteCollapseCharThreshold+50)
+	chip, ok := m.storePasteIfLarge(big)
+	if !ok {
+		t.Fatal("setup: expected paste to collapse")
+	}
+	line := "claude: what's wrong here? " + chip
+	got := m.expandPastes(line)
+	want := "claude: what's wrong here? " + big
+	if got != want {
+		t.Fatalf("expandPastes round-trip mismatch (got len %d, want len %d)", len(got), len(want))
+	}
+}
+
+func TestModel_ExpandPastes_NoOpWithoutChips(t *testing.T) {
+	m := newTestModel(t, nil, policy.Routing{})
+	if got := m.expandPastes("plain text, nothing to expand"); got != "plain text, nothing to expand" {
+		t.Fatalf("expandPastes changed plain text with no chips: %q", got)
+	}
+}
+
+func TestModel_HandleKey_LargePasteInsertsChipNotRawText(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	big := strings.Repeat("z", pasteCollapseCharThreshold+1)
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(big), Paste: true})
+	m = updated.(Model)
+
+	val := m.input.Value()
+	if strings.Contains(val, big) {
+		t.Fatal("input box contains the raw large paste, want it collapsed to a chip")
+	}
+	if !strings.Contains(val, "Pasted text #1") {
+		t.Fatalf("input.Value() = %q, want it to contain the collapse chip", val)
+	}
+}
+
+func TestModel_HandleKey_SmallPastePassesThroughUnchanged(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("hello"), Paste: true})
+	m = updated.(Model)
+
+	if got := m.input.Value(); got != "hello" {
+		t.Fatalf("input.Value() = %q after a small paste, want \"hello\" inserted verbatim", got)
+	}
+}
+
+func TestModel_DispatchUserTurn_ExpandsPasteChipBeforeSending(t *testing.T) {
+	w := newWorker()
+	m := newTestModel(t, map[string]*AgentWorker{"claude": w}, policy.Routing{})
+	big := strings.Repeat("q", pasteCollapseCharThreshold+1)
+	chip, ok := m.storePasteIfLarge(big)
+	if !ok {
+		t.Fatal("setup: expected paste to collapse")
+	}
+
+	m.dispatchUserTurn("claude", chip, true, true)
+
+	select {
+	case blocks := <-w.in:
+		if len(blocks) != 1 || blocks[0].Text == nil || !strings.Contains(blocks[0].Text.Text, big) {
+			t.Fatalf("queued content blocks = %+v, want the full expanded paste text", blocks)
+		}
+	default:
+		t.Fatal("dispatchUserTurn did not queue anything to the worker")
+	}
+
+	if out := m.viewport.View(); strings.Contains(out, big) {
+		t.Fatal("scrollback echo contains the full expanded paste, want it to keep showing the short chip")
+	}
+}
+
+// --- live "/"-command and "@"-file suggestion popup (Model wiring) ------
+
+func TestModel_TypingSlash_OpensCommandPopup(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan", Description: "make a plan"}}}
+	m.input.SetValue("/pl")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("a")})
+	m = updated.(Model)
+
+	if m.suggestKind != suggestCommand {
+		t.Fatalf("suggestKind = %v after typing into a leading \"/\", want suggestCommand", m.suggestKind)
+	}
+	if len(m.suggestItems) != 1 || m.suggestItems[0].label != "/plan" {
+		t.Fatalf("suggestItems = %+v, want [\"/plan\"]", m.suggestItems)
+	}
+	if !strings.Contains(m.renderSuggestOverlay(), "/plan") {
+		t.Fatalf("renderSuggestOverlay() = %q, want it to mention /plan", m.renderSuggestOverlay())
+	}
+}
+
+func TestModel_TabAcceptsHighlightedSuggestion(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+	m.input.SetValue("/plan")
+	m.refreshSuggest()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyTab})
+	m = updated.(Model)
+
+	if got := m.input.Value(); got != "/plan " {
+		t.Fatalf("input.Value() = %q after Tab-accepting the only match, want \"/plan \"", got)
+	}
+	if m.suggestKind != suggestNone {
+		t.Fatal("suggestKind still active after accepting — want the popup to close since the token no longer matches")
+	}
+}
+
+func TestModel_EnterAcceptsSuggestionInsteadOfSubmitting(t *testing.T) {
+	w := newWorker()
+	m := newTestModel(t, map[string]*AgentWorker{"claude": w}, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+	m.input.SetValue("/plan")
+	m.refreshSuggest()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if got := m.input.Value(); got != "/plan " {
+		t.Fatalf("input.Value() = %q after Enter with a popup open, want it to accept (\"/plan \"), not submit", got)
+	}
+	select {
+	case blocks := <-w.in:
+		t.Fatalf("Enter with a suggestion popup open dispatched a prompt (%+v), want it to only accept the suggestion", blocks)
+	default:
+	}
+}
+
+func TestModel_ArrowKeysMoveSuggestCursor(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}, {Name: "playtest"}}}
+	m.input.SetValue("/pla")
+	m.refreshSuggest()
+	if len(m.suggestItems) != 2 {
+		t.Fatalf("setup: want 2 matches for \"/pla\", got %d", len(m.suggestItems))
+	}
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.suggestCursor != 1 {
+		t.Fatalf("suggestCursor = %d after one Down, want 1", m.suggestCursor)
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.suggestCursor != 0 {
+		t.Fatalf("suggestCursor = %d after wrapping past the last item, want 0", m.suggestCursor)
+	}
+}
+
+func TestModel_EscDismissesPopupInsteadOfInterrupting(t *testing.T) {
+	w := newWorker()
+	m := newTestModel(t, map[string]*AgentWorker{"claude": w}, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+	m.input.SetValue("/pla")
+	m.refreshSuggest()
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	m = updated.(Model)
+
+	if m.suggestKind != suggestNone {
+		t.Fatal("suggestKind still active after Esc, want the popup dismissed")
+	}
+	// Typing further without changing the token (still "/pla") must keep
+	// it dismissed until the token actually changes.
+	m.refreshSuggest()
+	if m.suggestKind != suggestNone {
+		t.Fatal("popup reappeared on the same, still-suppressed token")
+	}
+
+	updated, _ = m.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	m = updated.(Model)
+	if m.suggestKind == suggestNone {
+		t.Fatal("popup stayed dismissed after the token actually changed (\"/plan\"), want it to un-suppress")
+	}
+}
+
+func TestModel_Relayout_ShrinksViewportWhilePopupOpen(t *testing.T) {
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.commands = map[string][]acp.AvailableCommand{"claude": {{Name: "plan"}}}
+	before := m.viewport.Height
+
+	m.input.SetValue("/pla")
+	m.refreshSuggest()
+	m.relayout()
+
+	if m.viewport.Height >= before {
+		t.Fatalf("viewport.Height = %d after opening a popup, want less than %d (the popup's lines subtracted)", m.viewport.Height, before)
+	}
+	wantOverlayLines := m.suggestOverlayLineCount()
+	if before-m.viewport.Height != wantOverlayLines {
+		t.Fatalf("viewport shrank by %d, want exactly suggestOverlayLineCount() = %d", before-m.viewport.Height, wantOverlayLines)
+	}
+}
+
+// --- Ctrl+V clipboard image paste ---------------------------------------
+
+// stubClipboardImage replaces readClipboardImage for the duration of a
+// test — same pattern as stubClipboard (writeClipboard), so these tests
+// never touch the real OS clipboard.
+func stubClipboardImage(t *testing.T, data []byte, mime string, err error) {
+	t.Helper()
+	orig := readClipboardImage
+	readClipboardImage = func() ([]byte, string, error) { return data, mime, err }
+	t.Cleanup(func() { readClipboardImage = orig })
+}
+
+func TestModel_CtrlV_NoClipboardImageIsSilentNoOp(t *testing.T) {
+	stubClipboardImage(t, nil, "", ErrNoClipboardImage)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.input.SetValue("hello")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	m = updated.(Model)
+
+	if got := m.input.Value(); got != "hello" {
+		t.Fatalf("input.Value() = %q after Ctrl+V with no clipboard image, want it untouched", got)
+	}
+	if out := m.viewport.View(); strings.Contains(out, "failed") {
+		t.Fatalf("viewport shows an error for the no-image case: %q", out)
+	}
+}
+
+func TestModel_CtrlV_RealErrorAppendsLine(t *testing.T) {
+	stubClipboardImage(t, nil, "", errors.New("boom"))
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	m = updated.(Model)
+
+	if out := m.viewport.View(); !strings.Contains(out, "boom") {
+		t.Fatalf("viewport.View() = %q, want the real clipboard-read error surfaced", out)
+	}
+}
+
+func TestModel_CtrlV_SuccessSavesFileAndInsertsAtMention(t *testing.T) {
+	fakePNG := []byte("fake-png-bytes")
+	stubClipboardImage(t, fakePNG, "image/png", nil)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	m.imageDir = t.TempDir()
+	m.input.SetValue("claude: what is this? ")
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyCtrlV})
+	m = updated.(Model)
+
+	val := m.input.Value()
+	if !strings.Contains(val, "@"+m.imageDir) || !strings.HasSuffix(strings.TrimSpace(val), ".png") {
+		t.Fatalf("input.Value() = %q, want an @-mention pointing at a .png file under %q", val, m.imageDir)
+	}
+	entries, err := os.ReadDir(m.imageDir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("os.ReadDir(imageDir) = %v, %v, want exactly one saved file", entries, err)
+	}
+	data, err := os.ReadFile(filepath.Join(m.imageDir, entries[0].Name()))
+	if err != nil || string(data) != string(fakePNG) {
+		t.Fatalf("saved file content = %q, %v, want the clipboard bytes verbatim", data, err)
 	}
 }

@@ -205,11 +205,12 @@ func (c Compaction) EnabledOrDefault() bool {
 	return c.Enabled != nil && *c.Enabled
 }
 
-// defaultCompactionThreshold: research into real-world Claude Code usage
-// (chorus-spec.md §0) found compacting deliberately around 60% usage
-// produces much better, cheaper summaries than waiting for an agent's own
-// late auto-compaction (which can trigger multiple times per long session
-// at 100K+ tokens each) — used as the default when unset or invalid.
+// defaultCompactionThreshold: research into real-world agent usage
+// patterns (chorus-spec.md §0) found compacting deliberately around 60%
+// usage produces much better, cheaper summaries than waiting for an
+// agent's own late auto-compaction (which can trigger multiple times per
+// long session at 100K+ tokens each) — used as the default when unset or
+// invalid.
 const defaultCompactionThreshold = 60
 
 // Threshold reports the context-usage percentage (0-100) that triggers

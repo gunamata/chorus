@@ -213,6 +213,24 @@ internal/tui          Bubbletea Model/Update/View. Model holds five
                       restores it; chorus never guesses a mode string —
                       `auto_mode` is something you discover via `modes`
                       and set yourself.
+                      handleKey wraps handleKeyDispatch: refreshSuggest
+                      (recomputes the live "/"/"@" popup from input
+                      content) and relayout (resizes the viewport for the
+                      popup's line count) run unconditionally after EVERY
+                      keypress, regardless of which branch fired — don't
+                      scatter these calls into individual
+                      handleKeyDispatch branches instead. relayout is the
+                      single source of viewport-sizing math (handleResize
+                      and handleKey's wrapper both call it), so a popup
+                      opening/closing mid-typing resizes the viewport
+                      exactly like a real terminal resize does.
+                      A literal Ctrl+V keystroke only ever reaches the
+                      program when the terminal had no text to
+                      bracket-paste (an image-only or empty clipboard) —
+                      real terminals intercept a text-bearing Ctrl+V as
+                      bracketed paste first. See readClipboardImage
+                      (internal/tui/clipboardimage*.go) and "Known
+                      limitations" for per-OS coverage.
 
 internal/session      Connection (one subprocess + ACP initialize
                       handshake — records SupportsLoadSession,
@@ -614,6 +632,18 @@ sandbox/              Opt-in per-agent container images for filesystem/
   `Connection.SupportsImagePrompts` is recorded but nothing reads it —
   no warning if you attach an image to an agent that never advertised
   support for receiving one.
+- **Ctrl+V clipboard-image paste's macOS/Linux code paths are unverified
+  live** — this codebase is developed entirely from a Windows
+  environment, so `clipboardimage_darwin.go` (`osascript`/`pbpaste
+  -Prefer png`) and `clipboardimage_linux.go` (`wl-paste`/`xclip`) are
+  written from documented CLI behavior only, unit-tested only insofar as
+  `readClipboardImage` is a stubbable function var (same pattern as
+  `writeClipboard`). The Windows path (direct CF_DIB decode via
+  user32/kernel32 syscalls, `dibToPNG`) IS confirmed, including a
+  pixel-level round-trip test of the bottom-up/BGR decode. Run the first
+  real macOS/Linux session through this feature and update this entry
+  either way — including "confirmed working," the same convention this
+  section uses everywhere else.
 - **The bubbletea TUI has been built and is covered by unit tests, but
   the tool-invocation environment used to build it has no real PTY** —
   most of bubbletea's actual terminal rendering (alt-screen, keyboard/
@@ -621,8 +651,8 @@ sandbox/              Opt-in per-agent container images for filesystem/
   by specific direct user reports (Esc-interrupt, click-drag selection,
   arrow-key menus, the textarea input box), not a full pass. Run it
   interactively before assuming a UI change looks right.
-- **No checkpointing/rewind** (Claude Code CLI's `/rewind`) —
-  deliberately out of scope so far: durable per-turn snapshots, a
+- **No checkpointing/rewind** — deliberately out of scope so far:
+  durable per-turn snapshots, a
   restore UI, and an unanswered design question (what does "restore"
   mean across N independently-running agent sessions?) make this a
   bigger, separate feature.
