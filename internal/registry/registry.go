@@ -17,6 +17,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"chorus/internal/headroom"
 	"chorus/internal/policy"
 	"chorus/internal/session"
 )
@@ -58,6 +59,13 @@ type entry struct {
 	// you've discovered the real value via the `modes` REPL command;
 	// chorus never guesses one on your behalf.
 	AutoMode string `yaml:"auto_mode"`
+
+	// Env is extra environment variables for this agent's subprocess —
+	// see session.Spec.Env's doc comment for what it's for (redirecting a
+	// non-sandboxed agent's provider API calls through a chorus-managed
+	// Headroom proxy, internal/headroom) and why it only applies to a
+	// bare host-process spawn, not a sandboxed `docker run` one.
+	Env map[string]string `yaml:"env"`
 }
 
 // file is agents.yaml's whole top-level shape.
@@ -66,6 +74,7 @@ type file struct {
 	Delegation   policy.Delegation `yaml:"delegation"`
 	Compaction   policy.Compaction `yaml:"compaction"`
 	Routing      policy.Routing    `yaml:"routing"`
+	Headroom     headroom.Config   `yaml:"headroom"`
 	Agents       []entry           `yaml:"agents"`
 }
 
@@ -96,6 +105,7 @@ func Parse(b []byte) ([]session.Spec, policy.Config, error) {
 		Delegation:   f.Delegation,
 		Compaction:   f.Compaction,
 		Routing:      f.Routing,
+		Headroom:     f.Headroom,
 		DefaultAgent: f.DefaultAgent,
 	}
 
@@ -128,6 +138,7 @@ func Parse(b []byte) ([]session.Spec, policy.Config, error) {
 			Notes:    e.Notes,
 			Models:   e.Models,
 			AutoMode: e.AutoMode,
+			Env:      e.Env,
 		})
 		cfg.Agents[e.Name] = policy.AgentPolicy{
 			AutoAllow:      e.AutoAllow,

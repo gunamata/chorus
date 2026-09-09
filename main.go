@@ -24,6 +24,7 @@ import (
 
 	"chorus/internal/bus"
 	"chorus/internal/delegate"
+	"chorus/internal/headroom"
 	"chorus/internal/policy"
 	"chorus/internal/registry"
 	"chorus/internal/render"
@@ -119,6 +120,39 @@ func run(resume bool, agentsOverride string) error {
 	if err := os.MkdirAll(logDir, 0o700); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: couldn't create %s, agent subprocess stderr will be discarded (not shown, not logged): %v\n", logDir, err)
 		logDir = ""
+	}
+
+	// Phase 0: start the optional Headroom compression proxy container
+	// (agents.yaml's `headroom:` block, internal/headroom) BEFORE any
+	// agent subprocess is spawned — an agent's own env vars (spec.Env,
+	// phase 1's session.Connect) and any {{ENV:...}} token in its spawn
+	// Args (sandboxed agents' `docker run -e NAME={{ENV:...}}`) are only
+	// resolved at spawn time, so CHORUS_HEADROOM_HOST_URL/
+	// CHORUS_HEADROOM_SANDBOX_URL must already be set in chorus's own
+	// process environment before that happens. Off (and none of this
+	// runs) unless explicitly enabled — same opt-in convention as
+	// delegation/compaction.
+	if cfg.Headroom.EnabledOrDefault() {
+		fmt.Println("starting headroom compression proxy...")
+		proxy, err := headroom.Start(ctx, cfg.Headroom)
+		if err != nil {
+			return fmt.Errorf("start headroom proxy: %w", err)
+		}
+		defer func() {
+			if err := proxy.Stop(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: failed to stop headroom container: %v\n", err)
+			}
+		}()
+		// Two separate values, not one — a non-sandboxed agent subprocess
+		// and a SANDBOXED agent's own `docker run` container reach this
+		// same proxy over different network paths (headroom.Proxy.HostURL/
+		// SandboxURL's doc comments). agents.yaml itself picks which one a
+		// given entry needs; chorus never guesses which env var name an
+		// agent's CLI honors (ANTHROPIC_BASE_URL vs OPENAI_BASE_URL vs
+		// none at all) — see internal/headroom's package doc comment.
+		os.Setenv("CHORUS_HEADROOM_HOST_URL", proxy.HostURL())
+		os.Setenv("CHORUS_HEADROOM_SANDBOX_URL", proxy.SandboxURL())
+		fmt.Printf("headroom ready (%s)\n", proxy.HostURL())
 	}
 
 	// Phase 1: connect to every registered agent (subprocess + ACP

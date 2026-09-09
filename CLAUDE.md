@@ -81,9 +81,21 @@ currently invoke `ReadTextFile`/`WriteTextFile`/`CreateTerminal` (both
 do file I/O and shell execution inside their own process), so a live
 smoke test would never exercise this code regardless of thoroughness.
 `internal/session` and most of `internal/delegate` remain untested by
-`go test` — they need a live subprocess or network mocking to exercise
-meaningfully (`internal/delegate/roster.go` is the exception: pure
-logic, has real coverage).
+plain `go test` — they need a live subprocess or network mocking to
+exercise meaningfully (`internal/delegate/roster.go` is the exception:
+pure logic, has real coverage). `internal/headroom` also has two
+go:build-tag-gated LIVE tests, excluded from the normal `go test ./...`
+run the same way, but runnable when the prerequisite is actually
+available: `internal/headroom/live_test.go` (`-tags headroom_live`,
+needs a real docker daemon) exercises the real Start/Stop against the
+real published image; `internal/session/live_headroom_test.go` (`-tags
+claude_headroom_live`, needs docker AND an authenticated `claude` CLI
+subscription) goes further and drives a real `claude-agent-acp`
+subprocess through a real Headroom container with a real prompt — this
+pair is what caught the docker-run command bug and the `slim` variant
+crash documented in internal/headroom's own entry below; keep both
+current if you touch that package's docker-invoking code, since
+stubbed-runDocker unit tests structurally can't catch that class of bug.
 
 `chorus __mcp_delegate` isn't meant to be run directly — it expects
 `CHORUS_DELEGATE_ADDR`/`_TOKEN`/`_SOURCE` env vars that only `main.go`
@@ -334,6 +346,94 @@ internal/registry     Parse(): agents.yaml -> ([]session.Spec,
                       by registry/session themselves. Spec.AutoMode
                       (yaml `auto_mode`) is optional per agent, backs the
                       `auto` REPL command — see internal/session's entry.
+                      Spec.Env (yaml per-agent `env:`) is optional extra
+                      environment for a bare host-process spawn only —
+                      see internal/headroom's entry for the motivating
+                      case and why it's a no-op for a sandboxed `docker
+                      run` spawn.
+
+internal/headroom     Optional chorus-managed Docker container running
+                      Headroom (https://docs.headroomlabs.ai/docs), a
+                      local compression proxy that sits between an agent
+                      CLI and its LLM provider. defaultImage is
+                      `code-nonroot`, deliberately not `latest` —
+                      Headroom's tags are an 8-way matrix of the `code`/
+                      `slim`/`nonroot` build modifiers (`latest` has
+                      none of them); `code` enables AST-aware code
+                      compression (the actually-relevant capability,
+                      since these agents' tool output is overwhelmingly
+                      source/diffs), `nonroot` runs as uid 1000. `slim`
+                      is deliberately EXCLUDED — CONFIRMED LIVE (2026-09,
+                      real docker run on Rancher Desktop/Windows, WSL2
+                      linux/amd64 backend): every `slim`-tagged variant
+                      segfaults on startup (exit 139, zero log output),
+                      isolated to the distroless base itself (both
+                      code-slim-nonroot AND plain slim-nonroot crashed
+                      identically; code-nonroot, non-slim, started clean
+                      and served real compressed requests in the same
+                      test). May be environment-specific — re-test before
+                      reconsidering, don't just revert on the reasoning
+                      alone. See defaultImage's own doc comment for the
+                      full account. agents.yaml's top-level
+                      `headroom:` block (Config, EnabledOrDefault false)
+                      — Start(ctx, cfg) does `docker run -d -p
+                      {port}:8787 -e HEADROOM_HOST=0.0.0.0 -e
+                      HEADROOM_PORT=8787 -e HEADROOM_MODE=... {image}`
+                      with NO trailing command — CONFIRMED LIVE (2026-09)
+                      that appending one (an earlier version did:
+                      "headroom proxy --host 0.0.0.0 --port 8787") breaks
+                      the container outright: the image's own ENTRYPOINT
+                      is already `python3 -m headroom.cli proxy` with a
+                      complete default CMD, so extra positional args
+                      after the image name are read as unexpected
+                      arguments to that already-complete command and the
+                      container exits immediately ("Error: Got unexpected
+                      extra arguments"). No stubbed-runDocker unit test
+                      could have caught this — see
+                      internal/session/live_headroom_test.go and
+                      internal/headroom/live_test.go (both
+                      go:build-tag-gated, excluded from the normal `go
+                      test ./...` run, real docker/real Claude required)
+                      for the tests that did. Then polls /stats until it
+                      responds (startTimeout 30s), returns a *Proxy;
+                      Stop() does `docker rm -f` on its own short-lived
+                      context (deliberately NOT the caller's ctx — Stop
+                      runs from a deferred shutdown path where that ctx
+                      may already be cancelled). docker invocation is
+                      behind the runDocker function var (same stubbing
+                      pattern as internal/tui's writeClipboard/
+                      readClipboardImage) so Start/Stop's argument-
+                      building is unit-tested without a real docker
+                      daemon. main.go's phase 0 (before phase 1's agent
+                      connects) starts this, THEN os.Setenv's
+                      CHORUS_HEADROOM_HOST_URL/_SANDBOX_URL — order
+                      matters, since both {{ENV:...}} in spawn Args and
+                      the new Spec.Env are resolved at spawn time, not
+                      parse time. Proxy.HostURL()
+                      (http://127.0.0.1:{port}) is for a NON-sandboxed
+                      agent; Proxy.SandboxURL()
+                      (http://host.docker.internal:{port}) is for a
+                      SANDBOXED agent's own container — chorus never
+                      guesses which one a given agents.yaml entry needs,
+                      let alone which provider-specific base-URL env var
+                      name (ANTHROPIC_BASE_URL etc.) an agent's CLI
+                      honors; the agents.yaml author wires both
+                      explicitly (README has worked examples). The
+                      container's port is published on EVERY host
+                      interface, not 127.0.0.1-only — see Start's own doc
+                      comment and README's security note for why
+                      (Linux Rancher Desktop's containers reach the host
+                      over a real docker bridge interface that does NOT
+                      reach a loopback-only-bound port, unlike Docker
+                      Desktop's macOS/Windows VM-proxied networking).
+                      Provider API keys (ANTHROPIC_API_KEY/OPENAI_API_KEY/
+                      AWS/GOOGLE_APPLICATION_CREDENTIALS) are passed to
+                      the container as bare `-e NAME` (pulls from
+                      chorus's own process env if set, omitted if not —
+                      same convention agents.yaml.sandbox.* already uses)
+                      but are NOT required for the core proxy-passthrough
+                      case — see "Known limitations" for what's actually
+                      unverified here.
 
 internal/delegate     Cross-agent delegation. Two roles: RunMCPServer
                       (the `chorus __mcp_delegate` subcommand — an MCP
@@ -652,14 +752,57 @@ sandbox/              Opt-in per-agent container images for filesystem/
   arrow-key menus, the textarea input box), not a full pass. Run it
   interactively before assuming a UI change looks right.
 - **No checkpointing/rewind** — deliberately out of scope so far:
-  durable per-turn snapshots, a
-  restore UI, and an unanswered design question (what does "restore"
-  mean across N independently-running agent sessions?) make this a
-  bigger, separate feature.
+  durable per-turn snapshots, a restore UI, and an unanswered design
+  question (what does "restore" mean across N independently-running
+  agent sessions?) make this a bigger, separate feature.
 - **Sandboxing (`sandbox/`) is confirmed live** for Claude, Gemini, and
   opencode (both free-tier and a VPN-bound Ollama backend) — see
   `sandbox/README.md` and the per-agent READMEs for setup. Cross-agent
   delegation is NOT supported for a sandboxed agent.
+- **Headroom compression proxy (`internal/headroom`, 2026-09): confirmed
+  live for Claude, on Rancher Desktop/Windows (WSL2 backend)** — two
+  go:build-tag-gated live tests (see "Test coverage" above) exercised
+  the real thing: `internal/headroom.Start`/`Stop` against the real
+  published image, and a real `claude-agent-acp` subprocess redirected
+  via `ANTHROPIC_BASE_URL` at a real Headroom container, prompted for
+  real. Confirmed by this: (1) `claude-agent-acp` DOES honor
+  `ANTHROPIC_BASE_URL` — Headroom's own `/stats` showed real compressed
+  Anthropic traffic (`"agent":"claude-code"`, real token counts, a real
+  provider-side prompt-cache hit on a second run) after the redirect;
+  (2) Headroom's proxy does NOT need its own copy of a provider API key
+  for this — neither `ANTHROPIC_API_KEY` nor `OPENAI_API_KEY` was set
+  anywhere in the test environment, and it still worked, confirming
+  `providerKeyEnvVars`'s doc comment's "not required" claim rather than
+  just asserting it; (3) `host.docker.internal` from a separate
+  container DOES reach the published port on this backend. This testing
+  is ALSO what found and fixed the docker-run command bug and the
+  `slim`-variant crash documented in internal/headroom's own entry
+  above — both invisible to the stubbed-runDocker unit tests, only
+  caught by these live ones.
+  Still unconfirmed: the same `host.docker.internal` path specifically
+  on Rancher Desktop's native-Linux backend (a materially different
+  network path — containers reach the host over a real bridge interface
+  there, not Windows/macOS's VM-proxied networking, which is why the
+  container's port is published broadly rather than loopback-only in
+  the first place — see Start's own doc comment); whether opencode's own
+  multi-provider config accepts a custom base URL the same way; and
+  Gemini entirely, moot regardless since it's already blocked by the
+  free-tier `IneligibleTierError` above. Update this entry with whatever
+  the Linux/opencode runs find, the same convention every other item in
+  this list uses.
+- **`session.Connection.Close()` may not kill an `npx`-spawned agent's
+  actual Node.js process on Windows** — found live (2026-09) as a side
+  effect of the Headroom live testing above: after `Close()`, the
+  spawned subprocess's own cwd stayed locked (`os.RemoveAll` failing
+  with "used by another process") for several seconds, consistent with
+  `cmd.Process.Kill()` only reaching the immediate `npx` wrapper, not
+  the Node.js process `npx` forks underneath it. Not Headroom-specific —
+  affects any `npx`-based `spawn` entry (the default `claude` entry
+  included) on Windows; could mean `quit`/Ctrl+C leaves an orphaned Node
+  process running rather than a merely-annoying leaked file lock. Not
+  yet root-caused beyond confirming the symptom — likely fix is tracking
+  and killing the real process tree (Windows job objects, or
+  `taskkill /T`) rather than a bare `Process.Kill()`.
 
 ## Gemini verification checklist — run the moment `gemini --acp` works
 

@@ -541,6 +541,10 @@ routing:
   decision_agent: opencode
   context_level: digest
 
+headroom:
+  enabled: false      # off by default — see Headroom compression proxy below
+  port: 8787
+
 agents:
   - name: claude
     spawn: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
@@ -585,7 +589,10 @@ which agent+model fits a given prompt. `models` is optional per agent —
 omit it entirely (as the registry's own `gemini`/`opencode` entries do)
 to let LLM-based routing pick that agent but never attempt to switch its
 model. `auto_mode` is also optional per agent — see [Auto
-mode](#auto-mode-acp-session-modes) above.
+mode](#auto-mode-acp-session-modes) above. `env` is an optional per-agent
+map of extra environment variables for a bare (non-sandboxed) spawn —
+see [Headroom compression proxy](#headroom-compression-proxy-agentsyaml)
+for the motivating use case.
 
 **`agents.yaml` isn't actually required on disk.** Resolution order,
 with no `--agents` flag:
@@ -899,6 +906,128 @@ comment on which env vars to set), loaded via
 registry](#agent-registry-agentsyaml)) instead of the default
 `./chorus`.
 
+## Headroom compression proxy (`agents.yaml`)
+
+Opt-in integration with [Headroom](https://docs.headroomlabs.ai/docs), a
+local compression proxy that sits between an agent CLI and its LLM
+provider, shrinking tool outputs/logs/JSON/code before the model sees
+them. chorus doesn't compress anything itself — enabling this starts a
+Headroom container for the life of the run, and each agent that opts in
+redirects its own provider API calls through it via that agent's own
+base-URL environment variable (e.g. `ANTHROPIC_BASE_URL` for Claude
+Code). Off by default.
+
+```yaml
+headroom:
+  enabled: true
+  # image: ghcr.io/headroomlabs-ai/headroom:code-nonroot   # this is the default
+  # port: 8787                                               # optional override
+  # mode: cache                                              # cache | token
+```
+
+When enabled, chorus starts one Docker container for the whole run (the
+**containerized** Headroom image, `ghcr.io/headroomlabs-ai/headroom`,
+not a bare `headroom` binary on your PATH — nothing else to install)
+and sets two environment variables in its own process, before any agent
+is spawned, for `agents.yaml` to reference via chorus's existing
+`{{ENV:NAME}}` substitution:
+
+**Default image tag is `code-nonroot`, not `latest`.** Headroom
+publishes an 8-way tag matrix — every combination of the `code`, `slim`,
+and `nonroot` build modifiers; `latest` is the variant with *none* of
+them. `code` adds Tree-sitter AST-aware code compression (the capability
+that actually matters here, since chorus's agents' tool output is
+overwhelmingly source code/diffs — `latest` silently compresses code
+with the generic statistical path instead). `nonroot` runs as uid 1000
+instead of root. **`slim` is deliberately NOT used**, despite being the
+more locked-down option in principle (a distroless base with no shell/
+curl/package manager) — **confirmed live** (2026-09, real `docker run`
+on Rancher Desktop/Windows, WSL2 linux/amd64 backend): every `slim`-
+tagged variant (`code-slim-nonroot` AND plain `slim-nonroot`, isolating
+it to the distroless base itself, not the `code` extra) segfaults on
+startup with zero log output, while `code-nonroot` (non-slim) started
+cleanly and served real compressed requests in the same test. This may
+be specific to this environment/backend — worth re-testing on your own
+machine before reconsidering. `code-nonroot` publishes multi-arch
+(amd64+arm64) same as every other variant. Override `image:` if you'd
+rather use a different one (or a self-hosted mirror).
+
+- `CHORUS_HEADROOM_HOST_URL` — reachable from a normal, non-sandboxed
+  agent subprocess (`http://127.0.0.1:{port}`).
+- `CHORUS_HEADROOM_SANDBOX_URL` — reachable from a **sandboxed** agent's
+  own `docker run` container (`http://host.docker.internal:{port}`).
+
+chorus never guesses which base-URL variable name a given agent's CLI
+actually honors — same "confirm the real value yourself" discipline as
+[Auto mode](#auto-mode-acp-session-modes)'s ACP session modes. You wire
+the mapping explicitly, once, per agent:
+
+**Non-sandboxed** — a new per-agent `env:` map (substituted the same way
+`spawn`'s argv already is):
+
+```yaml
+- name: claude
+  spawn: ["npx", "-y", "@agentclientprotocol/claude-agent-acp"]
+  env:
+    ANTHROPIC_BASE_URL: "{{ENV:CHORUS_HEADROOM_HOST_URL}}"
+```
+
+`env:` only reaches a bare host-process spawn — it sets environment
+variables on the subprocess chorus itself execs. It does nothing for a
+sandboxed `docker run` entry, since that subprocess IS the `docker` CLI,
+not whatever ends up running inside the container it starts.
+
+**Sandboxed** — add an explicit `-e` flag to the `docker run` argv
+instead, the same way `agents.yaml.sandbox.*` already does for
+`CHORUS_SANDBOX_ALLOW_HOSTS`:
+
+```yaml
+- name: claude
+  spawn: ["docker", "run", "--rm", "-i",
+          "-e", "ANTHROPIC_BASE_URL={{ENV:CHORUS_HEADROOM_SANDBOX_URL}}",
+          ...]
+```
+
+### Rancher Desktop / `host.docker.internal` assumption
+
+The sandboxed URL assumes **Rancher Desktop** (confirmed by [its own
+FAQ](https://docs.rancherdesktop.io/faq/#q-can-containers-reach-back-to-host-services-via-hostdockerinternal))
+resolves `host.docker.internal` inside a container with no extra flags —
+notably, do NOT add `--add-host=host.docker.internal:host-gateway`: that
+flag's `host-gateway` value is a Docker-Desktop-only feature Rancher
+Desktop [doesn't support](https://docs.rancherdesktop.io/faq/#q-can-i-map-hostdockerinternal-or-hostrancher-desktopinternal-to-host-gateway-with-the-flag---add-host)
+and adding it will error. A sandboxed agent's own egress firewall
+(`sandbox/*/init-firewall.sh`) already allows traffic to/from the whole
+host network subnet it auto-detects, so no `CHORUS_SANDBOX_ALLOW_HOSTS`
+change is needed for this specifically.
+
+**Security note**: the Headroom container's port is published on every
+host interface (`-p {port}:8787`, not loopback-only) — not an oversight.
+On Linux, Rancher Desktop's containers reach the host over a real Docker
+bridge interface, which does NOT reach a `127.0.0.1`-only-bound host
+port (unlike Docker Desktop's macOS/Windows VM-proxied networking,
+which typically does) — binding loopback-only would silently break
+sandboxed-agent reachability specifically on Linux. The tradeoff: the
+proxy is reachable from any local process (and, depending on Rancher
+Desktop's VM networking, possibly your LAN) while chorus is running.
+This whole reachability picture (host.docker.internal → a broadly-bound
+port, across all three OSes Rancher Desktop supports) is unverified
+live — confirm on your own machine before relying on it, and see [Known
+limitations](#known-limitations).
+
+### What actually gets forwarded
+
+Headroom's own docs describe passing provider API keys
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, AWS/Google credentials) to it for
+more accurate token-count-based stats. chorus passes these through to
+the container defensively (bare `-e NAME`, pulled from chorus's own
+process environment if set, omitted if not — the same convention
+`agents.yaml.sandbox.*` already uses) but doesn't require any of them:
+an already-authenticated client (e.g. Claude Code sending its own
+subscription auth header) has that header forwarded upstream through the
+proxy unchanged regardless of whether Headroom has its own copy of a
+provider key.
+
 ## Releases & publishing
 
 `.github/workflows/release.yml` builds and publishes everything on a
@@ -1172,3 +1301,34 @@ sandbox/                   Opt-in per-agent container images for filesystem/netw
   `CHORUS_SANDBOX_ALLOW_HOSTS` entries, since the earlier hard failure
   on an unresolved host was a startup-timing race against the VPN
   coming up, not a routing problem — see `sandbox/opencode/README.md`.
+- **Headroom compression proxy integration (2026-09): confirmed live for
+  Claude on Windows/Rancher Desktop** — see [Headroom compression
+  proxy](#headroom-compression-proxy-agentsyaml). A real
+  `session.Connect`/`NewSession`/`Prompt` round trip against the actual
+  `claude-agent-acp` subprocess, redirected via `ANTHROPIC_BASE_URL` at
+  a real `internal/headroom`-managed container, produced a real reply AND
+  showed up in Headroom's own `/stats` as genuine compressed Anthropic
+  traffic (`"agent":"claude-code"`, real token counts, a real prompt-cache
+  hit on a second run) — so **the ACP adapter chorus actually spawns does
+  honor `ANTHROPIC_BASE_URL`**, not just the bare CLI. Also confirmed:
+  `host.docker.internal` from a separate container reaches the published
+  port on this setup (Rancher Desktop/Windows, WSL2 backend). Still
+  unconfirmed: the same `host.docker.internal` path on Rancher Desktop's
+  native-Linux backend specifically (a materially different network path
+  — see `internal/headroom`'s own doc comment); and whether opencode's
+  own multi-provider config accepts a custom base URL the same way.
+  Gemini CLI is lowest priority here regardless, since it's already
+  blocked entirely by the free-tier `IneligibleTierError` above.
+- **`session.Connection.Close()` may not kill an `npx`-spawned agent's
+  actual Node.js process on Windows** — found live (2026-09) while
+  testing the above: after `Close()`, the spawned subprocess's own cwd
+  stayed locked (a file couldn't be deleted, "used by another process")
+  for up to several seconds, consistent with `cmd.Process.Kill()` only
+  reaching the immediate `npx` wrapper, not the Node.js process `npx`
+  spawns underneath it. Not Headroom-specific — this affects any
+  `npx`-based `spawn` entry (the default `claude` entry included) on
+  Windows, and could mean a `quit`/Ctrl+C in chorus itself leaves an
+  orphaned Node process behind rather than a leaked file lock. Worth a
+  dedicated fix (likely: track and kill the actual process tree, or run
+  `npx` via a mechanism that doesn't fork further) — not yet
+  investigated beyond confirming the symptom.

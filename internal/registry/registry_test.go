@@ -326,3 +326,75 @@ agents:
 		t.Errorf("specs[0].Models = %+v, want empty when omitted", specs[0].Models)
 	}
 }
+
+func TestParse_DecodesPerAgentEnv(t *testing.T) {
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: claude
+    spawn: ["claude", "--acp"]
+    env:
+      ANTHROPIC_BASE_URL: "{{ENV:CHORUS_HEADROOM_HOST_URL}}"
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if got := specs[0].Env["ANTHROPIC_BASE_URL"]; got != "{{ENV:CHORUS_HEADROOM_HOST_URL}}" {
+		t.Errorf("specs[0].Env[ANTHROPIC_BASE_URL] = %q, want the raw token (substitution happens later, in session.Connect)", got)
+	}
+}
+
+func TestParse_EnvOptional(t *testing.T) {
+	specs, _, err := Parse([]byte(`
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if len(specs[0].Env) != 0 {
+		t.Errorf("specs[0].Env = %+v, want empty when omitted", specs[0].Env)
+	}
+}
+
+func TestParse_DecodesHeadroomConfig(t *testing.T) {
+	_, cfg, err := Parse([]byte(`
+headroom:
+  enabled: true
+  image: custom/headroom:tag
+  port: 9999
+  mode: token
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if !cfg.Headroom.EnabledOrDefault() {
+		t.Error("Headroom.EnabledOrDefault() = false, want true")
+	}
+	if cfg.Headroom.ImageOrDefault() != "custom/headroom:tag" {
+		t.Errorf("Headroom.ImageOrDefault() = %q, want the configured image", cfg.Headroom.ImageOrDefault())
+	}
+	if cfg.Headroom.PortOrDefault() != 9999 {
+		t.Errorf("Headroom.PortOrDefault() = %d, want 9999", cfg.Headroom.PortOrDefault())
+	}
+	if cfg.Headroom.ModeOrDefault() != "token" {
+		t.Errorf("Headroom.ModeOrDefault() = %q, want token", cfg.Headroom.ModeOrDefault())
+	}
+}
+
+func TestParse_HeadroomOptional(t *testing.T) {
+	_, cfg, err := Parse([]byte(`
+agents:
+  - name: opencode
+    spawn: ["opencode", "acp"]
+`))
+	if err != nil {
+		t.Fatalf("Parse() error = %v", err)
+	}
+	if cfg.Headroom.EnabledOrDefault() {
+		t.Error("Headroom.EnabledOrDefault() = true with no headroom: block at all, want false (opt-in)")
+	}
+}

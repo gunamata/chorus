@@ -76,3 +76,29 @@ func TestSubstituteTokens_CombinesCwdAndEnvTokensInOneArg(t *testing.T) {
 		t.Errorf("substituteTokens() = %v, want %v", got, want)
 	}
 }
+
+func TestEnvLines_EmptyMapReturnsNil(t *testing.T) {
+	if got := envLines(nil, "/workspace"); got != nil {
+		t.Errorf("envLines(nil, ...) = %v, want nil", got)
+	}
+	if got := envLines(map[string]string{}, "/workspace"); got != nil {
+		t.Errorf("envLines({}, ...) = %v, want nil", got)
+	}
+}
+
+func TestEnvLines_FormatsAndSubstitutesTokens(t *testing.T) {
+	t.Setenv("CHORUS_TEST_HEADROOM_URL", "http://127.0.0.1:8787")
+	got := envLines(map[string]string{"ANTHROPIC_BASE_URL": "{{ENV:CHORUS_TEST_HEADROOM_URL}}"}, "/workspace")
+	want := []string{"ANTHROPIC_BASE_URL=http://127.0.0.1:8787"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("envLines() = %v, want %v", got, want)
+	}
+}
+
+func TestEnvLines_CwdTokenInValue(t *testing.T) {
+	got := envLines(map[string]string{"PROJECT_DIR": "{{CWD}}/sub"}, "/workspace")
+	want := []string{"PROJECT_DIR=/workspace/sub"}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("envLines() = %v, want %v", got, want)
+	}
+}

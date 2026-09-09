@@ -80,6 +80,18 @@ routing:
   context_level: digest
   decision_timeout_seconds: 60
 
+# headroom: optional chorus-managed Headroom compression proxy container
+# (https://docs.headroomlabs.ai/docs) — see README's "Headroom
+# compression proxy" section for the full picture, including the
+# Rancher Desktop host.docker.internal assumption for sandboxed agents.
+# OFF by default (commented out here); enabling it alone does nothing
+# for an agent until that agent's own entry below redirects its API
+# calls through it via `env:` (non-sandboxed) or an explicit `-e` flag
+# (sandboxed, agents.yaml.sandbox.*).
+# headroom:
+#   enabled: true
+#   port: 8787
+
 # Each entry's `spawn` is a full command line: the executable followed by
 # its arguments. `transport` must be "acp" (the only one chorus implements
 # today). `cost_tier` and `notes` are surfaced to every OTHER connected
@@ -112,6 +124,8 @@ agents:
     transport: acp
     auto_allow: [read, search, think]
     auto_allow_tools: [mcp__chorus-delegate__]
+    # env:                                            # needs headroom.enabled above too
+    #   ANTHROPIC_BASE_URL: "{{ENV:CHORUS_HEADROOM_HOST_URL}}"
     models:
       - id: claude-opus-4-8
         label: Opus

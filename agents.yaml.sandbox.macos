@@ -106,6 +106,20 @@ routing:
   context_level: digest
   decision_timeout_seconds: 60
 
+# headroom: optional chorus-managed Headroom compression proxy container
+# (https://docs.headroomlabs.ai/docs) — see README's "Headroom
+# compression proxy" section. Assumes Rancher Desktop's
+# host.docker.internal support (confirmed by Rancher Desktop's own docs
+# to need no --add-host flag — don't add one, host-gateway isn't
+# supported here). OFF by default (commented out); enabling it alone
+# does nothing until an agent entry below also redirects its API calls
+# through it via an explicit `-e` flag referencing
+# {{ENV:CHORUS_HEADROOM_SANDBOX_URL}} (see the commented example on the
+# claude entry below).
+# headroom:
+#   enabled: true
+#   port: 8787
+
 # Each entry's `spawn` is a full command line: the executable followed by
 # its arguments. `transport` must be "acp" (the only one chorus implements
 # today). `cost_tier` and `notes` are surfaced to every OTHER connected
@@ -157,6 +171,7 @@ agents:
             "-e", "CLOUD_ML_REGION",
             "-e", "ANTHROPIC_VERTEX_PROJECT_ID",
             "-e", "CHORUS_SANDBOX_ALLOW_HOSTS",
+            # "-e", "ANTHROPIC_BASE_URL={{ENV:CHORUS_HEADROOM_SANDBOX_URL}}", # needs headroom.enabled above too
             "matamagu/chorus-claude-sandbox"]
     workdir: /workspace
     cost_tier: metered

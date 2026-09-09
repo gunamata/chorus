@@ -22,6 +22,8 @@ package policy
 import (
 	"strings"
 	"time"
+
+	"chorus/internal/headroom"
 )
 
 // AgentPolicy is one agent's permission settings (agents.yaml's
@@ -245,6 +247,11 @@ type Config struct {
 	Delegation Delegation
 	Compaction Compaction
 	Routing    Routing
+	// Headroom is optional agents.yaml config (top-level `headroom:`
+	// block) for a chorus-managed Headroom compression proxy container
+	// (internal/headroom) — see that package's doc comment. Off by
+	// default when unset, same opt-in convention as Delegation/Compaction.
+	Headroom headroom.Config
 	// DefaultAgent is used whenever routing is off, or an LLM routing
 	// decision fails to resolve to a known agent+model.
 	DefaultAgent string

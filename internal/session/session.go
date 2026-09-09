@@ -92,6 +92,24 @@ type Spec struct {
 	// know it. Empty means `auto`/`auto <name>` has nothing to switch
 	// this agent to — not an error, just a no-op with a clear message.
 	AutoMode string
+
+	// Env is extra environment variables (agents.yaml's per-agent `env:`
+	// map) set on this agent's subprocess IN ADDITION to chorus's own
+	// inherited environment — e.g. redirecting a non-sandboxed agent's
+	// provider API calls through a chorus-managed Headroom compression
+	// proxy (internal/headroom) via ANTHROPIC_BASE_URL. Values go through
+	// the same {{CWD}}/{{ENV:NAME}} substitution as Args (see
+	// substituteTokens). Only meaningful for a bare host-process spawn —
+	// a sandboxed agent's `docker run` spawn command runs in a SEPARATE
+	// process (the docker CLI) from whatever ends up inside the
+	// container, so setting this subprocess's environment doesn't reach
+	// inside it; use an explicit `-e NAME=value` in Args instead for that
+	// case (agents.yaml.sandbox.* already does this for
+	// CHORUS_SANDBOX_ALLOW_HOSTS/GOOGLE_CLOUD_PROJECT/etc.). nil/empty
+	// (the default) leaves today's behavior unchanged: cmd.Env stays nil
+	// and the subprocess inherits chorus's own environment exactly as
+	// before this field existed.
+	Env map[string]string
 }
 
 // EffectiveCwd returns the cwd to send to this agent via ACP: WorkDir if
@@ -110,12 +128,35 @@ func (s Spec) EffectiveCwd(hostCwd string) string {
 func substituteTokens(args []string, cwd string) []string {
 	out := make([]string, len(args))
 	for i, a := range args {
-		a = strings.ReplaceAll(a, cwdToken, cwd)
-		a = envTokenPattern.ReplaceAllStringFunc(a, func(token string) string {
-			name := envTokenPattern.FindStringSubmatch(token)[1]
-			return os.Getenv(name)
-		})
-		out[i] = a
+		out[i] = substituteToken(a, cwd)
+	}
+	return out
+}
+
+// substituteToken applies substituteTokens' same {{CWD}}/{{ENV:NAME}}
+// replacement to a single string — the shared primitive substituteTokens
+// (Args) and envLines (Spec.Env's values) both build on, so the two
+// token kinds behave identically wherever either is used.
+func substituteToken(s, cwd string) string {
+	s = strings.ReplaceAll(s, cwdToken, cwd)
+	return envTokenPattern.ReplaceAllStringFunc(s, func(token string) string {
+		name := envTokenPattern.FindStringSubmatch(token)[1]
+		return os.Getenv(name)
+	})
+}
+
+// envLines renders Spec.Env (with {{CWD}}/{{ENV:NAME}} substitution
+// applied to each value) as "NAME=value" strings suitable for
+// exec.Cmd.Env — the shape os/exec expects. Returns nil for an empty
+// map, so Connect can tell "no overrides, inherit unchanged" apart from
+// "overrides that happen to be empty strings."
+func envLines(env map[string]string, cwd string) []string {
+	if len(env) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(env))
+	for name, value := range env {
+		out = append(out, name+"="+substituteToken(value, cwd))
 	}
 	return out
 }
@@ -195,6 +236,15 @@ func (c *Connection) Cwd() string { return c.cwd }
 func Connect(ctx context.Context, spec Spec, cwd string, outputCh chan<- bus.Update, permCh chan<- bus.PermissionRequest, pol policy.Policy, delegation policy.Delegation, costTiers map[string]string, stderr io.Writer) (*Connection, error) {
 	cmd := exec.CommandContext(ctx, spec.Command, substituteTokens(spec.Args, cwd)...)
 	cmd.Stderr = stderr
+	// nil Env (the default, spec.Env unset) leaves exec.Cmd's own
+	// documented behavior unchanged: the subprocess inherits chorus's
+	// whole environment. Only set it explicitly when there's something to
+	// ADD — os.Environ() first so an override in spec.Env can still shadow
+	// an inherited value (os/exec uses the LAST matching NAME=value when
+	// duplicates exist).
+	if extra := envLines(spec.Env, cwd); extra != nil {
+		cmd.Env = append(os.Environ(), extra...)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
