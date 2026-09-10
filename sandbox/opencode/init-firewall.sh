@@ -153,6 +153,7 @@ add_domain() {
 for domain in "registry.npmjs.org" "opencode.ai"; do
     add_domain "$domain" strict
 done
+add_domain "host.docker.internal"
 
 # Deployment-specific: a self-run Ollama endpoint (or any other
 # non-default backend) — never baked into the image itself.
