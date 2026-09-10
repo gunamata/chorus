@@ -154,6 +154,7 @@ add_domain() {
 for domain in "registry.npmjs.org" "api.anthropic.com" "aiplatform.googleapis.com"; do
     add_domain "$domain" strict
 done
+add_domain "host.docker.internal"
 
 # Deployment-specific additions (Vertex/Bedrock/gateway endpoints, an
 # internal Ollama host, ...) — never baked into the image itself.

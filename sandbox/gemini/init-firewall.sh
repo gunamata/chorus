@@ -147,6 +147,7 @@ add_domain() {
 for domain in "registry.npmjs.org" "oauth2.googleapis.com" "accounts.google.com" "cloudcode-pa.googleapis.com"; do
     add_domain "$domain" strict
 done
+add_domain "host.docker.internal"
 
 # Deployment-specific additions (e.g. Vertex AI's regional endpoint, if
 # switching this agent to Vertex auth instead of OAuth) — never baked
