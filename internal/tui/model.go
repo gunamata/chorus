@@ -948,11 +948,20 @@ func clampInt(v, lo, hi int) int {
 // with a "[agent] finished in Xs" line following shortly after, same as
 // always.
 func (m Model) interruptBusyAgents() Model {
-	targets := selectInterruptTargets(m.busyAgentNames(), m.lastRoutedAgent)
-	if len(targets) == 0 {
+	return m.interruptAgents(selectInterruptTargets(m.busyAgentNames(), m.lastRoutedAgent))
+}
+
+// interruptAgents sends ACP's session/cancel to each named worker — the
+// shared cancel-loop both Esc (a targeted subset, selectInterruptTargets)
+// and Ctrl+C (unconditionally every busy agent, no targeting — see its
+// own case in handleKeyDispatch) build on, so the two keys' only real
+// difference is which names they pass in here, not how cancellation
+// itself works.
+func (m Model) interruptAgents(names []string) Model {
+	if len(names) == 0 {
 		return m
 	}
-	for _, name := range targets {
+	for _, name := range names {
 		w, ok := m.workers[name]
 		if !ok {
 			continue
@@ -1196,11 +1205,19 @@ func (m Model) handleKeyDispatch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.Type {
 	case tea.KeyCtrlC:
-		// First press clears the in-progress draft rather than quitting
-		// outright — an immediate, unconfirmed Ctrl+C used to kill every
-		// connected agent's subprocess at once. Only quits once the input
-		// is already empty, which a second press naturally satisfies
-		// without needing a press-twice timer.
+		// Busy-check wins outright, before input content is even
+		// considered: if anything is running, Ctrl+C interrupts EVERY
+		// busy agent (unlike Esc, which narrows to lastRoutedAgent when
+		// that one's busy — see selectInterruptTargets) and leaves the
+		// input box untouched, so a half-typed prompt survives. Only once
+		// nothing is running does input content decide what happens:
+		// first press with a non-empty draft clears it rather than
+		// quitting outright; only an already-empty input quits — no
+		// press-twice timer needed, since the state change from the first
+		// press already satisfies it.
+		if busy := m.busyAgentNames(); len(busy) > 0 {
+			return m.interruptAgents(busy), nil
+		}
 		if m.input.Value() != "" {
 			m.input.Reset()
 			return m, nil

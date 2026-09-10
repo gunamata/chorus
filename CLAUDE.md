@@ -191,10 +191,28 @@ internal/tui          Bubbletea Model/Update/View. Model holds five
                       same trust level as a plain terminal), output
                       capped at 200KB.
                       Esc (modeNormal only) calls interruptBusyAgents →
+                      interruptAgents(selectInterruptTargets(...)) →
                       AgentWorker.Cancel → ACP's session/cancel,
                       targeting lastRoutedAgent if it's busy else every
                       busy agent. ACP doesn't guarantee an early stop,
                       only that the notification was sent.
+                      Ctrl+C (2026-09) shares interruptAgents but skips
+                      the targeting narrowing entirely: `if busy :=
+                      m.busyAgentNames(); len(busy) > 0` wins outright,
+                      before input content is even read — interrupts
+                      EVERY busy agent, leaves the input box untouched,
+                      and only falls through to the old clear-draft-then-
+                      quit logic once nothing is running. Two keys, two
+                      deliberately different scopes: Esc narrows to what
+                      you're likely watching, Ctrl+C is the blunt
+                      stop-everything one. Untestable end-to-end via
+                      plain `go test` for the same reason the rest of
+                      AgentWorker.Cancel's callers are (needs a live
+                      session.AgentSession/ACP connection) —
+                      TestModel_CtrlC_TakesInterruptBranchWhenBusy proves
+                      the branch is taken anyway, by asserting on the
+                      resulting panic from a deliberately nil-session
+                      test double rather than working around it.
                       Click-drag (mouse capture on by default) does
                       LINE-level (not character-column) text selection +
                       copy-on-select via github.com/atotto/clipboard,
@@ -376,8 +394,18 @@ internal/headroom     Optional chorus-managed Docker container running
                       alone. See defaultImage's own doc comment for the
                       full account. agents.yaml's top-level
                       `headroom:` block (Config, EnabledOrDefault false)
-                      — Start(ctx, cfg) does `docker run -d -p
-                      {port}:8787 -e HEADROOM_HOST=0.0.0.0 -e
+                      — Start(ctx, cfg) targets a FIXED name/volume
+                      (containerName "chorus-headroom", volumeName
+                      "chorus-headroom-data" — not per-run random ones;
+                      2026-09 redesign, see this file's own git history
+                      if you need the old ephemeral-per-run shape) and is
+                      idempotent: `docker inspect` first — already
+                      running -> reused as-is, no docker command needed;
+                      exists but stopped -> `docker start` (preserves its
+                      original --restart/volume/port); never existed ->
+                      `docker run -d --name chorus-headroom --restart
+                      unless-stopped -v chorus-headroom-data:/home/nonroot/.headroom
+                      -p {port}:8787 -e HEADROOM_HOST=0.0.0.0 -e
                       HEADROOM_PORT=8787 -e HEADROOM_MODE=... {image}`
                       with NO trailing command — CONFIRMED LIVE (2026-09)
                       that appending one (an earlier version did:
@@ -395,17 +423,28 @@ internal/headroom     Optional chorus-managed Docker container running
                       go:build-tag-gated, excluded from the normal `go
                       test ./...` run, real docker/real Claude required)
                       for the tests that did. Then polls /stats until it
-                      responds (startTimeout 30s), returns a *Proxy;
-                      Stop() does `docker rm -f` on its own short-lived
-                      context (deliberately NOT the caller's ctx — Stop
-                      runs from a deferred shutdown path where that ctx
-                      may already be cancelled). docker invocation is
+                      responds (startTimeout 30s), returns a *Proxy. On a
+                      health-check failure, the container is only
+                      removed if THIS call freshly created it via `docker
+                      run` — a reused (already-existing) container is
+                      left alone, since chorus didn't create it this run
+                      and a possibly-transient timeout doesn't justify
+                      destroying someone else's container. Stop() (plain
+                      `docker rm -f`) still exists but is NOT called
+                      anywhere in main.go's normal run path — the whole
+                      point of this redesign (--restart unless-stopped +
+                      a named volume) is a container that outlives any
+                      one chorus session and keeps its provider-side
+                      prompt cache warm across runs; only tests/manual
+                      cleanup call Stop() now. docker invocation is
                       behind the runDocker function var (same stubbing
                       pattern as internal/tui's writeClipboard/
                       readClipboardImage) so Start/Stop's argument-
                       building is unit-tested without a real docker
-                      daemon. main.go's phase 0 (before phase 1's agent
-                      connects) starts this, THEN os.Setenv's
+                      daemon (the tests stub `docker inspect`'s output
+                      too, to exercise all three reuse/start/create
+                      paths). main.go's phase 0 (before phase 1's agent
+                      connects) calls Start, THEN os.Setenv's
                       CHORUS_HEADROOM_HOST_URL/_SANDBOX_URL — order
                       matters, since both {{ENV:...}} in spawn Args and
                       the new Spec.Env are resolved at spawn time, not

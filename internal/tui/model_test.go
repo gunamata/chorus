@@ -2077,6 +2077,34 @@ func TestModel_CtrlC_ClearsNonEmptyInputInsteadOfQuitting(t *testing.T) {
 	}
 }
 
+// TestModel_CtrlC_TakesInterruptBranchWhenBusy proves Ctrl+C checks
+// busy-state BEFORE input content, the key behavioral change from the
+// old clear-or-quit-only version. AgentWorker.Cancel needs a real
+// session.AgentSession (which needs a live ACP connection) — untestable
+// here the same way the rest of internal/session is (see
+// TestModel_InterruptBusyAgents_NoOpWhenNothingIsBusy's own comment for
+// the identical limitation on Esc). This test turns that limitation into
+// a positive signal instead of working around it: newWorker() leaves
+// sess nil, so recovering a panic FROM INSIDE AgentWorker.Cancel proves
+// execution actually reached the interrupt branch — not the
+// input-clearing branch, which would have returned cleanly with no
+// panic at all. If a future change reorders these checks back to
+// input-first, this test starts failing (no panic, because Cancel is
+// never reached) instead of silently passing on the wrong branch.
+func TestModel_CtrlC_TakesInterruptBranchWhenBusy(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("want a panic from AgentWorker.Cancel's nil test session, proving the busy-interrupt branch was reached — got none, so Ctrl+C took some other branch (input-clearing?) instead of checking busy state first")
+		}
+	}()
+	w := newWorker()
+	w.busy.Store(true)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": w}, policy.Routing{})
+	m.agentSpecs = []session.Spec{{Name: "claude"}}
+	m.input.SetValue("half-typed prompt") // must be ignored — busy wins regardless
+	m.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+}
+
 func TestModel_CtrlC_QuitsWhenInputAlreadyEmpty(t *testing.T) {
 	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
 

@@ -1,8 +1,19 @@
 // Package headroom optionally runs Headroom
 // (https://docs.headroomlabs.ai/docs) — a local compression proxy that
 // sits between an agent CLI and its LLM provider, shrinking tool
-// outputs/logs/JSON/code before the model sees them — as a chorus-managed
-// Docker container, for the lifetime of one chorus run.
+// outputs/logs/JSON/code before the model sees them — as a single,
+// long-lived Docker container shared across chorus runs, not spun up and
+// torn down with each one: Start reuses it if it's already running,
+// starts it (via `docker start`, not `docker run`) if it exists but is
+// stopped, and only `docker run`s a fresh one if it's never existed at
+// all. `--restart unless-stopped` (baked in at that first `docker run`)
+// makes it survive a Docker engine/Desktop restart on its own; a named
+// volume persists its savings/cache data (~/.headroom inside the
+// container) across recreation. chorus never stops it — Proxy has no
+// caller in main.go's normal run path that tears it down, deliberately,
+// so it keeps running (and keeps its provider-side prompt cache warm)
+// after chorus exits. Stop still exists for tests/manual cleanup, just
+// isn't wired into chorus's own shutdown.
 //
 // Deliberately containerized for BOTH non-sandboxed and sandboxed agents,
 // not just a bare `headroom proxy` host process: a single running
@@ -27,11 +38,10 @@ package headroom
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -84,9 +94,8 @@ const (
 )
 
 // EnabledOrDefault defaults to false when unset — same opt-in convention
-// as policy.Delegation/Compaction: this starts an extra Docker container
-// for the lifetime of every chorus run, not something to turn on by
-// silent default.
+// as policy.Delegation/Compaction: this starts (or reuses) a long-lived
+// Docker container, not something to turn on by silent default.
 func (c Config) EnabledOrDefault() bool {
 	return c.Enabled != nil && *c.Enabled
 }
@@ -183,72 +192,130 @@ const (
 	healthCheckInterval = 500 * time.Millisecond
 )
 
-// newContainerName generates a unique per-run container name
-// (chorus-headroom-<8 random hex chars>) — random rather than fixed, so
-// two concurrent chorus runs (different projects/terminals) each get
-// their own container instead of colliding on `docker run --name`, and
-// so a container left behind by an unclean shutdown doesn't block the
-// next run from starting a fresh one under the same name.
-func newContainerName() (string, error) {
-	b := make([]byte, 4)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
+// containerName/volumeName are fixed, not per-run — the whole point of
+// this package's "reuse, don't recreate, never stop" model (package doc
+// comment) is a single shared instance, so `docker run --name`/`-v` need
+// a stable target to find across chorus invocations, not a fresh random
+// one each time.
+const (
+	containerName = "chorus-headroom"
+	volumeName    = "chorus-headroom-data"
+)
+
+// inspectState reports whether name exists at all, and if so, whether
+// it's currently running — via `docker inspect`, not `docker ps`, since
+// inspect still finds a STOPPED container (ps needs -a for that, and
+// then distinguishing "stopped" from "never existed" from its output is
+// more parsing than `docker inspect`'s explicit "no such object" already
+// gives for free). exists is false (not an error) when the container has
+// simply never been created.
+func inspectState(ctx context.Context, name string) (exists, running bool, err error) {
+	out, err := runDocker(ctx, "inspect", "--format", "{{.State.Running}}", name)
+	if err != nil {
+		return false, false, nil
 	}
-	return "chorus-headroom-" + hex.EncodeToString(b), nil
+	return true, strings.TrimSpace(string(out)) == "true", nil
 }
 
-// Start runs Headroom's container and waits for it to answer health
-// checks before returning. The container's port is published on every
-// host interface (`-p {port}:8787`, not `-p 127.0.0.1:{port}:8787`) —
-// deliberately, not an oversight: on Linux, Rancher Desktop's containers
-// reach the host over a real docker bridge interface, which does NOT
-// reach a 127.0.0.1-only-bound host port (unlike Docker Desktop's
-// macOS/Windows VM-proxied networking, which typically does) — so
-// binding to loopback-only would silently break SANDBOXED agent
-// reachability specifically on Linux. This is a real security tradeoff
-// (the proxy becomes reachable from any local process, and depending on
-// Rancher Desktop's VM networking possibly the LAN — see README) accepted
-// so one running container serves both modes uniformly; not something
-// chorus can make purely safe from the Go side alone. On failure, any
-// partially-started container is removed before returning the error.
+// Start ensures Headroom's container is running and waits for it to
+// answer health checks before returning:
+//   - already running -> reused as-is, no docker command needed.
+//   - exists but stopped (e.g. after a host reboot on a Docker Engine
+//     without `--restart` support, or a manual `docker stop`) -> `docker
+//     start`, which preserves its original --restart policy/volume/port.
+//   - never existed -> `docker run` with `--restart unless-stopped` (so a
+//     future Docker engine restart brings it back on its own) and a
+//     named volume mounted at the image's own state directory (so
+//     savings/cache data survives being recreated). Two chorus sessions
+//     racing to create it both take this branch; the `docker run` loser
+//     sees a name-conflict error, which is treated as success (reuse the
+//     winner's container) rather than a failure — see the inline comment
+//     at that check.
+//
+// The container's port is published on every host interface (`-p
+// {port}:8787`, not `-p 127.0.0.1:{port}:8787`) — deliberately, not an
+// oversight: on Linux, Rancher Desktop's containers reach the host over a
+// real docker bridge interface, which does NOT reach a
+// 127.0.0.1-only-bound host port (unlike Docker Desktop's macOS/Windows
+// VM-proxied networking, which typically does) — so binding to
+// loopback-only would silently break SANDBOXED agent reachability
+// specifically on Linux. This is a real security tradeoff (the proxy
+// becomes reachable from any local process, and depending on Rancher
+// Desktop's VM networking possibly the LAN — see README) accepted so one
+// running container serves both modes uniformly; not something chorus
+// can make purely safe from the Go side alone. On failure of a FRESH
+// `docker run` specifically, the partially-started container is removed
+// so the next attempt isn't blocked by a broken container occupying
+// containerName — a reused (already-existing) container is left alone on
+// a health-check failure, since chorus didn't create it this run and
+// removing someone's pre-existing container over a possibly-transient
+// timeout is too destructive a default.
 func Start(ctx context.Context, cfg Config) (*Proxy, error) {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return nil, fmt.Errorf("headroom.enabled is true but no \"docker\" executable was found on PATH: %w", err)
 	}
-	name, err := newContainerName()
-	if err != nil {
-		return nil, fmt.Errorf("generate headroom container name: %w", err)
-	}
 	port := cfg.PortOrDefault()
+	p := &Proxy{containerName: containerName, port: port}
 
-	args := []string{"run", "-d", "--name", name,
-		"-p", fmt.Sprintf("%d:8787", port),
-		"-e", "HEADROOM_HOST=0.0.0.0",
-		"-e", "HEADROOM_PORT=8787",
-		"-e", "HEADROOM_MODE=" + cfg.ModeOrDefault(),
-	}
-	for _, v := range providerKeyEnvVars {
-		args = append(args, "-e", v)
-	}
-	// No trailing command: the image's own ENTRYPOINT is already
-	// `python3 -m headroom.cli proxy` with a default CMD of `--host
-	// 0.0.0.0 --port 8787` — CONFIRMED LIVE (2026-09) that appending an
-	// explicit "headroom proxy --host ... --port ..." command here (an
-	// earlier version of this code did) breaks startup outright: the
-	// image's own CLI parser sees that as extra positional arguments
-	// after its own already-complete default CMD and exits immediately
-	// ("Error: Got unexpected extra arguments (headroom proxy)"). The -e
-	// HEADROOM_HOST/HEADROOM_PORT above are enough on their own.
-	args = append(args, cfg.ImageOrDefault())
-
-	if out, err := runDocker(ctx, args...); err != nil {
-		return nil, fmt.Errorf("docker run (headroom): %w: %s", err, out)
+	exists, running, err := inspectState(ctx, containerName)
+	if err != nil {
+		return nil, fmt.Errorf("inspect headroom container: %w", err)
 	}
 
-	p := &Proxy{containerName: name, port: port}
+	freshlyCreated := false
+	switch {
+	case running:
+		// Nothing to do — reuse it as-is.
+	case exists:
+		if out, err := runDocker(ctx, "start", containerName); err != nil {
+			return nil, fmt.Errorf("docker start (headroom): %w: %s", err, out)
+		}
+	default:
+		freshlyCreated = true
+		args := []string{"run", "-d", "--name", containerName,
+			"--restart", "unless-stopped",
+			"-p", fmt.Sprintf("%d:8787", port),
+			"-v", volumeName + ":/home/nonroot/.headroom",
+			"-e", "HEADROOM_HOST=0.0.0.0",
+			"-e", "HEADROOM_PORT=8787",
+			"-e", "HEADROOM_MODE=" + cfg.ModeOrDefault(),
+		}
+		for _, v := range providerKeyEnvVars {
+			args = append(args, "-e", v)
+		}
+		// No trailing command: the image's own ENTRYPOINT is already
+		// `python3 -m headroom.cli proxy` with a default CMD of `--host
+		// 0.0.0.0 --port 8787` — CONFIRMED LIVE (2026-09) that appending
+		// an explicit "headroom proxy --host ... --port ..." command
+		// here (an earlier version of this code did) breaks startup
+		// outright: the image's own CLI parser sees that as extra
+		// positional arguments after its own already-complete default
+		// CMD and exits immediately ("Error: Got unexpected extra
+		// arguments (headroom proxy)"). The -e HEADROOM_HOST/
+		// HEADROOM_PORT above are enough on their own.
+		args = append(args, cfg.ImageOrDefault())
+
+		if out, err := runDocker(ctx, args...); err != nil {
+			// Two chorus sessions starting within the same window both
+			// see "not running" and both try to create it — CONFIRMED
+			// LIVE (2026-09, two real concurrent `docker run`s) that the
+			// loser gets back "Conflict... already in use by container
+			// ...", not a hang or a corrupted state. Docker's own --name
+			// uniqueness is already the lock; the loser just needs to
+			// stop treating this as an error and reuse what the winner
+			// created, same as the "exists but stopped" path above.
+			if !strings.Contains(string(out), "already in use") {
+				return nil, fmt.Errorf("docker run (headroom): %w: %s", err, out)
+			}
+			freshlyCreated = false
+		}
+	}
+
 	if err := waitHealthy(ctx, p.HostURL()); err != nil {
-		_, _ = runDocker(context.Background(), "rm", "-f", name)
-		return nil, fmt.Errorf("headroom container started but never became healthy: %w", err)
+		if freshlyCreated {
+			_, _ = runDocker(context.Background(), "rm", "-f", containerName)
+		}
+		return nil, fmt.Errorf("headroom container never became healthy: %w", err)
 	}
 	return p, nil
 }
@@ -284,16 +351,15 @@ func waitHealthy(ctx context.Context, baseURL string) error {
 	return fmt.Errorf("timed out after %s: %w", startTimeout, lastErr)
 }
 
-// stopTimeout bounds Stop's own docker call — deliberately NOT tied to
-// the caller's ctx: Stop is expected to run from a deferred cleanup path
-// during shutdown, when the run's own context may already be cancelled
-// (e.g. Ctrl+C), and cleanup should still get a real chance to run rather
-// than being aborted by the same cancellation that triggered it.
+// stopTimeout bounds Stop's own docker call — deliberately not tied to a
+// caller's ctx, which may already be cancelled by the time cleanup runs.
 const stopTimeout = 10 * time.Second
 
-// Stop removes the container. Safe to call on a Proxy whose container
-// already exited on its own (`docker rm -f` on an already-stopped
-// container is not an error).
+// Stop removes the container. NOT called anywhere in chorus's own normal
+// run path (package doc comment: Headroom is meant to keep running after
+// chorus exits) — exists for tests and manual cleanup only. Safe to call
+// on a Proxy whose container already exited on its own (`docker rm -f`
+// on an already-stopped container is not an error).
 func (p *Proxy) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), stopTimeout)
 	defer cancel()

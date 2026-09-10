@@ -15,27 +15,33 @@ import (
 	"time"
 )
 
-// TestLive_StartAndStop exercises the REAL Start/Stop code path (not the
-// stubbed runDocker used by the rest of this package's tests) against a
-// real docker daemon and the real published image — the only way to catch
-// a bug like the one live testing found here (2026-09): an earlier
-// version appended an explicit "headroom proxy --host ... --port ..."
-// command that collided with the image's own complete default CMD and
-// made the container exit immediately, which no stubbed-docker unit test
-// could ever have caught.
-func TestLive_StartAndStop(t *testing.T) {
+// TestLive_StartIsIdempotentAndReachable exercises the REAL Start code
+// path (not the stubbed runDocker used by the rest of this package's
+// tests) against a real docker daemon and the real published image — the
+// only way to catch a bug like the one live testing found here (2026-09):
+// an earlier version appended an explicit "headroom proxy --host ...
+// --port ..." command that collided with the image's own complete
+// default CMD and made the container exit immediately, which no
+// stubbed-docker unit test could ever have caught.
+//
+// Deliberately does NOT call Stop(): chorus's own product code never
+// does either (package doc comment — Headroom is meant to keep running,
+// reused across runs, not torn down with each one), so this test leaves
+// the real "chorus-headroom" container running afterward, same as a real
+// chorus session would. Calling Start() a second time is the actual
+// regression test for "reuse if already running" — it should be fast
+// (no new docker run/start needed) and return a working Proxy either way.
+func TestLive_StartIsIdempotentAndReachable(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
+	if _, err := Start(ctx, Config{}); err != nil {
+		t.Fatalf("Start() (first call) error = %v", err)
+	}
 	p, err := Start(ctx, Config{})
 	if err != nil {
-		t.Fatalf("Start() error = %v", err)
+		t.Fatalf("Start() (second call, should reuse) error = %v", err)
 	}
-	defer func() {
-		if err := p.Stop(); err != nil {
-			t.Errorf("Stop() error = %v", err)
-		}
-	}()
 
 	resp, err := http.Get(p.HostURL() + "/stats")
 	if err != nil {

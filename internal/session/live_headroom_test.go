@@ -67,15 +67,14 @@ func TestLive_ClaudeThroughHeadroom(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
 	defer cancel()
 
+	// Deliberately never stopped afterward — matches chorus's own product
+	// behavior (internal/headroom's package doc comment): Headroom is
+	// meant to keep running, reused across runs, not torn down with this
+	// one.
 	proxy, err := headroom.Start(ctx, headroom.Config{})
 	if err != nil {
 		t.Fatalf("headroom.Start() error = %v", err)
 	}
-	defer func() {
-		if err := proxy.Stop(); err != nil {
-			t.Errorf("proxy.Stop() error = %v", err)
-		}
-	}()
 
 	cwd, err := os.MkdirTemp("", "chorus-headroom-live-*")
 	if err != nil {

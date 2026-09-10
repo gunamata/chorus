@@ -2,6 +2,7 @@ package headroom
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -84,21 +85,44 @@ func stubDocker(t *testing.T, fn func(args []string) ([]byte, error)) *[][]strin
 	return &calls
 }
 
-func TestStart_BuildsExpectedDockerRunArgs(t *testing.T) {
-	// A fake HTTP server standing in for the health check — Start's own
-	// docker-run call is stubbed to a no-op success, but waitHealthy makes
-	// a real HTTP request, so it needs somewhere real to hit. Since Start
-	// itself picks the URL from cfg.PortOrDefault(), point the config at
-	// this test server's actual port.
+// dockerStub is stubDocker configured to answer `docker inspect` the way
+// a container in a given state would — Start() now issues an inspect
+// call FIRST to decide whether it needs `run`, `start`, or nothing at
+// all, so exercising each of those three paths means controlling what
+// inspect reports. Every OTHER subcommand (run/start/rm) just succeeds
+// with no output, same as the old always-succeed stub.
+func dockerStub(t *testing.T, exists, running bool) *[][]string {
+	t.Helper()
+	return stubDocker(t, func(args []string) ([]byte, error) {
+		if args[0] == "inspect" {
+			if !exists {
+				return nil, errors.New("Error: No such object: " + args[len(args)-1])
+			}
+			if running {
+				return []byte("true\n"), nil
+			}
+			return []byte("false\n"), nil
+		}
+		return nil, nil
+	})
+}
+
+// healthyServer stands in for the health check — waitHealthy makes a
+// real HTTP request regardless of how docker itself is stubbed, so every
+// Start() test needs somewhere real to hit; Start picks the URL from
+// cfg.PortOrDefault(), so callers point Config at this server's actual port.
+func healthyServer(t *testing.T) (port int) {
+	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
-	defer srv.Close()
-	port := serverPort(t, srv.URL)
+	t.Cleanup(srv.Close)
+	return serverPort(t, srv.URL)
+}
 
-	calls := stubDocker(t, func(args []string) ([]byte, error) {
-		return nil, nil
-	})
+func TestStart_CreatesFreshContainerWhenNoneExists(t *testing.T) {
+	port := healthyServer(t)
+	calls := dockerStub(t, false, false)
 
 	cfg := Config{Port: port, Image: "custom/headroom:tag", Mode: "token"}
 	p, err := Start(context.Background(), cfg)
@@ -109,14 +133,19 @@ func TestStart_BuildsExpectedDockerRunArgs(t *testing.T) {
 		t.Fatalf("p.port = %d, want %d", p.port, port)
 	}
 
-	if len(*calls) != 1 {
-		t.Fatalf("runDocker called %d times, want exactly 1 (the docker run)", len(*calls))
+	if len(*calls) != 2 {
+		t.Fatalf("runDocker called %d times, want 2 (inspect, then run): %v", len(*calls), *calls)
 	}
-	callArgs := (*calls)[0]
-	got := strings.Join(callArgs, " ")
+	if (*calls)[0][0] != "inspect" {
+		t.Fatalf("first call = %v, want an inspect", (*calls)[0])
+	}
+	runArgs := (*calls)[1]
+	got := strings.Join(runArgs, " ")
 	for _, want := range []string{
-		"run -d --name chorus-headroom-",
+		"run -d --name chorus-headroom",
+		"--restart unless-stopped",
 		"-p " + strconv.Itoa(port) + ":8787",
+		"-v chorus-headroom-data:/home/nonroot/.headroom",
 		"-e HEADROOM_MODE=token",
 		"-e ANTHROPIC_API_KEY",
 	} {
@@ -132,33 +161,94 @@ func TestStart_BuildsExpectedDockerRunArgs(t *testing.T) {
 	// to that already-complete command and make the container exit
 	// immediately on a real docker daemon (a scenario this stubbed test
 	// can't itself detect, since runDocker never really runs).
-	if got := callArgs[len(callArgs)-1]; got != "custom/headroom:tag" {
+	if got := runArgs[len(runArgs)-1]; got != "custom/headroom:tag" {
 		t.Fatalf("last docker run arg = %q, want the image name with nothing appended after it", got)
 	}
 }
 
-func TestStart_RemovesContainerOnHealthCheckFailure(t *testing.T) {
-	// No server listening on this port at all — waitHealthy must time out.
-	// Use a short startTimeout override via a cancelled-shortly context
-	// instead of waiting the real 30s.
+func TestStart_TreatsRunNameConflictAsSuccess(t *testing.T) {
+	// Simulates losing the create race against a concurrent chorus
+	// session: inspect says "not exists" (checked before either session's
+	// docker run lands), but by the time THIS run executes, the other
+	// session has already created it — docker's real error in that case.
+	port := healthyServer(t)
 	calls := stubDocker(t, func(args []string) ([]byte, error) {
+		switch args[0] {
+		case "inspect":
+			return nil, errors.New("no such object")
+		case "run":
+			return []byte(`docker: Error response from daemon: Conflict. The container name "/chorus-headroom" is already in use by container "abc123".`),
+				errors.New("exit status 125")
+		}
 		return nil, nil
 	})
+
+	if _, err := Start(context.Background(), Config{Port: port}); err != nil {
+		t.Fatalf("Start() error = %v, want the name conflict treated as success (reuse the winner)", err)
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("runDocker called %d times, want 2 (inspect, run): %v", len(*calls), *calls)
+	}
+}
+
+func TestStart_ReusesAlreadyRunningContainer(t *testing.T) {
+	port := healthyServer(t)
+	calls := dockerStub(t, true, true)
+
+	if _, err := Start(context.Background(), Config{Port: port}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(*calls) != 1 || (*calls)[0][0] != "inspect" {
+		t.Fatalf("runDocker calls = %v, want exactly one inspect and nothing else — an already-running container needs no docker run/start", *calls)
+	}
+}
+
+func TestStart_StartsExistingStoppedContainer(t *testing.T) {
+	port := healthyServer(t)
+	calls := dockerStub(t, true, false)
+
+	if _, err := Start(context.Background(), Config{Port: port}); err != nil {
+		t.Fatalf("Start() error = %v", err)
+	}
+	if len(*calls) != 2 || (*calls)[1][0] != "start" {
+		t.Fatalf("runDocker calls = %v, want inspect then \"docker start\" (not \"run\") for an existing-but-stopped container", *calls)
+	}
+}
+
+func TestStart_RemovesFreshContainerOnHealthCheckFailure(t *testing.T) {
+	calls := dockerStub(t, false, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // already cancelled — waitHealthy's ctx.Done() case fires immediately
 
-	cfg := Config{Port: 1} // nothing listens on port 1
-	_, err := Start(ctx, cfg)
+	_, err := Start(ctx, Config{Port: 1}) // nothing listens on port 1
 	if err == nil {
 		t.Fatal("Start() with an immediately-cancelled context and nothing listening = nil error, want a health-check failure")
 	}
-
-	if len(*calls) != 2 {
-		t.Fatalf("runDocker called %d times, want 2 (the failed run's cleanup rm -f in addition to the initial run)", len(*calls))
+	if len(*calls) != 3 {
+		t.Fatalf("runDocker called %d times, want 3 (inspect, run, cleanup rm -f): %v", len(*calls), *calls)
 	}
-	if (*calls)[1][0] != "rm" {
-		t.Fatalf("second runDocker call = %v, want a cleanup \"rm -f\"", (*calls)[1])
+	if (*calls)[2][0] != "rm" {
+		t.Fatalf("third runDocker call = %v, want a cleanup \"rm -f\"", (*calls)[2])
+	}
+}
+
+func TestStart_DoesNotRemoveReusedContainerOnHealthCheckFailure(t *testing.T) {
+	// Already running, per inspect — but nothing actually listens on port
+	// 1, so the health check still fails. Since Start didn't create this
+	// container itself, it must NOT rm -f someone else's container over
+	// what could just be a transient timeout.
+	calls := dockerStub(t, true, true)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := Start(ctx, Config{Port: 1})
+	if err == nil {
+		t.Fatal("Start() with nothing listening = nil error, want a health-check failure")
+	}
+	if len(*calls) != 1 || (*calls)[0][0] != "inspect" {
+		t.Fatalf("runDocker calls = %v, want only the inspect — no rm -f on a reused container", *calls)
 	}
 }
 

@@ -133,6 +133,23 @@ $env:CHORUS_AGENTS = "https://gist.githubusercontent.com/you/id/raw/agents.yaml"
 irm https://raw.githubusercontent.com/gunamata/chorus/main/install.ps1 | iex
 ```
 
+**Uninstall** with the matching `uninstall.sh`/`uninstall.ps1` (same repo
+path, same `CHORUS_INSTALL_DIR`/`CHORUS_HOME` overrides). By default only
+the binary (and, on Windows, its PATH entry) is removed — your
+`agents.yaml`, session history, and any `chorus-headroom` Docker
+container/volume ([Headroom compression
+proxy](#headroom-compression-proxy-agentsyaml)) are left alone. Add
+`CHORUS_UNINSTALL_PURGE=1` (`$env:CHORUS_UNINSTALL_PURGE = "1"` on
+Windows) for a full wipe of all of it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gunamata/chorus/main/uninstall.sh | sh
+```
+
+```powershell
+irm https://raw.githubusercontent.com/gunamata/chorus/main/uninstall.ps1 | iex
+```
+
 ## Build
 
 ```sh
@@ -270,18 +287,20 @@ That first line — `[claude] fix the login bug in auth.py` — is chorus echoin
 - **`Esc` interrupts the current turn** without ending the session —
   sends ACP's own `session/cancel` for whichever agent you're most
   likely watching (the one most recently dispatched, if it's still
-  busy; otherwise every currently-busy agent), so a wrong or overly
-  long request doesn't force you to kill the whole program the way
-  `ctrl+c` does. The busy-status line above the input box shows
-  "(esc to interrupt)" whenever it's actually actionable.
-- `quit` / `exit` cleanly end every session, kill the subprocesses, and
-  restore your terminal (leaves the alt-screen, cursor visible). `ctrl+c`
-  does too, but only once the input box is already empty — the first
-  `ctrl+c` with a non-empty draft just clears it instead of quitting
-  outright, so an instinctive "clear what I typed" keystroke can't
-  accidentally kill every connected agent's session at once. Unlike
-  `Esc`, quitting ends every agent's session at once — reach for `Esc`
-  first if you only want to stop one running turn.
+  busy; otherwise every currently-busy agent). The busy-status line
+  above the input box shows "(esc to interrupt)" whenever it's actually
+  actionable.
+- **`ctrl+c` interrupts EVERY currently-busy agent**, not just the one
+  Esc would narrow to — a broader "stop everything running right now,"
+  and the input box is left exactly as typed either way (nothing is
+  cleared while something's still busy). Only once nothing is running
+  does `ctrl+c` fall back to acting on the input box: the first press
+  with a non-empty draft clears it, and only once the input is already
+  empty does a `ctrl+c` press quit — cleanly ending every session and
+  restoring your terminal (leaves the alt-screen, cursor visible), same
+  as typing `quit`/`exit`. That two-step (clear, then quit) means an
+  instinctive "clear what I typed" keystroke can't accidentally kill
+  every connected agent's session in one press.
 - **A turn finishing while the terminal is unfocused rings the terminal
   bell** (`\a`). Silent while focused; nothing to configure (a
   terminal that doesn't report focus at all just never triggers it,
@@ -911,11 +930,27 @@ registry](#agent-registry-agentsyaml)) instead of the default
 Opt-in integration with [Headroom](https://docs.headroomlabs.ai/docs), a
 local compression proxy that sits between an agent CLI and its LLM
 provider, shrinking tool outputs/logs/JSON/code before the model sees
-them. chorus doesn't compress anything itself — enabling this starts a
-Headroom container for the life of the run, and each agent that opts in
-redirects its own provider API calls through it via that agent's own
-base-URL environment variable (e.g. `ANTHROPIC_BASE_URL` for Claude
-Code). Off by default.
+them. chorus doesn't compress anything itself — enabling this starts (or
+reuses) **one long-lived Docker container shared across every chorus run**,
+not a fresh one per run, and each agent that opts in redirects its own
+provider API calls through it via that agent's own base-URL environment
+variable (e.g. `ANTHROPIC_BASE_URL` for Claude Code). Off by default.
+
+The container is deliberately treated as persistent infrastructure, not
+something chorus owns the lifecycle of end-to-end:
+- **Reused, not recreated** — chorus checks whether `chorus-headroom` is
+  already running before doing anything; if so, no `docker` command runs
+  at all. If it exists but is stopped, chorus runs `docker start`
+  (preserving its restart policy/volume/port); only a container that's
+  never existed gets a fresh `docker run`.
+- **`--restart unless-stopped`** — survives a Docker engine/Desktop
+  restart on its own.
+- **A named volume** (`chorus-headroom-data`, mounted at the image's own
+  state directory) persists its savings/cache data across recreation.
+- **chorus never stops it** — not on `quit`, not on Ctrl+C, not on a
+  crash. It's meant to keep running (and keep its provider-side prompt
+  cache warm) independently of any one chorus session. Stop it yourself
+  with `docker rm -f chorus-headroom` if you ever want to.
 
 ```yaml
 headroom:
@@ -925,11 +960,10 @@ headroom:
   # mode: cache                                              # cache | token
 ```
 
-When enabled, chorus starts one Docker container for the whole run (the
-**containerized** Headroom image, `ghcr.io/headroomlabs-ai/headroom`,
-not a bare `headroom` binary on your PATH — nothing else to install)
-and sets two environment variables in its own process, before any agent
-is spawned, for `agents.yaml` to reference via chorus's existing
+This is the **containerized** Headroom image (`ghcr.io/headroomlabs-ai/headroom`)
+— not a bare `headroom` binary on your PATH, nothing else to install.
+Before any agent is spawned, chorus sets two environment variables in
+its own process for `agents.yaml` to reference via chorus's existing
 `{{ENV:NAME}}` substitution:
 
 **Default image tag is `code-nonroot`, not `latest`.** Headroom

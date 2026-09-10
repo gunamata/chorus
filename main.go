@@ -134,15 +134,17 @@ func run(resume bool, agentsOverride string) error {
 	// delegation/compaction.
 	if cfg.Headroom.EnabledOrDefault() {
 		fmt.Println("starting headroom compression proxy...")
+		// headroom.Start reuses an already-running (or stopped-but-
+		// existing) container rather than always creating a fresh one,
+		// and chorus never stops it here — see internal/headroom's
+		// package doc comment: it's meant to keep running (restart
+		// policy survives a Docker engine restart, a named volume
+		// persists its data) across chorus runs, not be torn down with
+		// this one.
 		proxy, err := headroom.Start(ctx, cfg.Headroom)
 		if err != nil {
 			return fmt.Errorf("start headroom proxy: %w", err)
 		}
-		defer func() {
-			if err := proxy.Stop(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: failed to stop headroom container: %v\n", err)
-			}
-		}()
 		// Two separate values, not one — a non-sandboxed agent subprocess
 		// and a SANDBOXED agent's own `docker run` container reach this
 		// same proxy over different network paths (headroom.Proxy.HostURL/
