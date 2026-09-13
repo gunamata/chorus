@@ -1835,6 +1835,40 @@ func TestModel_HandleMouse_WheelEventsStillReachViewport(t *testing.T) {
 	}
 }
 
+func TestModel_HandleMouse_DragAtBottomEdgeAutoScrollsAndExtendsSelection(t *testing.T) {
+	got := stubClipboard(t, nil)
+	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})
+	for i := 0; i < 30; i++ {
+		m.appendLine(fmt.Sprintf("line %d\n", i))
+	}
+	m.syncViewport()
+	m.viewport.GotoTop()
+	bottomRow := m.viewport.Height - 1
+
+	updated, _ := m.handleMouse(tea.MouseMsg{Y: 0, Button: tea.MouseButtonLeft, Action: tea.MouseActionPress})
+	m = updated.(Model)
+
+	// Holding the drag at the viewport's bottom-most row (as far down as a
+	// real mouse can go) must keep scrolling and extending the selection
+	// past whatever was on screen when the drag started, not get stuck.
+	for i := 0; i < bottomRow+3; i++ {
+		updated, _ = m.handleMouse(tea.MouseMsg{Y: bottomRow, Button: tea.MouseButtonLeft, Action: tea.MouseActionMotion})
+		m = updated.(Model)
+	}
+	if m.viewport.YOffset == 0 {
+		t.Fatal("YOffset unchanged after dragging at the bottom edge, want the viewport to auto-scroll")
+	}
+	if m.selectCurLine < bottomRow+1 {
+		t.Fatalf("selectCurLine = %d, want it to extend past the initial viewport height (%d)", m.selectCurLine, bottomRow)
+	}
+
+	updated, _ = m.handleMouse(tea.MouseMsg{Y: bottomRow, Button: tea.MouseButtonLeft, Action: tea.MouseActionRelease})
+	m = updated.(Model)
+	if !strings.Contains(*got, "line 29") {
+		t.Fatalf("clipboard = %q, want it to include content beyond the first screenful (line 29)", *got)
+	}
+}
+
 func TestModel_CopySelection_ClipboardErrorSetsStatusInsteadOfPanicking(t *testing.T) {
 	stubClipboard(t, fmt.Errorf("no clipboard utility found"))
 	m := newTestModel(t, map[string]*AgentWorker{"claude": newWorker()}, policy.Routing{})

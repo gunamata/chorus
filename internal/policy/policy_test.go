@@ -161,6 +161,21 @@ func TestRouting_DecisionTimeout_DefaultsWhenUnsetOrNonPositive(t *testing.T) {
 	}
 }
 
+func TestRouting_AnonymizeOrDefault_DefaultsTrue(t *testing.T) {
+	var r Routing
+	if !r.AnonymizeOrDefault() {
+		t.Fatal("AnonymizeOrDefault() = false, want true when Anonymize is unset")
+	}
+	r.Anonymize = boolPtr(false)
+	if r.AnonymizeOrDefault() {
+		t.Fatal("AnonymizeOrDefault() = true, want false when explicitly disabled")
+	}
+	r.Anonymize = boolPtr(true)
+	if !r.AnonymizeOrDefault() {
+		t.Fatal("AnonymizeOrDefault() = false, want true when explicitly enabled")
+	}
+}
+
 // --- Policy (auto_allow / auto_allow_tools) ---------------------------
 
 func TestPolicy_AutoAllow(t *testing.T) {

@@ -417,7 +417,7 @@ func New(cfg Config) Model {
 	ta.FocusedStyle.Prompt = promptStyle
 	ta.BlurredStyle.Prompt = promptStyle
 	ta.ShowLineNumbers = false
-	ta.Placeholder = `<agent>: text, a bare prompt to auto-route, /name ..., or !cmd to run directly — try "commands" (ctrl+j for a new line)`
+	ta.Placeholder = `<agent>: text, a bare prompt to auto-route, /name ..., or !cmd to run directly — try "commands" (ctrl+j for a new line, click+drag to select & copy, ctrl+v to paste)`
 	ta.KeyMap = inputKeyMap
 	ta.CharLimit = 0
 	ta.SetHeight(inputHeight)
@@ -818,6 +818,18 @@ func (m Model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 
 		case tea.MouseActionMotion:
 			if m.selecting {
+				// A drag can't move the pointer past the terminal's own top/
+				// bottom row, so without this a selection could never reach
+				// content outside whatever was on screen when the drag
+				// started — scroll one line per motion event at the edge,
+				// same as the auto-scroll-while-dragging behavior standard
+				// editors/browsers use.
+				switch {
+				case msg.Y <= 0 && !m.viewport.AtTop():
+					m.viewport.ScrollUp(1)
+				case msg.Y >= m.viewport.Height-1 && !m.viewport.AtBottom():
+					m.viewport.ScrollDown(1)
+				}
 				m.selectCurLine = m.viewport.YOffset + clampInt(msg.Y, 0, m.viewport.Height-1)
 				m.syncViewport()
 			}
@@ -1975,7 +1987,7 @@ func (m Model) startRouteDecision(text string) (tea.Model, tea.Cmd) {
 	// Connection.Cwd's doc comment: passing m.cwd silently broke every
 	// routing decision to a containerized decision agent (session/new
 	// accepts the bad cwd, then session/prompt fails "-32603").
-	return m, runRouteDecision(m.ctx, conn, m.coll, conn.Cwd(), agents, m.defaultAgent, contextText, text, reqID, m.routing.DecisionTimeout())
+	return m, runRouteDecision(m.ctx, conn, m.coll, conn.Cwd(), agents, m.defaultAgent, contextText, text, m.routing.AnonymizeOrDefault(), reqID, m.routing.DecisionTimeout())
 }
 
 // handleRouteDecision resolves a routeDecisionMsg: picks the target agent

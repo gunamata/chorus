@@ -18,7 +18,7 @@ func testAgents() []DecisionAgentInfo {
 }
 
 func TestBuildDecisionPrompt_MentionsAgentsModelsAndPrompt(t *testing.T) {
-	p := BuildDecisionPrompt(testAgents(), "opencode", "claude did X earlier", "now do Y")
+	p := BuildDecisionPrompt(testAgents(), "opencode", "claude did X earlier", "now do Y", false)
 	for _, want := range []string{
 		"automated routing-decision request from chorus itself",
 		"not a message from the user",
@@ -35,9 +35,26 @@ func TestBuildDecisionPrompt_MentionsAgentsModelsAndPrompt(t *testing.T) {
 }
 
 func TestBuildDecisionPrompt_OmitsContextSectionWhenEmpty(t *testing.T) {
-	p := BuildDecisionPrompt(testAgents(), "opencode", "", "hello")
+	p := BuildDecisionPrompt(testAgents(), "opencode", "", "hello", false)
 	if strings.Contains(p, "Recent activity") {
 		t.Fatalf("BuildDecisionPrompt() with empty contextText still included a context section:\n%s", p)
+	}
+}
+
+func TestBuildDecisionPrompt_AnonymizesPromptAndContextWhenTrue(t *testing.T) {
+	p := BuildDecisionPrompt(testAgents(), "opencode", "earlier I asked about jane.doe@example.com", "email me at jane.doe@example.com", true)
+	if strings.Contains(p, "jane.doe@example.com") {
+		t.Fatalf("BuildDecisionPrompt(anonymize=true) still contains the raw email:\n%s", p)
+	}
+	if !strings.Contains(p, "[redacted-email]") {
+		t.Fatalf("BuildDecisionPrompt(anonymize=true) missing [redacted-email]:\n%s", p)
+	}
+}
+
+func TestBuildDecisionPrompt_LeavesSensitiveTextAloneWhenFalse(t *testing.T) {
+	p := BuildDecisionPrompt(testAgents(), "opencode", "", "email me at jane.doe@example.com", false)
+	if !strings.Contains(p, "jane.doe@example.com") {
+		t.Fatalf("BuildDecisionPrompt(anonymize=false) redacted the prompt, want it untouched:\n%s", p)
 	}
 }
 

@@ -562,7 +562,7 @@ func decisionAgentInfos(specs []session.Spec, workers map[string]*AgentWorker) [
 // the router indefinitely — the timeout is just another failure path
 // that falls back to the default agent, same as a parse failure; it just
 // needs to be generous enough not to fire on ordinary slowness.
-func runRouteDecision(ctx context.Context, conn *session.Connection, coll *delegate.Collectors, cwd string, agents []router.DecisionAgentInfo, defaultAgent, contextText, userPrompt string, reqID int, timeout time.Duration) tea.Cmd {
+func runRouteDecision(ctx context.Context, conn *session.Connection, coll *delegate.Collectors, cwd string, agents []router.DecisionAgentInfo, defaultAgent, contextText, userPrompt string, anonymize bool, reqID int, timeout time.Duration) tea.Cmd {
 	return func() tea.Msg {
 		cctx, cancel := context.WithTimeout(ctx, timeout)
 		defer cancel()
@@ -580,7 +580,7 @@ func runRouteDecision(ctx context.Context, conn *session.Connection, coll *deleg
 			return routeDecisionMsg{reqID: reqID, prompt: userPrompt, err: fmt.Errorf("opening decision sub-session: %w", err)}
 		}
 		coll.Register(sub.SessionID)
-		promptText := router.BuildDecisionPrompt(agents, defaultAgent, contextText, userPrompt)
+		promptText := router.BuildDecisionPrompt(agents, defaultAgent, contextText, userPrompt, anonymize)
 		promptErr := sub.Prompt(cctx, promptText)
 		reply := coll.Collect(sub.SessionID)
 		if promptErr != nil {

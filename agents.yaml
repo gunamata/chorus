@@ -74,11 +74,20 @@ compaction:
 # problem. Lower this if your decision_agent is fast/reliable and you'd
 # rather fail fast; raise it further if you see intermittent
 # "decision failed" fallbacks with an empty raw reply.
+#
+# anonymize: redacts obvious sensitive patterns (emails, IPv4 addresses,
+# API-key/token-shaped strings) out of the prompt and context_level
+# activity before they're sent to decision_agent — decision_agent is
+# picked for routing cost/capability reasons, not necessarily one you'd
+# otherwise trust with the raw prompt. Defaults to true when unset; set
+# false to send it unredacted (e.g. if redaction is mangling legitimate
+# content and hurting routing accuracy).
 routing:
   mode: llm
   decision_agent: opencode
   context_level: digest
   decision_timeout_seconds: 60
+  anonymize: true
 
 # headroom: optional chorus-managed Headroom compression proxy container
 # (https://docs.headroomlabs.ai/docs) — see README's "Headroom

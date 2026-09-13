@@ -85,6 +85,24 @@ type Routing struct {
 	// a real problem. A fast, reliable decision agent can set this lower
 	// to fail faster instead.
 	DecisionTimeoutSeconds int `yaml:"decision_timeout_seconds"`
+	// Anonymize controls whether the text built for DecisionAgent (the
+	// prompt being routed, plus ContextLevel's activity digest) has
+	// obvious sensitive patterns — emails, IPv4 addresses, API-key/token-
+	// shaped strings — redacted first (internal/router's anonymize.go).
+	// Defaults to true when unset: the decision agent is picked for
+	// routing cost/capability reasons, not necessarily one the user would
+	// otherwise trust with the raw prompt, so redact-by-default is the
+	// safer failure mode. Only ever applies to the hidden routing-decision
+	// prompt — never to what's actually sent to the agent that handles
+	// the real work.
+	Anonymize *bool `yaml:"anonymize"`
+}
+
+// AnonymizeOrDefault reports whether the routing-decision prompt should be
+// redacted before being sent to DecisionAgent. Defaults to true when
+// unset — same opt-out (not opt-in) convention as Delegation.BriefingEnabled.
+func (r Routing) AnonymizeOrDefault() bool {
+	return r.Anonymize == nil || *r.Anonymize
 }
 
 // defaultDecisionTimeoutSeconds is used when DecisionTimeoutSeconds is

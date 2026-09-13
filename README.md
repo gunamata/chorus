@@ -559,6 +559,7 @@ routing:
   mode: off           # off | llm — see Routing below
   decision_agent: opencode
   context_level: digest
+  anonymize: true     # redact emails/IPs/tokens before the decision agent sees them — see Routing below
 
 headroom:
   enabled: false      # off by default — see Headroom compression proxy below
@@ -730,6 +731,21 @@ agent's own log first — for opencode,
 `~/.local/share/opencode/log/opencode.log` — before assuming it's
 chorus; raise this setting if it turns out to be provider-side
 slowness.
+
+`routing.anonymize` (default `true`) redacts obvious sensitive
+patterns — email addresses, IPv4 addresses, API-key/token-shaped
+strings (`sk-…`, `ghp_…`, `AKIA…`, `Bearer …`, and any other 24+ char
+run of letters/digits/underscore) — out of the prompt and
+`context_level` activity before either reaches `decision_agent`, since
+that agent is picked for routing cost/capability reasons, not
+necessarily one you'd otherwise trust with the raw prompt. Only applies
+to this hidden routing-decision call — never to what's actually sent to
+the agent that ends up handling the real work. Pattern-matching, not
+real PII detection: it can't tell a secret from a long git SHA or
+identifier (redacts it anyway, harmless) and won't catch a short,
+low-entropy credential the named prefixes don't cover. Set to `false`
+if redaction is mangling legitimate prompt content and hurting routing
+accuracy more than it's worth.
 
 **Continuing a task on a different agent than the one that last handled
 it** (whether via an LLM routing decision or you switching manually) gets

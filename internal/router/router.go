@@ -54,7 +54,19 @@ type DecisionAgentInfo struct {
 // attempt the task itself, since a hidden decision sub-session still has
 // the agent's own built-in tools available even with chorus's MCP servers
 // detached.
-func BuildDecisionPrompt(agents []DecisionAgentInfo, defaultAgent, contextText, userPrompt string) string {
+//
+// anonymizeText, when true (policy.Routing.AnonymizeOrDefault — true
+// unless the caller's config explicitly disables it), redacts contextText
+// and userPrompt via anonymize() before they're embedded — the decision
+// agent is picked for routing cost/capability reasons, not necessarily
+// one the user would otherwise trust with the raw prompt. Never applied
+// to the agents slice (operator-authored agents.yaml config, not user
+// data).
+func BuildDecisionPrompt(agents []DecisionAgentInfo, defaultAgent, contextText, userPrompt string, anonymizeText bool) string {
+	if anonymizeText {
+		contextText = anonymize(contextText)
+		userPrompt = anonymize(userPrompt)
+	}
 	var b strings.Builder
 	b.WriteString("This is an automated routing-decision request from chorus itself, the multi-agent CLI harness " +
 		"you're running under — not a message from the user, and not a task for you to perform. Your only job " +
