@@ -119,6 +119,8 @@ routing:
 # headroom:
 #   enabled: true
 #   port: 8787
+#   output_shaper: "1"      # HEADROOM_OUTPUT_SHAPER (default "1")
+#   output_holdout: "0.1"   # HEADROOM_OUTPUT_HOLDOUT (default "0.1")
 
 # Each entry's `spawn` is a full command line: the executable followed by
 # its arguments. `transport` must be "acp" (the only one chorus implements

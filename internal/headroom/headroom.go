@@ -56,6 +56,11 @@ type Config struct {
 	// cost of cache stability). Passed straight through as HEADROOM_MODE;
 	// chorus doesn't interpret it.
 	Mode string `yaml:"mode"`
+	// OutputShaper/OutputHoldout tune Headroom's output shaping, passed
+	// through as HEADROOM_OUTPUT_SHAPER/HEADROOM_OUTPUT_HOLDOUT. Pointers
+	// so an explicit "0" is distinguishable from unset (which defaults).
+	OutputShaper  *string `yaml:"output_shaper"`
+	OutputHoldout *string `yaml:"output_holdout"`
 }
 
 // defaultImage/defaultPort/defaultMode are used when the corresponding
@@ -88,9 +93,11 @@ type Config struct {
 // Published multi-arch (amd64+arm64) same as every other variant, so
 // this isn't an Apple-Silicon-vs-Intel tradeoff either.
 const (
-	defaultImage = "ghcr.io/headroomlabs-ai/headroom:code-nonroot"
-	defaultPort  = 8787
-	defaultMode  = "cache"
+	defaultImage         = "ghcr.io/headroomlabs-ai/headroom:code-nonroot"
+	defaultPort          = 8787
+	defaultMode          = "cache"
+	defaultOutputShaper  = "1"
+	defaultOutputHoldout = "0.1"
 )
 
 // EnabledOrDefault defaults to false when unset — same opt-in convention
@@ -123,6 +130,22 @@ func (c Config) ModeOrDefault() string {
 		return defaultMode
 	}
 	return c.Mode
+}
+
+// OutputShaperOrDefault reports the effective HEADROOM_OUTPUT_SHAPER value.
+func (c Config) OutputShaperOrDefault() string {
+	if c.OutputShaper == nil {
+		return defaultOutputShaper
+	}
+	return *c.OutputShaper
+}
+
+// OutputHoldoutOrDefault reports the effective HEADROOM_OUTPUT_HOLDOUT value.
+func (c Config) OutputHoldoutOrDefault() string {
+	if c.OutputHoldout == nil {
+		return defaultOutputHoldout
+	}
+	return *c.OutputHoldout
 }
 
 // providerKeyEnvVars are passed to the container as BARE `-e NAME` flags
@@ -279,6 +302,8 @@ func Start(ctx context.Context, cfg Config) (*Proxy, error) {
 			"-e", "HEADROOM_HOST=0.0.0.0",
 			"-e", "HEADROOM_PORT=8787",
 			"-e", "HEADROOM_MODE=" + cfg.ModeOrDefault(),
+			"-e", "HEADROOM_OUTPUT_SHAPER=" + cfg.OutputShaperOrDefault(),
+			"-e", "HEADROOM_OUTPUT_HOLDOUT=" + cfg.OutputHoldoutOrDefault(),
 		}
 		for _, v := range providerKeyEnvVars {
 			args = append(args, "-e", v)

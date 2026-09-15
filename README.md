@@ -974,6 +974,8 @@ headroom:
   # image: ghcr.io/headroomlabs-ai/headroom:code-nonroot   # this is the default
   # port: 8787                                               # optional override
   # mode: cache                                              # cache | token
+  # output_shaper: "1"                                       # HEADROOM_OUTPUT_SHAPER (default "1")
+  # output_holdout: "0.1"                                    # HEADROOM_OUTPUT_HOLDOUT (default "0.1")
 ```
 
 This is the **containerized** Headroom image (`ghcr.io/headroomlabs-ai/headroom`)

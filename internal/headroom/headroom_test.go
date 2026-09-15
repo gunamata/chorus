@@ -147,6 +147,8 @@ func TestStart_CreatesFreshContainerWhenNoneExists(t *testing.T) {
 		"-p " + strconv.Itoa(port) + ":8787",
 		"-v chorus-headroom-data:/home/nonroot/.headroom",
 		"-e HEADROOM_MODE=token",
+		"-e HEADROOM_OUTPUT_SHAPER=1",
+		"-e HEADROOM_OUTPUT_HOLDOUT=0.1",
 		"-e ANTHROPIC_API_KEY",
 	} {
 		if !strings.Contains(got, want) {
