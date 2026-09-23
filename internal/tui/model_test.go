@@ -802,6 +802,52 @@ func TestModel_CtrlJInsertsNewlineInsteadOfSubmitting(t *testing.T) {
 	}
 }
 
+// A multi-line paste on a terminal with no bracketed-paste support (Windows
+// console) arrives as individual key events, with each newline a plain Enter.
+// The paste-burst heuristic must turn those into newlines, not one submitted
+// prompt per line.
+func TestModel_PastedNewlineInsertsInsteadOfSubmitting(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	// typeRunes+pressKey run back to back, well under pasteBurstGap, so the
+	// Enter after typed text is read as a pasted newline.
+	m = typeRunes(t, m, "line one")
+	m = pressKey(t, m, tea.KeyEnter)
+	m = typeRunes(t, m, "line two")
+
+	if got, want := m.input.Value(), "line one\nline two"; got != want {
+		t.Fatalf("input.Value() = %q, want %q — a pasted newline must not submit", got, want)
+	}
+	select {
+	case <-workers["claude"].in:
+		t.Fatal("a pasted newline must not submit the prompt")
+	default:
+	}
+}
+
+// A deliberate Enter — arriving after a human pause, not in a burst — must
+// still submit, even right after typed text.
+func TestModel_DeliberateEnterStillSubmitsAfterTyping(t *testing.T) {
+	workers := map[string]*AgentWorker{"claude": newWorker()}
+	m := newTestModel(t, workers, policy.Routing{})
+
+	m = typeRunes(t, m, "claude: hello")
+	m.lastKeyAt = time.Now().Add(-time.Second) // simulate the pause before Enter
+
+	updated, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+
+	if got := m.input.Value(); got != "" {
+		t.Fatalf("input.Value() = %q after a deliberate Enter, want it cleared (submitted)", got)
+	}
+	select {
+	case <-workers["claude"].in:
+	default:
+		t.Fatal("a deliberate Enter after typing must submit the prompt")
+	}
+}
+
 func TestModel_HomeEndMoveCursorToLineStartAndEnd(t *testing.T) {
 	cases := []struct {
 		name             string

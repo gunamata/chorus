@@ -312,6 +312,22 @@ type Model struct {
 	pastes      map[string]string
 	nextPasteID int
 
+	// lastKeyAt/lastWasPasteChar/pasting reconstruct paste detection on
+	// terminals whose input reader never sets KeyMsg.Paste — chiefly the
+	// Windows console (bubbletea only decodes bracketed paste on its
+	// non-Windows ANSI reader), where a paste arrives as individual key
+	// events and a pasted newline would otherwise submit mid-paste.
+	// handleKey sets pasting when the previous key inserted text into the box
+	// (lastWasPasteChar) AND this key lands within pasteBurstGap of it
+	// (machine speed, far faster than any human types); handleKeyDispatch
+	// uses it to treat a pasted Enter as a newline instead of a submit.
+	// Requiring lastWasPasteChar keeps a deliberate Enter — whose predecessor
+	// was another Enter, an arrow, or a set-value with no keystroke — from
+	// ever being read as a paste, no matter how fast it arrives.
+	lastKeyAt        time.Time
+	lastWasPasteChar bool
+	pasting          bool
+
 	// suggestKind/Items/Cursor/TokenStart/Token back the live "/"-command
 	// and "@"-file completion popup, recomputed once per keypress
 	// (refreshSuggest) and cached here so View()/relayout() only ever
@@ -1193,7 +1209,23 @@ func (m *Model) relayout() {
 // here, once, rather than scattered across handleKeyDispatch's many early
 // returns, so there's exactly one place that can get this wrong instead of
 // N of them.
+// pasteBurstGap is the inter-keystroke window below which consecutive keys
+// are treated as a paste rather than human typing. Pasted keys arrive back
+// to back (well under a millisecond of processing apart); the fastest human
+// char-to-Enter transition is far slower, so this cleanly separates them.
+// ponytail: timing heuristic, widen only if a real paste ever trips it on a
+// slow machine, narrow if a fast typist's Enter ever gets swallowed.
+const pasteBurstGap = 25 * time.Millisecond
+
 func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// See lastKeyAt/lastWasPasteChar: a key arriving within pasteBurstGap of a
+	// previous key that inserted text is part of a paste, not a deliberate
+	// keystroke. lastWasPasteChar resets to false by default; the branches in
+	// handleKeyDispatch that actually put text in the box set it back to true.
+	now := time.Now()
+	m.pasting = m.lastWasPasteChar && !m.lastKeyAt.IsZero() && now.Sub(m.lastKeyAt) < pasteBurstGap
+	m.lastKeyAt = now
+	m.lastWasPasteChar = false
 	newModel, cmd := m.handleKeyDispatch(msg)
 	mm := newModel.(Model)
 	mm.refreshSuggest()
@@ -1378,9 +1410,24 @@ func (m Model) handleKeyDispatch(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.SetValue(strings.TrimSuffix(val, "\\") + "\n")
 			return m, nil
 		}
+		// A newline arriving inside a paste burst (see handleKey/lastKeyAt)
+		// is part of the pasted text, not a deliberate submit — insert it and
+		// keep the whole paste in the box. The user's own Enter comes after a
+		// human pause, so pasting is false and it submits normally. This is
+		// what keeps a multi-line paste from being fired off as one prompt
+		// per line on terminals with no bracketed-paste support.
+		if m.pasting {
+			m.input.InsertRune('\n')
+			m.lastWasPasteChar = true // the paste continues onto the next line
+			return m, nil
+		}
 	}
 
 	if msg.Type != tea.KeyEnter {
+		// Only actual character input can be part of a paste burst — an arrow,
+		// backspace, or control key that merely falls through here must not
+		// extend one (see lastWasPasteChar).
+		m.lastWasPasteChar = msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace || msg.Type == tea.KeyTab
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
