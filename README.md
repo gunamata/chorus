@@ -971,7 +971,7 @@ something chorus owns the lifecycle of end-to-end:
 ```yaml
 headroom:
   enabled: true
-  # image: ghcr.io/headroomlabs-ai/headroom:code-nonroot   # this is the default
+  # image: ghcr.io/headroomlabs-ai/headroom:0.42.0-code-nonroot@sha256:ec60...   # default, pinned
   # port: 8787                                               # optional override
   # mode: cache                                              # cache | token
   # output_shaper: "1"                                       # HEADROOM_OUTPUT_SHAPER (default "1")
@@ -1003,6 +1003,16 @@ be specific to this environment/backend — worth re-testing on your own
 machine before reconsidering. `code-nonroot` publishes multi-arch
 (amd64+arm64) same as every other variant. Override `image:` if you'd
 rather use a different one (or a self-hosted mirror).
+
+**The default is pinned to a release and digest**
+(`0.42.0-code-nonroot@sha256:...`). The bare `code-nonroot` tag is a
+rolling build of Headroom's `main` branch, and an upstream change shipped
+through it has already broken startup once. chorus also runs the
+container with `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off` and
+`DO_NOT_TRACK=1`. Without them, Headroom's usage beacon (on by default)
+uploads an anonymous session summary to Headroom Labs. A container
+created by an older chorus keeps its old image and environment, so run
+`docker rm -f chorus-headroom` once to pick these up.
 
 - `CHORUS_HEADROOM_HOST_URL` — reachable from a normal, non-sandboxed
   agent subprocess (`http://127.0.0.1:{port}`).
@@ -1053,19 +1063,20 @@ and adding it will error. A sandboxed agent's own egress firewall
 host network subnet it auto-detects, so no `CHORUS_SANDBOX_ALLOW_HOSTS`
 change is needed for this specifically.
 
-**Security note**: the Headroom container's port is published on every
-host interface (`-p {port}:8787`, not loopback-only) — not an oversight.
-On Linux, Rancher Desktop's containers reach the host over a real Docker
-bridge interface, which does NOT reach a `127.0.0.1`-only-bound host
-port (unlike Docker Desktop's macOS/Windows VM-proxied networking,
-which typically does) — binding loopback-only would silently break
-sandboxed-agent reachability specifically on Linux. The tradeoff: the
-proxy is reachable from any local process (and, depending on Rancher
-Desktop's VM networking, possibly your LAN) while chorus is running.
-This whole reachability picture (host.docker.internal → a broadly-bound
-port, across all three OSes Rancher Desktop supports) is unverified
-live — confirm on your own machine before relying on it, and see [Known
-limitations](#known-limitations).
+**Security note**: the Headroom container's port is published on
+loopback only (`-p 127.0.0.1:{port}:8787`), and chorus sets
+`HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1` to acknowledge the container's
+internal `0.0.0.0` bind. That's Headroom's own documented setup for this
+case: Headroom 0.40+ refuses to start with an unauthenticated
+non-loopback bind otherwise. The proxy is reachable from local processes
+and from containers via `host.docker.internal`. It isn't reachable from
+your LAN. This was confirmed live on Rancher Desktop for Windows (WSL2)
+and Linux (Lima). macOS is unverified.
+
+If you created a `chorus-headroom` container with an older chorus, it
+may still be published on every interface. chorus reuses an existing
+container as-is, so `docker rm -f chorus-headroom` once to have it
+recreated with the loopback-only binding.
 
 ### What actually gets forwarded
 

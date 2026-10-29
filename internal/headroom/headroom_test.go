@@ -144,7 +144,11 @@ func TestStart_CreatesFreshContainerWhenNoneExists(t *testing.T) {
 	for _, want := range []string{
 		"run -d --name chorus-headroom",
 		"--restart unless-stopped",
-		"-p " + strconv.Itoa(port) + ":8787",
+		"-p 127.0.0.1:" + strconv.Itoa(port) + ":8787",
+		"-e HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1",
+		"-e HEADROOM_BEACON=off",
+		"-e HEADROOM_TELEMETRY=off",
+		"-e DO_NOT_TRACK=1",
 		"-v chorus-headroom-data:/home/nonroot/.headroom",
 		"-e HEADROOM_MODE=token",
 		"-e HEADROOM_OUTPUT_SHAPER=1",

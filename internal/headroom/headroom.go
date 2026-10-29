@@ -21,9 +21,8 @@
 // http://127.0.0.1:{port} from host-mode agent subprocesses AND as
 // http://host.docker.internal:{port} from a SANDBOXED agent's own
 // container (see Proxy.SandboxURL's doc comment for the Rancher Desktop
-// assumption this rests on, and README/CLAUDE.md for the security
-// tradeoff of publishing to every host interface rather than 127.0.0.1
-// only, which host.docker.internal needs to actually reach it).
+// assumption this rests on, and Start's for why the port is published
+// on 127.0.0.1 only).
 //
 // chorus never talks to Headroom's HTTP API directly — a running Proxy
 // only ever hands out URLs (HostURL/SandboxURL) for an agent's OWN
@@ -92,8 +91,15 @@ type Config struct {
 //
 // Published multi-arch (amd64+arm64) same as every other variant, so
 // this isn't an Apple-Silicon-vs-Intel tradeoff either.
+//
+// Pinned to a release tag AND its multi-arch index digest, not the bare
+// `code-nonroot` tag: that one is a rolling build of Headroom's `main`
+// branch (image label org.opencontainers.image.version=main), and an
+// unannounced upstream change through it already broke startup once (the
+// 0.40 bind policy — see Start). The digest makes the pin immune to a
+// re-pushed tag; bump both together, after re-running the live tests.
 const (
-	defaultImage         = "ghcr.io/headroomlabs-ai/headroom:code-nonroot"
+	defaultImage         = "ghcr.io/headroomlabs-ai/headroom:0.42.0-code-nonroot@sha256:ec6036a3ac8001aceed69f33eec96f4bb3f1eb4df1cfbdcfe014ef38f4a700e1"
 	defaultPort          = 8787
 	defaultMode          = "cache"
 	defaultOutputShaper  = "1"
@@ -189,11 +195,9 @@ func (p *Proxy) HostURL() string {
 // support (confirmed by Rancher Desktop's own docs to work with no extra
 // --add-host flag — that flag's host-gateway value is explicitly a
 // Docker-Desktop-only feature Rancher Desktop doesn't support, so don't
-// add it). UNVERIFIED here: whether host.docker.internal reaches a port
-// published on every host interface consistently across all three
-// platforms Rancher Desktop supports — see Start's doc comment for why
-// the container's port is published broadly rather than to 127.0.0.1
-// only, and "Known limitations" for the open question this leaves.
+// add it). Confirmed live that host.docker.internal reaches the
+// loopback-only published port on Windows (WSL2) and Linux (Lima)
+// backends; macOS unverified — see Start's doc comment.
 func (p *Proxy) SandboxURL() string {
 	return fmt.Sprintf("http://host.docker.internal:%d", p.port)
 }
@@ -255,18 +259,22 @@ func inspectState(ctx context.Context, name string) (exists, running bool, err e
 //     winner's container) rather than a failure — see the inline comment
 //     at that check.
 //
-// The container's port is published on every host interface (`-p
-// {port}:8787`, not `-p 127.0.0.1:{port}:8787`) — deliberately, not an
-// oversight: on Linux, Rancher Desktop's containers reach the host over a
-// real docker bridge interface, which does NOT reach a
-// 127.0.0.1-only-bound host port (unlike Docker Desktop's macOS/Windows
-// VM-proxied networking, which typically does) — so binding to
-// loopback-only would silently break SANDBOXED agent reachability
-// specifically on Linux. This is a real security tradeoff (the proxy
-// becomes reachable from any local process, and depending on Rancher
-// Desktop's VM networking possibly the LAN — see README) accepted so one
-// running container serves both modes uniformly; not something chorus
-// can make purely safe from the Go side alone. On failure of a FRESH
+// The container's port is published on loopback only (`-p
+// 127.0.0.1:{port}:8787`), with HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1
+// acknowledging the container-internal 0.0.0.0 bind. Headroom >= 0.40
+// REFUSES to start with an unauthenticated non-loopback bind otherwise
+// (exits 1: "Refusing to bind '0.0.0.0'..." — found live 2026-10 when
+// code-nonroot moved to 0.42; chorus only saw the health check time out
+// with EOF). The acknowledgement is Headroom's own documented shape for
+// exactly this case: the process binds 0.0.0.0 inside the container but
+// the runtime publishes it on 127.0.0.1, which the process can't observe.
+// An earlier version published on every host interface, on the theory
+// that Linux Rancher Desktop containers couldn't reach a loopback-only
+// port via host.docker.internal — DISPROVEN LIVE (2026-10, Rancher
+// Desktop/Lima on Linux): a separate container reached a
+// 127.0.0.1-published port via host.docker.internal fine. Publishing
+// broadly with the acknowledgement set would have been an unauthenticated
+// relay reachable by anyone who can reach the host. On failure of a FRESH
 // `docker run` specifically, the partially-started container is removed
 // so the next attempt isn't blocked by a broken container occupying
 // containerName — a reused (already-existing) container is left alone on
@@ -297,9 +305,20 @@ func Start(ctx context.Context, cfg Config) (*Proxy, error) {
 		freshlyCreated = true
 		args := []string{"run", "-d", "--name", containerName,
 			"--restart", "unless-stopped",
-			"-p", fmt.Sprintf("%d:8787", port),
+			"-p", fmt.Sprintf("127.0.0.1:%d:8787", port),
 			"-v", volumeName + ":/home/nonroot/.headroom",
 			"-e", "HEADROOM_HOST=0.0.0.0",
+			"-e", "HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1",
+			// Opt out of Headroom's usage beacon, which is ON by default
+			// and uploads an anonymous session summary to Headroom Labs.
+			// Any one of these disables it (telemetry/beacon.py); all
+			// three are set so a future upstream rename of one doesn't
+			// silently re-enable it. HEADROOM_TELEMETRY=off only stops
+			// local stats aggregation, which is already off by default —
+			// /stats (the health check below) still answers.
+			"-e", "HEADROOM_BEACON=off",
+			"-e", "HEADROOM_TELEMETRY=off",
+			"-e", "DO_NOT_TRACK=1",
 			"-e", "HEADROOM_PORT=8787",
 			"-e", "HEADROOM_MODE=" + cfg.ModeOrDefault(),
 			"-e", "HEADROOM_OUTPUT_SHAPER=" + cfg.OutputShaperOrDefault(),

@@ -374,7 +374,16 @@ internal/headroom     Optional chorus-managed Docker container running
                       Headroom (https://docs.headroomlabs.ai/docs), a
                       local compression proxy that sits between an agent
                       CLI and its LLM provider. defaultImage is
-                      `code-nonroot`, deliberately not `latest` —
+                      `0.42.0-code-nonroot@sha256:...` — PINNED to a
+                      release + digest, because bare `code-nonroot` is a
+                      rolling `main`-branch build that broke startup once
+                      already (the 0.40 bind policy); bump tag and digest
+                      together, after re-running both live tests. The
+                      container also always gets HEADROOM_BEACON=off/
+                      HEADROOM_TELEMETRY=off/DO_NOT_TRACK=1 (the beacon is
+                      on by default upstream and uploads a session
+                      summary). The variant is `code-nonroot`,
+                      deliberately not `latest` —
                       Headroom's tags are an 8-way matrix of the `code`/
                       `slim`/`nonroot` build modifiers (`latest` has
                       none of them); `code` enables AST-aware code
@@ -405,7 +414,8 @@ internal/headroom     Optional chorus-managed Docker container running
                       original --restart/volume/port); never existed ->
                       `docker run -d --name chorus-headroom --restart
                       unless-stopped -v chorus-headroom-data:/home/nonroot/.headroom
-                      -p {port}:8787 -e HEADROOM_HOST=0.0.0.0 -e
+                      -p 127.0.0.1:{port}:8787 -e HEADROOM_HOST=0.0.0.0
+                      -e HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 -e
                       HEADROOM_PORT=8787 -e HEADROOM_MODE=... {image}`
                       with NO trailing command — CONFIRMED LIVE (2026-09)
                       that appending one (an earlier version did:
@@ -458,13 +468,17 @@ internal/headroom     Optional chorus-managed Docker container running
                       name (ANTHROPIC_BASE_URL etc.) an agent's CLI
                       honors; the agents.yaml author wires both
                       explicitly (README has worked examples). The
-                      container's port is published on EVERY host
-                      interface, not 127.0.0.1-only — see Start's own doc
-                      comment and README's security note for why
-                      (Linux Rancher Desktop's containers reach the host
-                      over a real docker bridge interface that does NOT
-                      reach a loopback-only-bound port, unlike Docker
-                      Desktop's macOS/Windows VM-proxied networking).
+                      container's port is published on 127.0.0.1 ONLY,
+                      with HEADROOM_ALLOW_UNAUTHENTICATED_BIND=1 —
+                      CONFIRMED LIVE (2026-10) that Headroom >= 0.40
+                      refuses an unauthenticated 0.0.0.0 bind without
+                      that acknowledgement (container exits 1, chorus
+                      only sees /stats time out with EOF). Don't go back
+                      to publishing on every interface: with the ack set
+                      that would be an unauthenticated relay open to the
+                      LAN. The old reason for doing it (Linux Rancher
+                      Desktop containers supposedly can't reach a
+                      loopback-only port) was DISPROVEN live on Lima.
                       Provider API keys (ANTHROPIC_API_KEY/OPENAI_API_KEY/
                       AWS/GOOGLE_APPLICATION_CREDENTIALS) are passed to
                       the container as bare `-e NAME` (pulls from
@@ -818,12 +832,10 @@ sandbox/              Opt-in per-agent container images for filesystem/
   `slim`-variant crash documented in internal/headroom's own entry
   above — both invisible to the stubbed-runDocker unit tests, only
   caught by these live ones.
-  Still unconfirmed: the same `host.docker.internal` path specifically
-  on Rancher Desktop's native-Linux backend (a materially different
-  network path — containers reach the host over a real bridge interface
-  there, not Windows/macOS's VM-proxied networking, which is why the
-  container's port is published broadly rather than loopback-only in
-  the first place — see Start's own doc comment); whether opencode's own
+  Also confirmed live (2026-10, Rancher Desktop/Lima on Linux): a
+  separate container reaches the 127.0.0.1-only published port via
+  `host.docker.internal`.
+  Still unconfirmed: the same path on macOS; whether opencode's own
   multi-provider config accepts a custom base URL the same way; and
   Gemini entirely, moot regardless since it's already blocked by the
   free-tier `IneligibleTierError` above. Update this entry with whatever
