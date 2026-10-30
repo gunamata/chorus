@@ -49,25 +49,33 @@ iptables -A OUTPUT -o lo -j ACCEPT
 
 ipset create allowed-domains hash:net
 
+# api.github.com/meta is an UNAUTHENTICATED REST call, rate-limited to 60
+# requests/hour per public IP — and every container start makes one (three
+# per chorus launch, more behind a shared NAT/VPN egress IP). CONFIRMED
+# LIVE (2026-10): once exhausted, GitHub answers 403 "API rate limit
+# exceeded", which used to be fatal here and took every sandboxed agent
+# down with "initialize: Internal error". Now best-effort, like
+# add_google_ranges below: on any failure, GITHUB_FALLBACK makes the base
+# allowlist DNS-snapshot github.com/api.github.com instead (less complete
+# than the published ranges, but enough for git/gh against those hosts).
+GITHUB_FALLBACK=""
 echo "Fetching GitHub IP ranges..."
-gh_ranges=$(curl -s https://api.github.com/meta)
-if [ -z "$gh_ranges" ]; then
-    echo "ERROR: Failed to fetch GitHub IP ranges"
-    exit 1
+gh_ranges=$(curl -s --max-time 10 https://api.github.com/meta || true)
+if [ -z "$gh_ranges" ] || ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null 2>&1; then
+    gh_msg=$(echo "$gh_ranges" | jq -r '.message // empty' 2>/dev/null || true)
+    echo "WARNING: Failed to fetch GitHub IP ranges${gh_msg:+ ($gh_msg)} — falling back to per-host DNS snapshot for github.com/api.github.com"
+    GITHUB_FALLBACK=1
+else
+    echo "Processing GitHub IPs..."
+    while read -r cidr; do
+        if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
+            exit 1
+        fi
+        echo "Adding GitHub range $cidr"
+        ipset add allowed-domains "$cidr"
+    done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 fi
-if ! echo "$gh_ranges" | jq -e '.web and .api and .git' >/dev/null; then
-    echo "ERROR: GitHub API response missing required fields"
-    exit 1
-fi
-echo "Processing GitHub IPs..."
-while read -r cidr; do
-    if [[ ! "$cidr" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
-        echo "ERROR: Invalid CIDR range from GitHub meta: $cidr"
-        exit 1
-    fi
-    echo "Adding GitHub range $cidr"
-    ipset add allowed-domains "$cidr"
-done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
 # add_domain DOMAIN [STRICT]
 # Resolves DOMAIN and adds its A records to the allowlist. STRICT (base
@@ -153,6 +161,11 @@ add_domain() {
 for domain in "registry.npmjs.org" "opencode.ai"; do
     add_domain "$domain" strict
 done
+if [ -n "$GITHUB_FALLBACK" ]; then
+    for domain in "github.com" "api.github.com"; do
+        add_domain "$domain" strict
+    done
+fi
 add_domain "host.docker.internal"
 
 # Deployment-specific: a self-run Ollama endpoint (or any other
@@ -194,9 +207,13 @@ if curl --connect-timeout 5 https://example.com >/dev/null 2>&1; then
 else
     echo "Firewall verification passed - unable to reach https://example.com as expected"
 fi
-if ! curl --connect-timeout 5 https://api.github.com/zen >/dev/null 2>&1; then
-    echo "ERROR: Firewall verification failed - unable to reach https://api.github.com"
+# Positive check against github.com, NOT api.github.com/zen: the latter is
+# another rate-limited REST call (see the GitHub fetch above). A HEAD
+# request only needs a TCP+TLS connection to succeed — any HTTP status is
+# fine — so -f is deliberately omitted.
+if ! curl -sI --connect-timeout 5 https://github.com >/dev/null 2>&1; then
+    echo "ERROR: Firewall verification failed - unable to reach https://github.com"
     exit 1
 else
-    echo "Firewall verification passed - able to reach https://api.github.com as expected"
+    echo "Firewall verification passed - able to reach https://github.com as expected"
 fi
