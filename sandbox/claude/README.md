@@ -62,6 +62,7 @@ fresh, empty `/home/node/.claude` for container-local state only.
   spawn: ["docker", "run", "--rm", "-i",
           "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
           "-v", "{{CWD}}:/workspace",
+          "-v", "chorus-te-data:/home/node/.tokeneconomizer",
           "-v", "~/.config/gcloud:/home/node/.config/gcloud:ro",
           "-e", "CLAUDE_CODE_USE_VERTEX=1",
           "-e", "CLOUD_ML_REGION=<region>",
@@ -76,6 +77,31 @@ fresh, empty `/home/node/.claude` for container-local state only.
 per `session.Spec.WorkDir`/`EffectiveCwd`) with the real host project
 directory before this command is exec'd — the `agents.yaml` entry stays
 portable across machines/clones instead of hardcoding an absolute path.
+
+The `chorus-te-data` named volume persists the TokenEconomizer plugin's
+learned data (`~/.tokeneconomizer`) across runs. It is REQUIRED for the
+plugin baked into the image to be worth anything — with `--rm` the
+container is discarded every run, and a named volume is the only state
+that survives. Drop this `-v` line to disable the plugin's learning
+entirely (the plugin stays installed but starts cold every run). The
+volume is keyed internally by repo, so one shared volume across all
+projects is fine. Once per image rebuild (new Claude Code version),
+run `/tokeneconomizer:toolprune refresh-catalog` once from a chorus
+session to rebuild its tool catalog.
+
+CAVEAT — remote-less projects collide. The plugin keys a repo by its
+git `origin` remote URL, NOT by path, so distinct git repos stay cleanly
+separated in the shared volume even though every project mounts at the
+same `/workspace` inside the container. But a project with no `origin`
+remote (not a git repo, or a local-only one) falls back to the checkout
+PATH — which inside the container is always `/workspace` — so ALL such
+remote-less projects collide onto one key and cross-contaminate each
+other's learned data. Multiple chorus sessions on the SAME repo (same or
+different folders) are safe from corruption — the plugin locks
+(`fcntl.flock`) and writes atomically — you just get some last-writer-wins
+learning churn. If you run several remote-less projects and want them
+isolated, give each its own volume (rename `chorus-te-data` per project)
+or drop the `-v` line for those.
 
 ## Verifying containment
 

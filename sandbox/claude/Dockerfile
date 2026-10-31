@@ -63,6 +63,21 @@ ENV PATH=$PATH:/usr/local/share/npm-global/bin
 # the agent subprocess is already baked into the image).
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION} @agentclientprotocol/claude-agent-acp
 
+# Optional cost-reduction plugin: Microsoft TokenEconomizer. Baked at BUILD
+# time (same reasoning as the CLI above — keeps the runtime firewall
+# allowlist minimal; the marketplace fetch happens here, not at runtime).
+# Its hooks DO fire under claude-agent-acp — confirmed live 2026-10:
+# SessionStart/UserPromptSubmit/PreToolUse all fired from the project's
+# .claude/settings.local.json while driven over ACP, using the host login
+# (no API key). `marketplace add` takes the GitHub repo directly, so no
+# local clone to keep around.
+# CRITICAL: the plugin's LEARNED data lives in ~/.tokeneconomizer, which is
+# ephemeral per `docker run` unless a volume is mounted for it — see the
+# spawn example in sandbox/claude/README.md. Without that volume it re-learns
+# from zero every run and buys nothing, so this build step alone is useless.
+RUN claude plugin marketplace add microsoft/TokenEconomizer && \
+  claude plugin install tokeneconomizer@tokeneconomizer
+
 COPY init-firewall.sh /usr/local/bin/
 COPY entrypoint.sh /usr/local/bin/
 USER root
