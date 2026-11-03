@@ -74,11 +74,27 @@ endpoint:
   spawn: ["docker", "run", "--rm", "-i",
           "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
           "-v", "{{CWD}}:/workspace",
+          "-v", "chorus-opencode-data:/home/node/.local/share/opencode",
           "-e", "CHORUS_SANDBOX_ALLOW_HOSTS=ollama.internal.company.com:11434",
           "chorus-opencode-sandbox"]
   workdir: /workspace
   cost_tier: free
 ```
+
+The `chorus-opencode-data` named volume persists opencode's data
+directory (`~/.local/share/opencode`). Sessions live there in a SQLite
+database (`opencode.db`), alongside `auth.json` if you ever run
+`opencode providers login` inside the container. This volume is what
+makes `chorus --resume` work for a sandboxed opencode. With `--rm` the
+database would otherwise be discarded on exit, every saved session ID
+would fail `session/load`, and chorus would silently fall back to a fresh
+session each run. The whole directory is mounted, unlike Claude's
+`projects/`-only volume (see `sandbox/claude/README.md`), because the
+image bakes nothing into it that a rebuild would need to update. The
+image already creates it owned by `node`, so a fresh volume inherits
+that ownership. Every project shares one database (the container cwd is
+always `/workspace`), but session IDs are unique, so resume by ID
+doesn't collide. Drop this `-v` line if you don't need resume.
 
 ## Verifying containment
 

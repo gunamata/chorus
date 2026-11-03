@@ -53,7 +53,13 @@ running Claude Code outside a container:
 
 Never mount the host's real `~/.claude` (its live interactive-login
 state) regardless of which option you use — the image already creates a
-fresh, empty `/home/node/.claude` for container-local state only.
+fresh `/home/node/.claude` for container-local state only. Besides the
+security exposure, a host `~/.claude` bind mount shadows everything the
+image baked into that directory (the TokenEconomizer plugin install,
+`settings.json`), and the container writes its own `/home/node/...` paths
+back into the host's `plugins/installed_plugins.json`, breaking plugins
+for host-side Claude Code. That happened once; the
+`chorus-claude-projects` volume below replaced it.
 
 ## `agents.yaml` snippet (Vertex example, this deployment's real setup)
 
@@ -62,6 +68,7 @@ fresh, empty `/home/node/.claude` for container-local state only.
   spawn: ["docker", "run", "--rm", "-i",
           "--cap-add=NET_ADMIN", "--cap-add=NET_RAW",
           "-v", "{{CWD}}:/workspace",
+          "-v", "chorus-claude-projects:/home/node/.claude/projects",
           "-v", "chorus-te-data:/home/node/.tokeneconomizer",
           "-v", "~/.config/gcloud:/home/node/.config/gcloud:ro",
           "-e", "CLAUDE_CODE_USE_VERTEX=1",
@@ -77,6 +84,23 @@ fresh, empty `/home/node/.claude` for container-local state only.
 per `session.Spec.WorkDir`/`EffectiveCwd`) with the real host project
 directory before this command is exec'd — the `agents.yaml` entry stays
 portable across machines/clones instead of hardcoding an absolute path.
+
+The `chorus-claude-projects` named volume persists Claude Code's session
+transcripts (`~/.claude/projects/-workspace/<session-id>.jsonl`) across
+runs. It is what makes `chorus --resume` work for a sandboxed Claude:
+with `--rm` the transcripts would otherwise be discarded on exit, every
+saved session ID would fail `session/load`, and chorus would silently
+fall back to a fresh session each run. Only `projects/` is mounted, NOT
+all of `/home/node/.claude`. The plugin install and `settings.json` must
+keep coming from the image, and a whole-directory named volume would
+freeze them at whatever the image held the first time the volume was
+created, so later image rebuilds would never update the plugin. The image
+pre-creates `projects/` owned by `node` so the volume inherits that
+ownership. Without it, Docker creates the mount point root-owned and
+transcripts can't be written at all. Every project shares the
+`-workspace` subdirectory (the container cwd is always `/workspace`),
+but session IDs are UUIDs, so resume by ID doesn't collide. Drop this
+`-v` line if you don't need resume.
 
 The `chorus-te-data` named volume persists the TokenEconomizer plugin's
 learned data (`~/.tokeneconomizer`) across runs. It is REQUIRED for the

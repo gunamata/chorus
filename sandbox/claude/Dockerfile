@@ -47,7 +47,11 @@ ENV DEVCONTAINER=true
 # of the project. /home/node/.claude is left as a plain directory, not a
 # mount of the host's real ~/.claude: never give a sandboxed agent the
 # host's live interactive-login state (see security note in README.md).
-RUN mkdir -p /workspace /home/node/.claude && \
+# /home/node/.claude/projects is pre-created so the chorus-claude-projects
+# named volume mounted there (session transcripts, for resume) inherits
+# node ownership on first use — otherwise Docker creates the mount point
+# root-owned and Claude Code can't write transcripts at all.
+RUN mkdir -p /workspace /home/node/.claude/projects && \
   chown -R node:node /workspace /home/node/.claude
 
 WORKDIR /workspace
