@@ -51,8 +51,9 @@ ENV DEVCONTAINER=true
 # named volume mounted there (session transcripts, for resume) inherits
 # node ownership on first use — otherwise Docker creates the mount point
 # root-owned and Claude Code can't write transcripts at all.
-RUN mkdir -p /workspace /home/node/.claude/projects && \
-  chown -R node:node /workspace /home/node/.claude
+# /home/node/.tokeneconomizer is pre-created for the exact same reason
+RUN mkdir -p /workspace /home/node/.claude/projects /home/node/.tokeneconomizer && \
+  chown -R node:node /workspace /home/node/.claude /home/node/.tokeneconomizer
 
 WORKDIR /workspace
 
